@@ -81,12 +81,11 @@ Return                             -> the return value borrows from this argumen
 
 The accesses also give the pointee's shape. Constant offsets become struct fields: `fields: [(0, written), (8, read)]`. An access at an unknown offset (`indexed`) is evidence for a slice or array. The ML type model (design/ml-refinement.md) proposes types, and these facts gate its proposals.
 
-Run on the driver's null-check sample (`cargo run`):
+Run on the null-check sample (`chungusite --hex "48 85 ff 74 09 48 89 77 08 48 8b 47 10 c3 31 c0 c3" --emit borrows`):
 
 ```
-argument borrows:
-  RSI: integer
-  RDI: Option<&mut T>, fields at +8 (written), +16
+  rsi: integer
+  rdi: Option<&mut T>, fields at +8 (written), +16
 ```
 
 i.e. `fn f(p: Option<&mut S>, v: u64) -> u64`, with `S` having fields at 8 (written) and 16 (read).

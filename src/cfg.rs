@@ -17,12 +17,16 @@ pub struct Cfg {
 
 impl Cfg {
     pub fn new(f: &Function) -> Cfg {
-        let n = f.blocks.len();
+        Cfg::from_succs(f.blocks.len(), f.entry, |b| f.blocks[b].term.successors())
+    }
 
+    /// The CFG of any graph of `n` blocks with at most two successors each.
+    /// The structurer uses it on the graph it rewrites.
+    pub fn from_succs(n: usize, entry: BlockId, succ: impl Fn(BlockId) -> [Option<BlockId>; 2]) -> Cfg {
         // Predecessors, counting sort style.
         let mut count = vec![0u32; n + 1];
-        for (_, blk) in f.blocks.iter() {
-            for s in blk.term.successors().into_iter().flatten() {
+        for b in (0..n).map(BlockId::new) {
+            for s in succ(b).into_iter().flatten() {
                 count[s.index() + 1] += 1;
             }
         }
@@ -31,9 +35,9 @@ impl Cfg {
         }
         let pred_start = count.clone();
         let mut fill = count;
-        let mut preds = vec![f.entry; pred_start[n] as usize];
-        for (b, blk) in f.blocks.iter() {
-            for s in blk.term.successors().into_iter().flatten() {
+        let mut preds = vec![entry; pred_start[n] as usize];
+        for b in (0..n).map(BlockId::new) {
+            for s in succ(b).into_iter().flatten() {
                 preds[fill[s.index()] as usize] = b;
                 fill[s.index()] += 1;
             }
@@ -42,10 +46,10 @@ impl Cfg {
         // Reverse postorder with an explicit stack.
         let mut post = Vec::with_capacity(n);
         let mut seen = vec![false; n];
-        let mut stack: Vec<(BlockId, u8)> = vec![(f.entry, 0)];
-        seen[f.entry.index()] = true;
+        let mut stack: Vec<(BlockId, u8)> = vec![(entry, 0)];
+        seen[entry.index()] = true;
         while let Some(&mut (b, ref mut next)) = stack.last_mut() {
-            let succ = f.blocks[b].term.successors();
+            let succ = succ(b);
             if (*next as usize) < succ.len() {
                 let s = succ[*next as usize];
                 *next += 1;
@@ -67,7 +71,7 @@ impl Cfg {
         }
 
         let mut cfg = Cfg { pred_start, preds, rpo, rpo_index, idom: vec![None; n] };
-        cfg.compute_dominators(f.entry);
+        cfg.compute_dominators(entry);
         cfg
     }
 

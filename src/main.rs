@@ -275,7 +275,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         eprintln!("  {} statics ({bytes} bytes) from the binary's data sections", statics.len());
     }
     if total.state_machines > 0 {
-        eprintln!("  {} with irreducible control flow, kept as a `loop {{ match bb }}` state machine", total.state_machines);
+        eprintln!("  {} with irreducible control flow, which needed a `bb` state variable around that region", total.state_machines);
     }
     if total.todo > 0 {
         eprintln!("  {} todo!() left where the emitter can't express an instruction yet", total.todo);

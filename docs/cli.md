@@ -58,32 +58,35 @@ pub fn maybe_count(rdi_ref: Option<&[u8]>) -> u64 {
 
 Each function header says how many of its accesses are checked. Byte slices are a stopgap until struct recovery can name the pointee type and turn these into `&S` with real fields.
 
-Control flow is structured ([`src/structure.rs`](../src/structure.rs)): branches become `if`/`else`, loops become `loop` with `break`, `continue` and early `return`, and block parameters become mutable variables assigned on each edge. A loop's exits are emitted after it, so leaving it is a `break`:
+Control flow is structured ([`src/structure.rs`](../src/structure.rs)): branches become `if`/`else`, loops become `while` or `loop` with `break`, `continue` and early `return`, and block parameters become mutable variables assigned on each edge. A value used once, in the block that computes it, is written inside the expression that uses it rather than as a `let` of its own, unless that would move a load past a store or call, or a call past any memory access. A block that only tests a condition joins the test before it in `&&` or `||`, and constants (including casts of constants) are written as literals. This is `count_outside` from a small C file, compiled by gcc at `-O0`:
 
-```rust
-pub unsafe fn find(mut rdi: u64, mut rsi: u64, mut rdx: u64) -> u64 {
-    let mut v2: u64 = 0;
-    ...
-    v2 = v1;
-    loop {
-        let v4: bool = v2 >= rsi; // 0x5
-        if v4 {
-            break;
-        }
-        let v7: u64 = rdi.wrapping_add(v2.wrapping_mul(8)); // 0x7
-        let v8: u64 = unsafe { (v7 as *const u64).read_unaligned() }; // 0x7
-        let v10: bool = v8 == rdx; // 0xe
-        if v10 {
-            break;
-        }
-        ...
-        v2 = v13;
-    }
-    return v2 as u64;
+```c
+long count_outside(const long *a, long n, long lo, long hi) {
+    long c = 0;
+    for (long i = 0; i < n && a[i] != 0; i++)
+        if (a[i] < lo || a[i] > hi)
+            c++;
+    return c;
 }
 ```
 
-Where the nesting needs it (two paths into the same `else`, as in `if a || b`), a labeled block (`'b7: { .. break 'b7; .. }`) stands in. A function whose CFG is irreducible (a cycle with two entries) has no such nesting and stays a `loop { match bb { ... } }` state machine; the summary on stderr counts those.
+```rust
+pub unsafe fn count_outside(mut rdi: u64, mut rsi: u64, mut rdx: u64, mut rcx: u64) -> u64 {
+    let mut v174: u64 = 0;
+    let mut v161: u64 = 0;
+    (v174, v161) = (0_u64, 0_u64);
+    while (v161 as i64) < (rsi as i64) && (unsafe { (rdi.wrapping_add(v161.wrapping_mul(8)) as *const u64).read_unaligned() }) != 0_u64 {
+        if (rdx as i64) > ((unsafe { (rdi.wrapping_add(v161.wrapping_mul(8)) as *const u64).read_unaligned() }) as i64) || (rcx as i64) < ((unsafe { (rdi.wrapping_add(v161.wrapping_mul(8)) as *const u64).read_unaligned() }) as i64) {
+            (v174, v161) = (v174.wrapping_add(1_u64), v161.wrapping_add(1_u64));
+        } else {
+            v161 = v161.wrapping_add(1_u64);
+        }
+    }
+    return v174;
+}
+```
+
+Where the nesting still needs it (a loop with several exits that lead to different code, or two paths into the same code from different depths), a labeled block (`'b7: { .. break 'b7; .. }`) stands in. A function whose CFG is irreducible (a cycle with two entries) gets a `bb` variable for that cycle only: each edge into the cycle sets `bb` to the block it enters, and a `loop` at the top of the cycle tests it (`if bb == 2 { .. } else { .. }`). Everything outside the cycle, and inside it, stays structured. The summary on stderr counts those functions.
 
 Every statement ends with the address of the instruction it came from.
 
@@ -108,7 +111,7 @@ Slots the dynamic loader fills with an address (GOT entries, vtables, pointer ta
 
 - the `sum` loop from `tests/common`, in both modes, linked into a program that runs it and checks the results, including that safe mode panics on a too-short slice;
 - 400 random programs built from supported instructions, in both modes, which must all type-check;
-- 300 random register-only programs emitted both structured and as the state machine, run on the same random inputs, which must return the same values (programs that don't terminate run out of fuel and are skipped);
+- 300 random register-only programs emitted both structured and as the whole-function state machine (`structure: false`), run on the same random inputs, which must return the same values (programs that don't terminate run out of fuel and are skipped);
 - the real binary on a small ELF built in the test: `--list`, both modes, `-f`, `--emit ir` and the exit codes.
 
 `tests/globals.rs` decompiles a cdylib that reads a `static`, writes a `static mut` (both through the GOT) and has a mangled function, then links the output into a program that checks the values. It also checks that `-j 1` and `-j 4` print the same thing.

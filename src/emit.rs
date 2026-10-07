@@ -12,17 +12,20 @@
 //!   bounds-checked slice read or write; everything else falls back to the
 //!   fast-mode raw access. The function is only `unsafe` if a raw access remains.
 //!
-//! Control flow is structured (`structure.rs`): `if`/`else`, `loop` with `break`
-//! and `continue`, and early `return`, with block parameters as mutable variables.
-//! An irreducible CFG falls back to a `loop { match bb { .. } }` state machine,
-//! which is correct for any CFG.
+//! Control flow is structured (`structure.rs`): `if`/`else`, `while`, `loop` with
+//! `break` and `continue`, and early `return`, with block parameters as mutable
+//! variables. A value used once, in the block that defines it, is printed inside
+//! the expression that uses it instead of as a `let` (`plan_inlining`), as long
+//! as that keeps memory accesses and calls in order. With structuring off, or
+//! for a dominator tree too deep to recurse into, the function is a
+//! `loop { match bb { .. } }` state machine, which is correct for any CFG.
 //!
 //! The input must be clean SSA (`opt::clean`), which is what the borrow analysis
 //! expects too.
 use crate::abi::{Sig, Site, STACK_ARG_BASE, SYSV_ARGS};
 use crate::borrow::{analyze, Class, ParamBorrow, RSP};
 use crate::cfg::Cfg;
-use crate::structure::{print, structure, Node, Source};
+use crate::structure::{atomic, print, structure, Node, Source};
 use crate::ir::*;
 use crate::verify::for_each_operand;
 use std::fmt::Write;
@@ -41,8 +44,9 @@ pub struct EmitStats {
     pub raw: usize,
     /// Instructions or terminators the emitter can't express yet (`todo!()`).
     pub todo: usize,
-    /// Functions whose control flow is irreducible, emitted as a
-    /// `loop { match bb { .. } }` state machine instead of structured code.
+    /// Functions that needed a state machine: irreducible control flow, where a
+    /// `bb` variable dispatches into the irreducible region (the rest stays
+    /// structured), or the whole-function `loop { match bb { .. } }` fallback.
     pub state_machines: usize,
 }
 
@@ -107,6 +111,10 @@ struct Emitter<'a> {
     /// Values that need a variable declared up front (block params, and values
     /// used outside the block that defines them).
     hoisted: Vec<bool>,
+    /// Values printed inside the expression that uses them (`plan_inlining`).
+    inline: Vec<bool>,
+    /// How many times each value is printed as an operand.
+    uses: Vec<u32>,
     /// Rust expression for a constant address that points into the binary's data.
     global_of: &'a dyn Fn(u64) -> Option<String>,
     stats: EmitStats,
@@ -186,9 +194,12 @@ pub fn emit_function_in(f: &Function, name: &str, mode: Mode, env: &Env, out: &m
         args,
         entry_param,
         hoisted: hoisted(f, &cfg),
+        inline: Vec::new(),
+        uses: Vec::new(),
         global_of: env.global_of,
         stats: EmitStats::default(),
     };
+    e.plan_inlining(&cfg);
 
     let mut body = String::new();
     e.body(&cfg, &mut body);
@@ -440,20 +451,34 @@ impl Emitter<'_> {
                 let _ = writeln!(out, "    let mut frame = vec![0u128; {n}];");
             }
         }
-        // Up-front declarations for block params and cross-block values.
+        let mut code = String::new();
+        self.code(cfg, &mut code);
+        // Up-front declarations for block params and cross-block values, if the
+        // code still mentions them (structuring can bypass a block's parameters).
+        let mut idents = std::collections::HashSet::new();
+        for w in code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            idents.insert(w);
+        }
         for &b in &cfg.rpo {
             let blk = &f.blocks[b];
             for &v in blk.params.get(&f.value_pool).iter().chain(blk.insts.get(&f.value_pool)) {
-                if self.hoisted[v.index()] && !self.skip[v.index()] {
+                let name = self.name(v);
+                if self.hoisted[v.index()] && !self.skip[v.index()] && !self.trivial(v) && idents.contains(name.as_str()) {
                     let zero = match self.ty(v) {
                         TyId::BOOL => "false",
                         TyId::PAIR => "(0, 0)",
                         _ => "0",
                     };
-                    let _ = writeln!(out, "    let mut {}: {} = {zero};", self.name(v), rty(self.ty(v)));
+                    let _ = writeln!(out, "    let mut {name}: {} = {zero};", rty(self.ty(v)));
                 }
             }
         }
+        out.push_str(&code);
+    }
+
+    /// The body after the declarations.
+    fn code(&mut self, cfg: &Cfg, out: &mut String) {
+        let f = self.f;
         let has_edges = cfg.rpo.iter().any(|&b| f.blocks[b].term.successors()[0].is_some());
         if !has_edges {
             self.block(f.entry, "    ", out);
@@ -463,8 +488,11 @@ impl Emitter<'_> {
         // again below if it doesn't, so count them only once.
         let before = self.stats;
         if self.structure {
-            if let Some(nodes) = structure(f, cfg, self) {
-                print(&nodes, 1, out);
+            if let Some(s) = structure(f, cfg, self) {
+                if s.dispatchers > 0 {
+                    self.stats.state_machines += 1;
+                }
+                print(&s.body, 1, out);
                 return;
             }
             self.stats = before;
@@ -480,13 +508,296 @@ impl Emitter<'_> {
         out.push_str("            _ => unreachable!(),\n        }\n    }\n");
     }
 
+    /// Values that need no variable: constants and undefined values, which are
+    /// printed as literals wherever they are used.
+    fn trivial(&self, v: ValueId) -> bool {
+        match self.f.insts[v].kind {
+            _ if self.const_of(v).is_some() => true,
+            InstKind::CallOut { call, reg } => !(reg == crate::abi::RDX && matches!(self.f.insts[call].kind, InstKind::Call { .. }) && self.ret2(call)),
+            _ => false,
+        }
+    }
+
+    /// `v`'s value if it is a constant, or a cast of one (an undefined value is 0).
+    fn const_of(&self, v: ValueId) -> Option<u128> {
+        let ty = self.ty(v);
+        if matches!(ty, TyId::PAIR | TyId::UNIT) {
+            return None;
+        }
+        let mask = |x: u128| if bytes(ty) >= 8 { x & u64::MAX as u128 } else { x & ((1u128 << (bytes(ty) * 8)) - 1) };
+        match self.f.insts[v].kind {
+            InstKind::Const(c) => Some(self.f.consts[c.index()]),
+            InstKind::Undef => Some(0),
+            InstKind::Cast { kind: CastKind::ZExt | CastKind::Trunc | CastKind::Bitcast, v: x } => self.const_of(x).map(mask),
+            InstKind::Cast { kind: CastKind::SExt, v: x } => {
+                let bits = 8 * bytes(self.ty(x)) as u32;
+                let c = self.const_of(x)? as u64;
+                Some(mask(((c << (64 - bits)) as i64 >> (64 - bits)) as u64 as u128))
+            }
+            _ => None,
+        }
+    }
+
+    /// Does the instruction print as a statement of its own?
+    fn is_stmt(&self, id: ValueId) -> bool {
+        !self.skip[id.index()] && !self.trivial(id) && !self.inline[id.index()]
+    }
+
+    /// The operands `inst` prints, in the order they are evaluated. Operands it
+    /// doesn't print (a callee called by name, the call behind a `CallOut`, the
+    /// arguments of an instruction printed as `todo!()`) are left out.
+    fn printed_operands(&self, id: ValueId) -> Vec<ValueId> {
+        use InstKind::*;
+        let f = self.f;
+        let mut out = Vec::new();
+        match f.insts[id].kind {
+            Call { callee, args } => {
+                if !(self.call)(Site::Call(id)).is_some_and(|c| c.path.is_some()) {
+                    out.push(callee);
+                }
+                out.extend_from_slice(self.call_args(args));
+            }
+            CallOut { .. } | Param(_) => {}
+            MemCopy { dst, src, len } => out.extend([src, dst, len]),
+            Aggregate { ty: TyId::PAIR, fields } => out.extend_from_slice(fields.get(&f.value_pool)),
+            k if renders_todo(k) => {}
+            k => for_each_operand(k, f, |v| out.push(v)),
+        }
+        out
+    }
+
+    /// The operands `b`'s terminator prints, in order, with whether only pure
+    /// values may be inlined there: edge arguments of a `Branch` are evaluated on
+    /// some paths only, and a parallel assignment is hard enough to read already.
+    fn term_operands(&self, b: BlockId) -> Vec<(ValueId, bool)> {
+        let f = self.f;
+        let edge = |to: BlockId, args: &[ValueId], out: &mut Vec<(ValueId, bool)>, cond: bool| {
+            let params = f.blocks[to].params.get(&f.value_pool);
+            out.extend(params.iter().zip(args).filter(|(p, a)| p != a).map(|(_, &a)| (a, cond)));
+        };
+        let mut out = Vec::new();
+        match f.blocks[b].term {
+            Terminator::Jump { to, args } => {
+                // In a parallel assignment, only pure values stay readable inline.
+                edge(to, args.get(&f.value_pool), &mut out, false);
+                if out.len() > 1 {
+                    out.iter_mut().for_each(|o| o.1 = true);
+                }
+            }
+            Terminator::Branch { c, t, f: e, args } => {
+                out.push((c, false));
+                let a = args.get(&f.value_pool);
+                let nt = f.blocks[t].params.len as usize;
+                edge(t, &a[..nt], &mut out, true);
+                edge(e, &a[nt..], &mut out, true);
+            }
+            Terminator::Return(Some(v)) => out.push((v, false)),
+            Terminator::TailCall { callee, args } => {
+                if !(self.call)(Site::Tail(b)).is_some_and(|c| c.path.is_some()) {
+                    out.push((callee, false));
+                }
+                out.extend(self.call_args(args).iter().map(|&v| (v, false)));
+            }
+            Terminator::Return(None) | Terminator::Switch { .. } | Terminator::Unreachable => {}
+        }
+        out
+    }
+
+    /// A call's arguments as printed: straight from the lifter, a call lists all
+    /// six argument registers and more.
+    fn call_args(&self, args: ListRef) -> &[ValueId] {
+        let args = args.get(&self.f.value_pool);
+        if self.sig.is_none() {
+            &args[..args.len().min(6)]
+        } else {
+            args
+        }
+    }
+
+    /// Decide which values are printed inside the expression that uses them
+    /// instead of as a `let` of their own: values used exactly once, in the block
+    /// that defines them, as long as that doesn't change the order of memory
+    /// accesses and calls (a load never moves past a store or a call, and a call
+    /// or store never moves past any other access).
+    fn plan_inlining(&mut self, cfg: &Cfg) {
+        let f = self.f;
+        let n = f.insts.len();
+        let mut uses = vec![0u32; n];
+        // Used where it is evaluated on some paths only: a `Select` arm or an edge
+        // argument of a branch. Only pure values may move there.
+        let mut partial = vec![false; n];
+        for &b in &cfg.rpo {
+            for &id in f.blocks[b].insts.get(&f.value_pool) {
+                if self.skip[id.index()] {
+                    continue;
+                }
+                let ops = self.printed_operands(id);
+                let select = matches!(f.insts[id].kind, InstKind::Select { .. });
+                for (k, &o) in ops.iter().enumerate() {
+                    uses[o.index()] += 1;
+                    partial[o.index()] |= select && k > 0;
+                }
+            }
+            for (o, cond) in self.term_operands(b) {
+                uses[o.index()] += 1;
+                partial[o.index()] |= cond;
+            }
+        }
+        let mut inline = vec![false; n];
+        for &b in &cfg.rpo {
+            for &id in f.blocks[b].insts.get(&f.value_pool) {
+                let i = id.index();
+                inline[i] = uses[i] == 1
+                    && !self.skip[i]
+                    && !self.hoisted[i]
+                    && !self.trivial(id)
+                    && self.yields_value(id)
+                    && (!partial[i] || motion(f.insts[id].kind) == Motion::Pure);
+            }
+        }
+        self.inline = inline;
+        self.uses = uses;
+        let mut depth = vec![0u32; n];
+        let mut seq = Vec::new();
+        let mut pos = vec![0u32; n];
+        for &b in &cfg.rpo {
+            let insts = f.blocks[b].insts.get(&f.value_pool);
+            // Keep expressions shallow enough to read.
+            for &id in insts {
+                // Instructions that print as their operand add no nesting.
+                let own = match f.insts[id].kind {
+                    InstKind::PtrOffset { index: None, disp: 0, .. } | InstKind::IntToPtr(_) | InstKind::PtrToInt(_) => 0,
+                    _ => 1,
+                };
+                let d = own + self.printed_operands(id).iter().filter(|o| self.inline[o.index()]).map(|o| depth[o.index()]).max().unwrap_or(0);
+                if self.inline[id.index()] && d > MAX_INLINE_DEPTH {
+                    self.inline[id.index()] = false;
+                }
+                depth[id.index()] = d;
+            }
+            // A bounds-checked store borrows its slice mutably while its operands
+            // are evaluated, so a checked load can't be inside them.
+            for &id in insts {
+                if let InstKind::Store { ptr, val, .. } = f.insts[id].kind {
+                    if self.slice_root(ptr, true).is_some() {
+                        for o in [ptr, val] {
+                            if self.inline[o.index()] && self.reads_slice(o) {
+                                self.inline[o.index()] = false;
+                            }
+                        }
+                    }
+                }
+            }
+            for (k, &id) in insts.iter().enumerate() {
+                pos[id.index()] = k as u32;
+            }
+            // Un-inline whatever would run out of order, until nothing does.
+            loop {
+                seq.clear();
+                for &id in insts {
+                    if self.is_stmt(id) {
+                        self.eval_order(id, &mut seq);
+                    }
+                }
+                for (o, _) in self.term_operands(b) {
+                    if self.inline[o.index()] {
+                        self.eval_order(o, &mut seq);
+                    }
+                }
+                let (mut any, mut effect) = (None::<u32>, None::<u32>);
+                let mut late = Vec::new();
+                for &v in &seq {
+                    let p = pos[v.index()];
+                    match motion(f.insts[v].kind) {
+                        Motion::Pure => continue,
+                        Motion::Read if effect.is_some_and(|e| p < e) => late.push(v),
+                        Motion::Effect if any.is_some_and(|a| p < a) => late.push(v),
+                        Motion::Effect => effect = effect.max(Some(p)),
+                        Motion::Read => {}
+                    }
+                    any = any.max(Some(p));
+                }
+                if late.is_empty() {
+                    break;
+                }
+                for v in late {
+                    debug_assert!(self.inline[v.index()]);
+                    self.inline[v.index()] = false;
+                }
+            }
+        }
+    }
+
+    /// Does `v`'s expression, with what is inlined into it, read a safe-mode slice?
+    fn reads_slice(&self, v: ValueId) -> bool {
+        let checked = matches!(self.f.insts[v].kind, InstKind::Load { ptr, .. } if self.slice_root(ptr, false).is_some());
+        checked || self.printed_operands(v).iter().any(|&o| self.inline[o.index()] && self.reads_slice(o))
+    }
+
+    /// `v` and everything inlined into it are pure (`Motion::Pure`).
+    fn pure_tree(&self, v: ValueId) -> bool {
+        motion(self.f.insts[v].kind) == Motion::Pure && self.printed_operands(v).iter().all(|&o| !self.inline[o.index()] || self.pure_tree(o))
+    }
+
+    /// `id` and the values inlined into it, in the order they are evaluated.
+    fn eval_order(&self, id: ValueId, seq: &mut Vec<ValueId>) {
+        for o in self.printed_operands(id) {
+            if self.inline[o.index()] {
+                self.eval_order(o, seq);
+            }
+        }
+        seq.push(id);
+    }
+
+    /// Does `inst` print as an expression with a value (`Stmt::Value`)?
+    fn yields_value(&self, id: ValueId) -> bool {
+        use InstKind::*;
+        match self.f.insts[id].kind {
+            Call { .. } => {
+                let ret = match (self.call)(Site::Call(id)) {
+                    Some(CallInfo { path: Some(_), ret, ret2, .. }) => ret && !ret2,
+                    _ => true,
+                };
+                ret && self.used[id.index()]
+            }
+            Store { .. } | MemCopy { .. } | Param(_) => false,
+            k => !renders_todo(k),
+        }
+    }
+
+    /// `v` as an operand: its name, or its expression if it is inlined. `atom`:
+    /// the context binds tighter than any operator (a method receiver, an operand
+    /// of `as` or `==`), so anything but a simple expression needs parentheses.
+    fn op(&mut self, v: ValueId, atom: bool) -> String {
+        if !self.inline[v.index()] && !self.trivial(v) {
+            return self.name(v);
+        }
+        let Stmt::Value(e) = self.inst(v) else { unreachable!("inlined a statement") };
+        if atom && !atomic(&e) {
+            format!("({e})")
+        } else {
+            e
+        }
+    }
+
+    /// `v` as a `u64` call argument or return value.
+    fn op_u64(&mut self, v: ValueId) -> String {
+        if let Some(c) = self.const_of(v) {
+            return self.konst(c, TyId::B8);
+        }
+        match self.ty(v) {
+            TyId::B8 | TyId::PTR => self.op(v, false),
+            _ => format!("{} as u64", self.op(v, true)),
+        }
+    }
+
     /// The block's statements, one per line, without its terminator.
     fn stmt_lines(&mut self, b: BlockId) -> Vec<String> {
         let f = self.f;
         let blk = &f.blocks[b];
         let mut out = Vec::new();
         for &id in blk.insts.get(&f.value_pool) {
-            if self.skip[id.index()] {
+            if !self.is_stmt(id) {
                 continue;
             }
             let at = f.origin.get(id.index()).copied().unwrap_or(0);
@@ -513,8 +824,8 @@ impl Emitter<'_> {
     fn exit_line(&mut self, b: BlockId) -> String {
         let t = self.f.blocks[b].term;
         match t {
-            Terminator::Return(Some(v)) if self.ty(v) == TyId::PAIR => format!("return {};", self.name(v)),
-            Terminator::Return(Some(v)) => format!("return {} as u64;", self.name(v)),
+            Terminator::Return(Some(v)) if self.ty(v) == TyId::PAIR => format!("return {};", self.op(v, false)),
+            Terminator::Return(Some(v)) => format!("return {};", self.op_u64(v)),
             Terminator::Return(None) if self.sig.is_some_and(|s| !s.ret) => "return;".to_string(),
             Terminator::Return(None) => "return 0;".to_string(),
             Terminator::TailCall { callee, args } => {
@@ -550,7 +861,8 @@ impl Emitter<'_> {
                 let a = args.get(&f.value_pool);
                 let nt = f.blocks[t].params.len as usize;
                 let inner = format!("{ind}    ");
-                let _ = writeln!(out, "{ind}if {} {{", self.name(c));
+                let c = crate::structure::Cond::Atom(self.op(c, false));
+                let _ = writeln!(out, "{ind}if {c} {{");
                 self.goto(t, &a[..nt], &inner, out);
                 let _ = writeln!(out, "{ind}}} else {{");
                 self.goto(e, &a[nt..], &inner, out);
@@ -563,14 +875,23 @@ impl Emitter<'_> {
     }
 
     /// Pass edge arguments to `to`'s parameters, as a parallel assignment.
-    fn assign(&self, to: BlockId, args: &[ValueId]) -> Option<String> {
+    fn assign(&mut self, to: BlockId, args: &[ValueId]) -> Option<String> {
         let params = self.f.blocks[to].params.get(&self.f.value_pool);
-        let pairs: Vec<(String, String)> = params
-            .iter()
-            .zip(args)
-            .map(|(&p, &a)| (self.name(p), self.name(a)))
-            .filter(|(p, a)| p != a)
-            .collect();
+        let mut pairs = Vec::new();
+        for (&p, &a) in params.iter().zip(args) {
+            if p == a {
+                continue;
+            }
+            let (pt, at) = (self.ty(p), self.ty(a));
+            let v = match (pt, at) {
+                _ if rty(pt) == rty(at) => self.op(a, false),
+                // print a constant at the parameter's type
+                (_, at) if at != TyId::BOOL && self.const_of(a).is_some() => self.konst(self.const_of(a).unwrap(), pt),
+                (TyId::BOOL, _) => format!("{} != 0", self.op(a, true)),
+                _ => format!("{} as {}", self.op(a, true), rty(pt)),
+            };
+            pairs.push((self.name(p), v));
+        }
         match pairs.len() {
             0 => None,
             1 => Some(format!("{} = {};", pairs[0].0, pairs[0].1)),
@@ -582,7 +903,7 @@ impl Emitter<'_> {
     }
 
     /// State machine edge: assign `to`'s parameters, then jump.
-    fn goto(&self, to: BlockId, args: &[ValueId], ind: &str, out: &mut String) {
+    fn goto(&mut self, to: BlockId, args: &[ValueId], ind: &str, out: &mut String) {
         if let Some(a) = self.assign(to, args) {
             let _ = writeln!(out, "{ind}{a}");
         }
@@ -594,26 +915,18 @@ impl Emitter<'_> {
         let f = self.f;
         let ty = self.ty(id);
         let t = rty(ty);
-        let n = |v: ValueId| self.name(v);
+        if let Some(c) = self.const_of(id) {
+            return Stmt::Value(self.konst(c, ty));
+        }
         let e = match f.insts[id].kind {
-            Const(c) => {
-                let v = f.consts[c.index()];
-                match ty {
-                    TyId::BOOL => (v != 0).to_string(),
-                    _ => {
-                        let mask = if bytes(ty) >= 8 { u64::MAX as u128 } else { (1u128 << (bytes(ty) * 8)) - 1 };
-                        format!("{:#x}_{t}", v & mask)
-                    }
-                }
-            }
             Undef if ty == TyId::BOOL => "false".to_string(),
             CallOut { call, reg: crate::abi::RDX } if matches!(f.insts[call].kind, Call { .. }) && self.ret2(call) => {
-                format!("{}_pair.1", n(call))
+                format!("{}_pair.1", self.name(call))
             }
             Undef | CallOut { .. } => format!("0_{t}"),
             Aggregate { ty: TyId::PAIR, fields } => {
                 let v = fields.get(&f.value_pool);
-                format!("({} as u64, {} as u64)", n(v[0]), n(v[1]))
+                format!("({}, {})", self.op_u64(v[0]), self.op_u64(v[1]))
             }
             AddrOfLocal(_) => "frame.as_mut_ptr() as u64".to_string(),
             Call { callee, args } => {
@@ -627,19 +940,22 @@ impl Emitter<'_> {
                 call
             }
             Param(i) => format!("todo!(\"param {i}\")"),
-            BlockParam(_) => n(id),
+            BlockParam(_) => self.name(id),
             Bin { op, lhs, rhs } => self.bin(op, lhs, rhs),
-            Un { op, v } => match op {
-                UnOp::Neg => format!("{}.wrapping_neg()", n(v)),
-                UnOp::Not => format!("!{}", n(v)),
-                UnOp::Bswap => format!("{}.swap_bytes()", n(v)),
-                UnOp::Popcnt => format!("{}.count_ones() as {t}", n(v)),
-                UnOp::Ctz => format!("{}.trailing_zeros() as {t}", n(v)),
-                UnOp::Clz => format!("{}.leading_zeros() as {t}", n(v)),
-            },
+            Un { op, v } => {
+                let a = self.op(v, true);
+                match op {
+                    UnOp::Neg => format!("{a}.wrapping_neg()"),
+                    UnOp::Not => format!("!{a}"),
+                    UnOp::Bswap => format!("{a}.swap_bytes()"),
+                    UnOp::Popcnt => format!("{a}.count_ones() as {t}"),
+                    UnOp::Ctz => format!("{a}.trailing_zeros() as {t}"),
+                    UnOp::Clz => format!("{a}.leading_zeros() as {t}"),
+                }
+            }
             Cmp { cc, lhs, rhs } => {
-                let (a, b) = (n(lhs), n(rhs));
                 let s = signed(self.ty(lhs));
+                let (a, b) = (self.op(lhs, true), self.op(rhs, true));
                 match cc {
                     Cond::Eq => format!("{a} == {b}"),
                     Cond::Ne => format!("{a} != {b}"),
@@ -653,18 +969,32 @@ impl Emitter<'_> {
                     Cond::Sge => format!("({a} as {s}) >= ({b} as {s})"),
                 }
             }
-            Cast { kind, v } => match kind {
-                CastKind::SExt => format!("{} as {} as {t}", n(v), signed(self.ty(v))),
-                _ => format!("{} as {t}", n(v)),
-            },
-            Select { c, t: a, f: b } => format!("if {} {{ {} }} else {{ {} }}", n(c), n(a), n(b)),
+            Cast { kind, v } => {
+                let a = self.op(v, true);
+                match kind {
+                    CastKind::SExt => format!("{a} as {} as {t}", signed(self.ty(v))),
+                    _ => format!("{a} as {t}"),
+                }
+            }
+            Select { c, t: a, f: b } => {
+                let (c, a, b) = (self.op(c, false), self.op(a, false), self.op(b, false));
+                format!("if {c} {{ {a} }} else {{ {b} }}")
+            }
+            PtrOffset { base, index: Some(i), scale, disp } if self.const_of(base) == Some(0) => {
+                // `0 + i*scale + disp`: print the index part alone
+                let mut s = if scale == 1 { self.op(i, true) } else { format!("{}.wrapping_mul({scale})", self.op(i, true)) };
+                if disp != 0 {
+                    s = if disp < 0 { format!("{s}.wrapping_sub({:#x})", -(disp as i64)) } else { format!("{s}.wrapping_add({disp:#x})") };
+                }
+                s
+            }
             PtrOffset { base, index, scale, disp } => {
-                let mut s = n(base);
+                let mut s = self.op(base, true);
                 if let Some(i) = index {
                     s = if scale == 1 {
-                        format!("{s}.wrapping_add({})", n(i))
+                        format!("{s}.wrapping_add({})", self.op(i, false))
                     } else {
-                        format!("{s}.wrapping_add({}.wrapping_mul({scale}))", n(i))
+                        format!("{s}.wrapping_add({}.wrapping_mul({scale}))", self.op(i, true))
                     };
                 }
                 match disp {
@@ -674,19 +1004,15 @@ impl Emitter<'_> {
                 }
             }
             IntToPtr(v) => match f.insts[v].kind {
-                Const(c) => (self.global_of)(f.consts[c.index()] as u64).unwrap_or_else(|| n(v)),
-                _ => n(v),
+                Const(c) => (self.global_of)(f.consts[c.index()] as u64).unwrap_or_else(|| self.op(v, false)),
+                _ => self.op(v, false),
             },
-            PtrToInt(v) => n(v),
+            PtrToInt(v) => self.op(v, false),
             Load { ptr, .. } => self.load(ptr, ty),
             Store { ptr, val, .. } => return Stmt::Effect(self.store(ptr, val)),
             MemCopy { dst, src, len } => {
-                let s = format!(
-                    "unsafe {{ core::ptr::copy({} as *const u8, {} as *mut u8, {} as usize) }}",
-                    n(src),
-                    n(dst),
-                    n(len)
-                );
+                let (src, dst, len) = (self.op(src, true), self.op(dst, true), self.op(len, true));
+                let s = format!("unsafe {{ core::ptr::copy({src} as *const u8, {dst} as *mut u8, {len} as usize) }}");
                 self.stats.raw += 1;
                 return Stmt::Effect(s);
             }
@@ -702,6 +1028,18 @@ impl Emitter<'_> {
         Stmt::Value(e)
     }
 
+    /// The constant `v` as a literal of type `ty`.
+    fn konst(&self, v: u128, ty: TyId) -> String {
+        if ty == TyId::BOOL {
+            return (v != 0).to_string();
+        }
+        let mask = if bytes(ty) >= 8 { u64::MAX as u128 } else { (1u128 << (bytes(ty) * 8)) - 1 };
+        match v & mask {
+            v if v < 10 => format!("{v}_{}", rty(ty)),
+            v => format!("{v:#x}_{}", rty(ty)),
+        }
+    }
+
     /// Does the call `call` return rax:rdx?
     fn ret2(&self, call: ValueId) -> bool {
         (self.call)(Site::Call(call)).is_some_and(|c| c.ret2)
@@ -710,12 +1048,14 @@ impl Emitter<'_> {
     /// A call to the callee at `site`, and whether it returns a value (`ret`), and
     /// two (`ret2`, as a `(u64, u64)`).
     fn call_expr(&mut self, site: Site, callee: ValueId, args: ListRef) -> (String, bool, bool) {
-        let args = args.get(&self.f.value_pool);
-        // Straight from the lifter, a call lists all six argument registers and more.
-        let args = if self.sig.is_none() { &args[..args.len().min(6)] } else { args };
-        let a: Vec<String> = args.iter().map(|&v| format!("{} as u64", self.name(v))).collect();
+        let info = (self.call)(site);
+        let named = matches!(info, Some(CallInfo { path: Some(_), .. }));
+        // The callee is evaluated first, as `printed_operands` says.
+        let callee = if named { String::new() } else { self.op(callee, true) };
+        let args = self.call_args(args).to_vec();
+        let a: Vec<String> = args.iter().map(|&v| self.op_u64(v)).collect();
         let a = a.join(", ");
-        match (self.call)(site) {
+        match info {
             Some(CallInfo { path: Some(p), ret, ret2, foreign }) => {
                 if foreign {
                     self.stats.raw += 1;
@@ -729,23 +1069,35 @@ impl Emitter<'_> {
             _ => {
                 self.stats.raw += 1;
                 let tys = vec!["u64"; args.len()].join(", ");
-                let callee = self.name(callee);
                 (format!("unsafe {{ core::mem::transmute::<u64, unsafe extern \"C\" fn({tys}) -> u64>({callee})({a}) }}"), true, false)
             }
         }
     }
 
-    fn bin(&self, op: BinOp, lhs: ValueId, rhs: ValueId) -> String {
-        let (a, b) = (self.name(lhs), self.name(rhs));
+    fn bin(&mut self, op: BinOp, lhs: ValueId, rhs: ValueId) -> String {
         let ty = self.ty(lhs);
         let (t, s) = (rty(ty), signed(ty));
         if ty == TyId::BOOL {
+            let (a, b) = (self.op(lhs, true), self.op(rhs, true));
             let o = match op {
                 BinOp::And => "&",
                 BinOp::Or => "|",
                 _ => "^",
             };
             return format!("{a} {o} {b}");
+        }
+        // Method calls take the right operand as an argument; operators and `as`
+        // need it atomic.
+        let method = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::RotL | BinOp::RotR | BinOp::Shl | BinOp::LShr);
+        let a = self.op(lhs, true);
+        let shift = matches!(op, BinOp::Shl | BinOp::LShr | BinOp::AShr | BinOp::RotL | BinOp::RotR);
+        // A shift amount is a `u32`; a constant one needs no cast.
+        let b = match self.const_of(rhs) {
+            Some(c) if shift => return self.bin_shift(op, a, &(c as u32).to_string(), t, s),
+            _ => self.op(rhs, !method || shift),
+        };
+        if shift {
+            return self.bin_shift(op, a, &format!("{b} as u32"), t, s);
         }
         match op {
             BinOp::Add => format!("{a}.wrapping_add({b})"),
@@ -758,11 +1110,18 @@ impl Emitter<'_> {
             BinOp::And => format!("{a} & {b}"),
             BinOp::Or => format!("{a} | {b}"),
             BinOp::Xor => format!("{a} ^ {b}"),
-            BinOp::Shl => format!("{a}.wrapping_shl({b} as u32)"),
-            BinOp::LShr => format!("{a}.wrapping_shr({b} as u32)"),
-            BinOp::AShr => format!("({a} as {s}).wrapping_shr({b} as u32) as {t}"),
-            BinOp::RotL => format!("{a}.rotate_left({b} as u32)"),
-            BinOp::RotR => format!("{a}.rotate_right({b} as u32)"),
+            BinOp::Shl | BinOp::LShr | BinOp::AShr | BinOp::RotL | BinOp::RotR => unreachable!(),
+        }
+    }
+
+    /// A shift or rotate of `a` by `n` (a `u32` expression).
+    fn bin_shift(&self, op: BinOp, a: String, n: &str, t: &str, s: &str) -> String {
+        match op {
+            BinOp::Shl => format!("{a}.wrapping_shl({n})"),
+            BinOp::LShr => format!("{a}.wrapping_shr({n})"),
+            BinOp::AShr => format!("({a} as {s}).wrapping_shr({n}) as {t}"),
+            BinOp::RotL => format!("{a}.rotate_left({n})"),
+            _ => format!("{a}.rotate_right({n})"),
         }
     }
 
@@ -786,8 +1145,10 @@ impl Emitter<'_> {
     }
 
     fn load(&mut self, ptr: ValueId, ty: TyId) -> String {
-        let (t, len, p) = (rty(ty), bytes(ty), self.name(ptr));
-        if let Some((root, ArgKind::Slice { nullable, mutbl })) = self.slice_root(ptr, false) {
+        let (t, len) = (rty(ty), bytes(ty));
+        let root = self.slice_root(ptr, false);
+        let p = self.op(ptr, true);
+        if let Some((root, ArgKind::Slice { nullable, mutbl })) = root {
             self.stats.checked += 1;
             let s = match (nullable, mutbl) {
                 (false, _) => format!("{root}_ref"),
@@ -802,14 +1163,52 @@ impl Emitter<'_> {
 
     fn store(&mut self, ptr: ValueId, val: ValueId) -> String {
         let vt = self.ty(val);
-        let (t, len, p, v) = (rty(vt), bytes(vt), self.name(ptr), self.name(val));
-        if let Some((root, ArgKind::Slice { nullable, .. })) = self.slice_root(ptr, true) {
+        let (t, len) = (rty(vt), bytes(vt));
+        let root = self.slice_root(ptr, true);
+        let p = self.op(ptr, true);
+        if let Some((root, ArgKind::Slice { nullable, .. })) = root {
             self.stats.checked += 1;
+            let v = self.op(val, true);
             let s = if nullable { format!("{root}_ref.as_deref_mut().unwrap()") } else { format!("{root}_ref") };
             return format!("{s}[{p}.wrapping_sub({root}_base) as usize..][..{len}].copy_from_slice(&{v}.to_le_bytes())");
         }
         self.stats.raw += 1;
+        let v = self.op(val, false);
         format!("unsafe {{ ({p} as *mut {t}).write_unaligned({v}) }}")
+    }
+}
+
+/// How deep an expression may get through inlining (`Emitter::plan_inlining`).
+const MAX_INLINE_DEPTH: u32 = 4;
+
+/// Kinds the emitter prints as `todo!()`, ignoring their operands.
+fn renders_todo(k: InstKind) -> bool {
+    use InstKind::*;
+    match k {
+        Aggregate { ty, .. } => ty != TyId::PAIR,
+        Exit { .. } | AddrOfGlobal(_) | FuncRef(_) | ImportRef(_) | Copy(_) | Move(_) | Assign { .. } | Borrow { .. } | Opaque { .. } => true,
+        _ => false,
+    }
+}
+
+/// What moving an instruction's evaluation can disturb.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Motion {
+    /// Free to move: arithmetic, comparisons, address computations.
+    Pure,
+    /// Reads memory or can panic: must not move past an `Effect`.
+    Read,
+    /// Calls and writes: must not move past a `Read` or another `Effect`.
+    Effect,
+}
+
+fn motion(k: InstKind) -> Motion {
+    use InstKind::*;
+    match k {
+        Load { volatile: false, .. } | Bin { op: BinOp::UDiv | BinOp::SDiv | BinOp::URem | BinOp::SRem, .. } => Motion::Read,
+        Call { .. } | Store { .. } | MemCopy { .. } | Load { .. } | Param(_) => Motion::Effect,
+        k if renders_todo(k) => Motion::Effect,
+        _ => Motion::Pure,
     }
 }
 
@@ -827,12 +1226,30 @@ impl Source for Emitter<'_> {
         self.stmt_lines(b).into_iter().map(Node::Line).collect()
     }
 
+    fn speculate(&self, b: BlockId) -> bool {
+        let insts = self.f.blocks[b].insts.get(&self.f.value_pool);
+        let stmts: Vec<ValueId> = insts.iter().copied().filter(|&id| self.is_stmt(id)).collect();
+        stmts.len() <= 3 && stmts.iter().all(|&id| self.pure_tree(id) && self.yields_value(id))
+    }
+
+    fn forwards(&self, b: BlockId) -> bool {
+        let f = self.f;
+        let blk = &f.blocks[b];
+        let Terminator::Jump { args, .. } = blk.term else { return false };
+        let args = args.get(&f.value_pool);
+        let quiet = blk.insts.get(&f.value_pool).iter().all(|&id| {
+            self.skip[id.index()] || self.trivial(id) || (self.inline[id.index()] && motion(f.insts[id].kind) == Motion::Pure)
+        });
+        let once = |p: &ValueId| self.uses[p.index()] == 1 && args.iter().filter(|&a| a == p).count() == 1;
+        quiet && blk.params.get(&f.value_pool).iter().all(once)
+    }
+
     fn edge(&mut self, to: BlockId, args: &[ValueId]) -> Vec<Node> {
         self.assign(to, args).map(Node::Line).into_iter().collect()
     }
 
-    fn cond(&self, c: ValueId) -> String {
-        self.name(c)
+    fn cond(&mut self, c: ValueId) -> String {
+        self.op(c, false)
     }
 
     fn exit(&mut self, b: BlockId) -> Node {

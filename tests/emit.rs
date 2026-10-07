@@ -55,9 +55,9 @@ fn sum_loop_runs_the_same_in_both_modes() {
     assert!(safe.starts_with("pub fn sum(rdi_ref: &mut [u8], mut rsi: u64, mut rcx: u64) -> u64 {"), "{safe}");
     assert!(!safe.contains("unsafe"), "{safe}");
     assert!(fast.starts_with("pub unsafe fn sum(mut rdi: u64, mut rsi: u64, mut rcx: u64) -> u64 {"), "{fast}");
-    // The loop is structured: exit with `break`, return after it.
-    assert!(fast.contains("    loop {\n") && fast.contains("            break;\n") && !fast.contains("match bb"), "{fast}");
-    assert!(fast.ends_with("    }\n    return v19 as u64;\n}\n"), "{fast}");
+    // The loop is structured: a `while` on the inlined condition, return after it.
+    assert!(fast.contains("    while v6 < rsi {\n") && !fast.contains("match bb"), "{fast}");
+    assert!(fast.ends_with("    }\n    return v19;\n}\n"), "{fast}");
 
     let main = r#"
 mod fast { include!("fast.rs"); }
@@ -83,6 +83,54 @@ fn main() {
     let dir = scratch("sum");
     std::fs::write(dir.join("fast.rs"), format!("{PRELUDE}{fast}").replace("#![allow", "#[allow")).unwrap();
     std::fs::write(dir.join("safe.rs"), format!("{PRELUDE}{safe}").replace("#![allow", "#[allow")).unwrap();
+    rustc(&dir, "main.rs", main, &["-o", dir.join("run").to_str().unwrap()]);
+    let out = Command::new(dir.join("run")).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// `if a < b || c == 0` is one `if` with `||`, not two tests and a labeled
+/// block, and `while` loops test their condition in the `while`.
+#[test]
+fn short_circuit_and_while() {
+    // rax = 0; while rdi < rsi { if rdi < rdx || rcx == 0 { rax += 1 } else { rax += 2 }; rdi += 1 }
+    let mut a = CodeAssembler::new(64).unwrap();
+    let (mut head, mut body, mut yes, mut next, mut done) =
+        (a.create_label(), a.create_label(), a.create_label(), a.create_label(), a.create_label());
+    a.xor(eax, eax).unwrap();
+    a.set_label(&mut head).unwrap();
+    a.cmp(rdi, rsi).unwrap();
+    a.jae(done).unwrap();
+    a.set_label(&mut body).unwrap();
+    a.cmp(rdi, rdx).unwrap();
+    a.jb(yes).unwrap();
+    a.test(rcx, rcx).unwrap();
+    a.je(yes).unwrap();
+    a.add(rax, 2).unwrap();
+    a.jmp(next).unwrap();
+    a.set_label(&mut yes).unwrap();
+    a.add(rax, 1).unwrap();
+    a.set_label(&mut next).unwrap();
+    a.add(rdi, 1).unwrap();
+    a.jmp(head).unwrap();
+    a.set_label(&mut done).unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(common::BASE).unwrap();
+    let fast = emit(&code, "f", Mode::Fast);
+    assert!(fast.lines().any(|l| l.starts_with("    while ") && l.ends_with(" < rsi {")), "{fast}");
+    assert!(fast.contains(" || "), "{fast}");
+    assert!(!fast.contains("'b") && !fast.contains("bb"), "{fast}");
+
+    let main = r#"
+mod fast { include!("fast.rs"); }
+fn main() {
+    let r = |x: u64, n: u64, lo: u64, z: u64| unsafe { fast::f(x, n, lo, z) };
+    assert_eq!(r(0, 4, 2, 1), 1 + 1 + 2 + 2);
+    assert_eq!(r(0, 4, 0, 0), 4);
+    assert_eq!(r(5, 4, 0, 0), 0);
+}
+"#;
+    let dir = scratch("short");
+    std::fs::write(dir.join("fast.rs"), format!("{PRELUDE}{fast}").replace("#![allow", "#[allow")).unwrap();
     rustc(&dir, "main.rs", main, &["-o", dir.join("run").to_str().unwrap()]);
     let out = Command::new(dir.join("run")).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -268,10 +316,18 @@ fn structured_control_flow_matches_the_state_machine() {
         emit_function_with(&f, &format!("sm{p}"), Mode::Fast, false, &|_| None, &|_| None, &mut sm);
         if stats.state_machines > 0 {
             machines += 1;
-        } else if st.contains("loop {") || st.contains("if ") {
+        } else if st.contains("loop {") || st.contains("while ") || st.contains("if ") {
             structured += 1;
         }
-        let fuel = |src: String, n: u32| src.replace("loop {", &format!("loop {{ fuel!({n});"));
+        // Every loop, `loop` or `while`, burns fuel on each iteration.
+        let fuel = |src: String, n: u32| {
+            let line = |l: &str| {
+                let t = l.trim_start();
+                let head = t.starts_with("loop {") || t.starts_with("while ") || (t.starts_with('\'') && (t.contains(": loop {") || t.contains(": while ")));
+                if head && l.ends_with(" {") { format!("{l} fuel!({n});\n") } else { format!("{l}\n") }
+            };
+            src.lines().map(line).collect::<String>()
+        };
         lib.push_str(&format!("// {code:02x?}\n{}{}", fuel(st, 1_000), fuel(sm, 1_000_000)));
         let arity = sm_arity(&lib, p);
         let args = (0..arity).map(|k| format!("x[{k}]")).collect::<Vec<_>>().join(", ");

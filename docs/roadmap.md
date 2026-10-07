@@ -28,7 +28,6 @@ Whole-program signature recovery ([calls.md](calls.md)): arguments, stack argume
 - Indirect calls (function pointers, vtables) guess their arguments from the call site. Recovering vtables (step 6) would give them targets.
 - Floating-point and vector arguments and returns (xmm registers) aren't tracked yet, which matters once SSE arithmetic lifts (step 1); 16-byte copies don't need it.
 - In safe mode, functions that other decompiled functions call take integers, because callers have addresses, not slices. Passing slices across calls needs the call summaries of step 7.
-- Function discovery still comes from symbols (step 8).
 
 ## 3. Stack frames (done)
 
@@ -67,7 +66,7 @@ Stages 5 to 7 in [ownership.md](ownership.md): call summaries and moves (`malloc
 
 ## 8. Binary handling
 
-- Stripped binaries: discover functions from the entry point, call targets and `.eh_frame`, instead of requiring `--addr`/`--size`.
+- ~~Stripped binaries: discover functions from the entry point, call targets and `.eh_frame`, instead of requiring `--addr`/`--size`.~~ Done ([cli.md](cli.md#stripped-binaries)): on chungusite's stripped debug build all 20,025 function starts are found. Still open: noreturn calls (`__stack_chk_fail`, `abort`) for binaries without unwind tables, and Mach-O `LC_FUNCTION_STARTS`.
 - ~~Demangle C++ and Rust symbol names.~~ Done.
 - ~~Lift functions in parallel with `rayon`, one `Lifter` and `Function` per thread, as ir.md plans.~~ Done (`-j`).
 

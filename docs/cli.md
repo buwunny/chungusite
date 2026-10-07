@@ -13,7 +13,7 @@ chungusite --hex "48 8b 47 08 c3"          # raw bytes, loaded at 0x1000, no fil
 chungusite ./prog -j 1                     # one worker thread (default: one per CPU)
 ```
 
-Input is any x86_64 ELF, Mach-O or PE file (`object` crate). Functions come from the symbol table, falling back to the dynamic symbols, so a stripped binary needs `--addr` with `--size`.
+Input is any x86_64 ELF, Mach-O or PE file (`object` crate). Functions come from the symbol table. A stripped binary (no function in the static symbol table) works the same way: functions are discovered instead (`src/discover.rs`), see [Stripped binaries](#stripped-binaries). `--addr` with `--size` lifts bytes that nothing finds.
 
 Rust (legacy and v0) and Itanium C++ symbols are demangled, without the Rust hash or the C++ parameter list: `_ZN4core3fmt5write17h…E` shows as `core::fmt::write` in `--list` and the headers, and becomes the identifier `core__fmt__write`. `-f` accepts either form.
 
@@ -102,6 +102,20 @@ Each static is the data symbol covering the address, sized by the symbol table. 
 
 Slots the dynamic loader fills with an address (GOT entries, vtables, pointer tables, from the binary's dynamic relocations) are emitted as pointers to the static or function they point to, and those statics are emitted too. Each GOT slot is its own 8-byte static, so only the slots the code uses appear. A slot pointing at an import is null, and one pointing at a function of the binary that isn't in the output (not selected, or left out by `--skip-failed`) keeps its bytes from the file, so the output compiles either way. Only data the selected functions reach is emitted; `tests/globals.rs` builds a cdylib, decompiles it and runs the result against the original's statics.
 
+## Stripped binaries
+
+Without a symbol table, `src/discover.rs` finds functions from, most trusted first:
+
+1. unwind tables: the FDEs in `.eh_frame` (ELF, Mach-O) or `.pdata` (PE), which give the exact start and length of every function compiled with unwind info, the default on x86_64;
+2. the dynamic symbols (exports), which `strip` keeps and which keep their names;
+3. the entry point and the start of each code section;
+4. targets of direct calls and jumps out of a function, `lea reg, [rip+x]` into code, `mov reg, imm` into code in a non-PIE binary, and code addresses the loader writes into data (vtables, function tables);
+5. code that none of the above covers, if it starts with a prologue (`endbr64`, `push rbp`/`rbx`/`r12`-`r15`, `sub rsp, ..`) or at a 16-byte boundary, after any alignment padding.
+
+This repeats until nothing new turns up. A function without unwind info ends at the last instruction its control flow reaches before the next known start. A candidate strictly inside an FDE's range is rejected. Discovered functions are named `sub_<addr>`, except `_start` (the entry point), `main` (what `_start` passes to `__libc_start_main` in `rdi`), and `_init`/`_fini` (the `.init`/`.fini` sections). Calls into imports are named as before, from the PLT stubs and GOT relocations, which `strip` keeps. The summary on stderr says how many functions were discovered.
+
+On chungusite's own debug build, `strip` keeps none of its 20,025 function symbols, and discovery finds all 20,025 starts. 20,021 sizes match the symbol table exactly; the other 4 are crtstuff's hand-written functions, whose symbol sizes include their trailing padding. Lifting and type-checking give the same results with and without symbols. Known gap: without unwind tables, discovery doesn't know which calls don't return, so a function ending in a call to `__stack_chk_fail` or `abort` can run into the next one (gcc -O2 with `-fno-asynchronous-unwind-tables` merges 1 of the corpus's 88 functions this way).
+
 ## Tests
 
 `tests/emit.rs` compiles what the emitter prints with `rustc`:
@@ -110,5 +124,7 @@ Slots the dynamic loader fills with an address (GOT entries, vtables, pointer ta
 - 400 random programs built from supported instructions, in both modes, which must all type-check;
 - 300 random register-only programs emitted both structured and as the state machine, run on the same random inputs, which must return the same values (programs that don't terminate run out of fuel and are skipped);
 - the real binary on a small ELF built in the test: `--list`, both modes, `-f`, `--emit ir` and the exit codes.
+
+`tests/discover.rs` links `tests/differential/corpus.c` with each C compiler found, with and without unwind tables and as a non-PIE, strips a copy, and checks that `--list` on the stripped copy finds the same function starts as the symbol table (and the same sizes, except the crt functions), names `main`, and that the stripped copy's output type-checks in both modes.
 
 `tests/globals.rs` decompiles a cdylib that reads a `static`, writes a `static mut` (both through the GOT) and has a mangled function, then links the output into a program that checks the values. It also checks that `-j 1` and `-j 4` print the same thing.

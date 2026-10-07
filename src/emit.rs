@@ -12,14 +12,16 @@
 //!   bounds-checked slice read or write; everything else falls back to the
 //!   fast-mode raw access. The function is only `unsafe` if a raw access remains.
 //!
-//! Control flow is emitted as-is: a single-block function is straight-line code,
-//! anything with edges is a `loop { match bb { .. } }` state machine with block
-//! parameters as mutable variables. Recovering `if`/`while` is future work.
+//! Control flow is structured (`structure.rs`): `if`/`else`, `loop` with `break`
+//! and `continue`, and early `return`, with block parameters as mutable variables.
+//! An irreducible CFG falls back to a `loop { match bb { .. } }` state machine,
+//! which is correct for any CFG.
 //!
 //! The input must be clean SSA (`opt::clean`), which is what the borrow analysis
 //! expects too.
 use crate::borrow::{analyze, Class, ParamBorrow, RSP};
 use crate::cfg::Cfg;
+use crate::structure::{print, structure, Node, Source};
 use crate::ir::*;
 use crate::verify::for_each_operand;
 use std::fmt::Write;
@@ -38,6 +40,9 @@ pub struct EmitStats {
     pub raw: usize,
     /// Instructions or terminators the emitter can't express yet (`todo!()`).
     pub todo: usize,
+    /// Functions whose control flow is irreducible, emitted as a
+    /// `loop { match bb { .. } }` state machine instead of structured code.
+    pub state_machines: usize,
 }
 
 const REG: [&str; 16] = [
@@ -56,6 +61,8 @@ enum ArgKind {
 
 struct Emitter<'a> {
     f: &'a Function,
+    /// Try structured control flow before the state machine.
+    structure: bool,
     /// Borrow analysis (safe mode only).
     borrow: Option<crate::borrow::Analysis>,
     args: Vec<ArgKind>,
@@ -79,7 +86,7 @@ pub fn emit_function(
     name_of: &dyn Fn(u64) -> Option<String>,
     out: &mut String,
 ) -> EmitStats {
-    emit_function_with_globals(f, name, mode, name_of, &|_| None, out)
+    emit_function_with(f, name, mode, true, name_of, &|_| None, out)
 }
 
 /// `emit_function`, plus `global_of`, which turns a constant address used as a
@@ -89,6 +96,20 @@ pub fn emit_function_with_globals(
     f: &Function,
     name: &str,
     mode: Mode,
+    name_of: &dyn Fn(u64) -> Option<String>,
+    global_of: &dyn Fn(u64) -> Option<String>,
+    out: &mut String,
+) -> EmitStats {
+    emit_function_with(f, name, mode, true, name_of, global_of, out)
+}
+
+/// `emit_function_with_globals`, choosing whether to structure control flow. With
+/// `structure: false` every function with a branch is a state machine.
+pub fn emit_function_with(
+    f: &Function,
+    name: &str,
+    mode: Mode,
+    structure: bool,
     name_of: &dyn Fn(u64) -> Option<String>,
     global_of: &dyn Fn(u64) -> Option<String>,
     out: &mut String,
@@ -112,6 +133,7 @@ pub fn emit_function_with_globals(
 
     let mut e = Emitter {
         f,
+        structure,
         borrow,
         args,
         entry_param,
@@ -288,6 +310,17 @@ impl Emitter<'_> {
             self.block(f.entry, "    ", out);
             return;
         }
+        // Structured `if`/`loop` when the CFG allows it. Statements are emitted
+        // again below if it doesn't, so count them only once.
+        let before = self.stats;
+        if self.structure {
+            if let Some(nodes) = structure(f, cfg, self) {
+                print(&nodes, 1, out);
+                return;
+            }
+            self.stats = before;
+        }
+        self.stats.state_machines += 1;
         let _ = writeln!(out, "    let mut bb: u32 = {};", f.entry.index());
         out.push_str("    loop {\n        match bb {\n");
         for &b in &cfg.rpo {
@@ -298,43 +331,28 @@ impl Emitter<'_> {
         out.push_str("            _ => unreachable!(),\n        }\n    }\n");
     }
 
-    fn block(&mut self, b: BlockId, ind: &str, out: &mut String) {
+    /// The block's statements, one per line, without its terminator.
+    fn stmt_lines(&mut self, b: BlockId) -> Vec<String> {
         let f = self.f;
         let blk = &f.blocks[b];
+        let mut out = Vec::new();
         for &id in blk.insts.get(&f.value_pool) {
             let at = f.origin.get(id.index()).copied().unwrap_or(0);
-            match self.inst(id) {
-                Stmt::Value(e) if self.hoisted[id.index()] => {
-                    let _ = writeln!(out, "{ind}{} = {e}; // {at:#x}", self.name(id));
-                }
-                Stmt::Value(e) => {
-                    let _ = writeln!(out, "{ind}let {}: {} = {e}; // {at:#x}", self.name(id), rty(self.ty(id)));
-                }
-                Stmt::Effect(e) => {
-                    let _ = writeln!(out, "{ind}{e}; // {at:#x}");
-                }
-            }
+            out.push(match self.inst(id) {
+                Stmt::Value(e) if self.hoisted[id.index()] => format!("{} = {e}; // {at:#x}", self.name(id)),
+                Stmt::Value(e) => format!("let {}: {} = {e}; // {at:#x}", self.name(id), rty(self.ty(id))),
+                Stmt::Effect(e) => format!("{e}; // {at:#x}"),
+            });
         }
-        match blk.term {
-            Terminator::Jump { to, args } => {
-                self.edge(to, args.get(&f.value_pool), ind, out);
-            }
-            Terminator::Branch { c, t, f: e, args } => {
-                let a = args.get(&f.value_pool);
-                let nt = f.blocks[t].params.len as usize;
-                let inner = format!("{ind}    ");
-                let _ = writeln!(out, "{ind}if {} {{", self.name(c));
-                self.edge(t, &a[..nt], &inner, out);
-                let _ = writeln!(out, "{ind}}} else {{");
-                self.edge(e, &a[nt..], &inner, out);
-                let _ = writeln!(out, "{ind}}}");
-            }
-            Terminator::Return(Some(v)) => {
-                let _ = writeln!(out, "{ind}return {} as u64;", self.name(v));
-            }
-            Terminator::Return(None) => {
-                let _ = writeln!(out, "{ind}return 0;");
-            }
+        out
+    }
+
+    /// A terminator that leaves the function (or can't be expressed yet).
+    fn exit_line(&mut self, t: Terminator) -> String {
+        let f = self.f;
+        match t {
+            Terminator::Return(Some(v)) => format!("return {} as u64;", self.name(v)),
+            Terminator::Return(None) => "return 0;".to_string(),
             Terminator::TailCall { callee, .. } => {
                 self.stats.todo += 1;
                 let target = match f.insts[callee].kind {
@@ -347,20 +365,45 @@ impl Emitter<'_> {
                     },
                     _ => self.name(callee),
                 };
-                let _ = writeln!(out, "{ind}todo!(\"tail call to {target}: argument recovery not implemented\");");
+                format!("todo!(\"tail call to {target}: argument recovery not implemented\");")
             }
             Terminator::Switch { .. } => {
                 self.stats.todo += 1;
-                let _ = writeln!(out, "{ind}todo!(\"switch\");");
+                "todo!(\"switch\");".to_string()
             }
-            Terminator::Unreachable => {
-                let _ = writeln!(out, "{ind}panic!(\"execution ran past the end of the lifted code\");");
+            Terminator::Unreachable => "panic!(\"execution ran past the end of the lifted code\");".to_string(),
+            Terminator::Jump { .. } | Terminator::Branch { .. } => unreachable!("not an exit"),
+        }
+    }
+
+    /// One `match` arm of the state machine.
+    fn block(&mut self, b: BlockId, ind: &str, out: &mut String) {
+        let f = self.f;
+        for line in self.stmt_lines(b) {
+            let _ = writeln!(out, "{ind}{line}");
+        }
+        match f.blocks[b].term {
+            Terminator::Jump { to, args } => {
+                self.goto(to, args.get(&f.value_pool), ind, out);
+            }
+            Terminator::Branch { c, t, f: e, args } => {
+                let a = args.get(&f.value_pool);
+                let nt = f.blocks[t].params.len as usize;
+                let inner = format!("{ind}    ");
+                let _ = writeln!(out, "{ind}if {} {{", self.name(c));
+                self.goto(t, &a[..nt], &inner, out);
+                let _ = writeln!(out, "{ind}}} else {{");
+                self.goto(e, &a[nt..], &inner, out);
+                let _ = writeln!(out, "{ind}}}");
+            }
+            t => {
+                let _ = writeln!(out, "{ind}{}", self.exit_line(t));
             }
         }
     }
 
-    /// Pass edge arguments to `to`'s parameters (a parallel assignment) and jump.
-    fn edge(&self, to: BlockId, args: &[ValueId], ind: &str, out: &mut String) {
+    /// Pass edge arguments to `to`'s parameters, as a parallel assignment.
+    fn assign(&self, to: BlockId, args: &[ValueId]) -> Option<String> {
         let params = self.f.blocks[to].params.get(&self.f.value_pool);
         let pairs: Vec<(String, String)> = params
             .iter()
@@ -369,14 +412,19 @@ impl Emitter<'_> {
             .filter(|(p, a)| p != a)
             .collect();
         match pairs.len() {
-            0 => {}
-            1 => {
-                let _ = writeln!(out, "{ind}{} = {};", pairs[0].0, pairs[0].1);
-            }
+            0 => None,
+            1 => Some(format!("{} = {};", pairs[0].0, pairs[0].1)),
             _ => {
                 let (l, r): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
-                let _ = writeln!(out, "{ind}({}) = ({});", l.join(", "), r.join(", "));
+                Some(format!("({}) = ({});", l.join(", "), r.join(", ")))
             }
+        }
+    }
+
+    /// State machine edge: assign `to`'s parameters, then jump.
+    fn goto(&self, to: BlockId, args: &[ValueId], ind: &str, out: &mut String) {
+        if let Some(a) = self.assign(to, args) {
+            let _ = writeln!(out, "{ind}{a}");
         }
         let _ = writeln!(out, "{ind}bb = {};", to.index());
     }
@@ -464,7 +512,7 @@ impl Emitter<'_> {
             }
             other => {
                 self.stats.todo += 1;
-                let s = format!("{other:?}").replace('"', "'");
+                let s = format!("{other:?}").replace('"', "'").replace('{', "{{").replace('}', "}}");
                 if ty == TyId::UNIT {
                     return Stmt::Effect(format!("todo!(\"{s}\")"));
                 }
@@ -557,4 +605,22 @@ enum Stmt {
     Value(String),
     /// Side effect only.
     Effect(String),
+}
+
+impl Source for Emitter<'_> {
+    fn stmts(&mut self, b: BlockId) -> Vec<Node> {
+        self.stmt_lines(b).into_iter().map(Node::Line).collect()
+    }
+
+    fn edge(&mut self, to: BlockId, args: &[ValueId]) -> Vec<Node> {
+        self.assign(to, args).map(Node::Line).into_iter().collect()
+    }
+
+    fn cond(&self, c: ValueId) -> String {
+        self.name(c)
+    }
+
+    fn exit(&mut self, b: BlockId) -> Node {
+        Node::Exit(self.exit_line(self.f.blocks[b].term))
+    }
 }

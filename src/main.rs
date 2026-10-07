@@ -188,6 +188,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         total.checked += d.stats.checked;
         total.raw += d.stats.raw;
         total.todo += d.stats.todo;
+        total.state_machines += d.stats.state_machines;
         statics.extend(d.statics);
     }
     if let Some(g) = &globals {
@@ -220,6 +221,9 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     if !statics.is_empty() {
         let bytes: u64 = statics.iter().map(|i| i.len).sum();
         eprintln!("  {} statics ({bytes} bytes) from the binary's data sections", statics.len());
+    }
+    if total.state_machines > 0 {
+        eprintln!("  {} with irreducible control flow, kept as a `loop {{ match bb }}` state machine", total.state_machines);
     }
     if total.todo > 0 {
         eprintln!("  {} todo!() left where the emitter can't express an instruction yet", total.todo);
@@ -391,6 +395,7 @@ fn describe(e: &LiftError) -> String {
         LiftError::FlagsNotInBlock { ip } => format!("branch at {ip:#x} reads flags set in another block"),
         LiftError::BranchOutOfRange { ip, target } => format!("branch at {ip:#x} leaves the function (to {target:#x})"),
         LiftError::TargetInsideInstruction { target } => format!("branch into the middle of an instruction at {target:#x}"),
+        LiftError::ClobberedRead { ip, reg } => format!("{reg:?} read at {ip:#x} after a call clobbered it"),
     }
 }
 

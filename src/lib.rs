@@ -10,4 +10,5 @@ pub mod load;
 pub mod names;
 pub mod opt;
 pub mod refine;
+pub mod structure;
 pub mod verify;

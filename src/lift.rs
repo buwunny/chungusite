@@ -34,16 +34,31 @@ pub enum LiftError {
     BranchOutOfRange { ip: u64, target: u64 },
     /// A branch targets the middle of another instruction (overlapping code).
     TargetInsideInstruction { target: u64 },
+    /// An instruction reads a register that a `call` earlier in the same block
+    /// clobbered (System V: rcx, rsi, rdi, r8-r11), which the ABI leaves undefined.
+    ClobberedRead { ip: u64, reg: Register },
 }
 
-/// Lazy flags: remember what set them, and only build a `Cmp` when a Jcc reads them.
-/// `cmp` itself therefore emits nothing, and flags that are never read cost nothing.
+/// System V integer argument registers, in order.
+const ARG_REGS: [Register; 6] = [Register::RDI, Register::RSI, Register::RDX, Register::RCX, Register::R8, Register::R9];
+/// Registers a System V call clobbers, besides rax and rdx (which hold the result).
+const CLOBBERED: [Register; 7] = [
+    Register::RCX, Register::RSI, Register::RDI, Register::R8, Register::R9, Register::R10, Register::R11,
+];
+
+/// Lazy flags: remember what set them, and only build a `Cmp` when a Jcc, CMOVcc or
+/// SETcc reads them. `cmp` itself therefore emits nothing, and flags that are never
+/// read cost nothing.
 #[derive(Copy, Clone)]
 enum Flags {
     Unknown,
-    /// cmp / sub: every integer condition is derivable from the operands.
+    /// cmp / sub / neg: every integer condition is derivable from the operands.
     Sub { lhs: ValueId, rhs: ValueId },
-    /// test / and / or / xor / add: only ZF and SF are modelled (`res == 0`, `res < 0`).
+    /// test / and / or / xor: ZF and SF from the result, CF = OF = 0.
+    Logic { res: ValueId },
+    /// add: ZF, SF, CF (`res < lhs` unsigned) and OF.
+    Add { lhs: ValueId, rhs: ValueId, res: ValueId },
+    /// inc / dec / shifts: only ZF and SF are modelled (`res == 0`, `res < 0`).
     Res { res: ValueId },
 }
 
@@ -53,14 +68,29 @@ struct BlockState {
     out: RegFile,
     /// `BlockParam` created for each live-in GPR.
     params: RegFile,
+    /// GPRs a `call` in this block clobbered and nothing has written since. Reading one
+    /// later in the block is an error. A successor that reads one gets the zero the
+    /// call left in `out`: the ABI leaves the value undefined, and the usual way to get
+    /// there is falling through past a call that never returns.
+    clobbered: u16,
 }
 
-const EMPTY_STATE: BlockState = BlockState { out: [None; NGPR], params: [None; NGPR] };
+const EMPTY_STATE: BlockState = BlockState { out: [None; NGPR], params: [None; NGPR], clobbered: 0 };
+
+/// Where an instruction's destination operand lives.
+#[derive(Copy, Clone)]
+enum Dst {
+    Reg(Register),
+    Mem(ValueId),
+}
 
 pub struct Lifter {
     insn: Instruction,
     leaders: Vec<u64>,
     state: Vec<BlockState>,
+    /// Each `Call` and its argument registers. The arguments go into `value_pool`
+    /// in `finalize`, after every block's instruction list is in place.
+    calls: Vec<(ValueId, [ValueId; 6])>,
     cur: usize,
     flags: Flags,
     ip: u64,
@@ -76,6 +106,7 @@ impl Lifter {
             insn: Instruction::default(),
             leaders: Vec::with_capacity(256),
             state: Vec::with_capacity(256),
+            calls: Vec::with_capacity(64),
             cur: 0,
             flags: Flags::Unknown,
             ip: 0,
@@ -87,6 +118,7 @@ impl Lifter {
         f.clear();
         self.find_leaders(code, ip);
         self.state.clear();
+        self.calls.clear();
         for _ in 0..self.leaders.len() {
             self.state.push(EMPTY_STATE);
             f.blocks.push(Block { insts: ListRef::EMPTY, params: ListRef::EMPTY, term: Terminator::Unreachable });
@@ -178,11 +210,16 @@ impl Lifter {
     /// Lift `self.insn`. Returns true if it ended the block.
     fn lift_insn(&mut self, f: &mut Function) -> Result<bool, LiftError> {
         let i = self.insn; // Instruction is Copy (40 bytes); avoids borrowing self
+        // ud2 / int3 / hlt: traps the compiler puts where control can't continue
+        if matches!(i.mnemonic(), Mnemonic::Ud2 | Mnemonic::Int3 | Mnemonic::Hlt) {
+            self.end_block(f, Terminator::Unreachable);
+            return Ok(true);
+        }
         match i.flow_control() {
             FlowControl::Next => self.lift_data(f, &i).map(|_| false),
+            FlowControl::Call | FlowControl::IndirectCall => self.call(f, &i).map(|_| false),
             FlowControl::ConditionalBranch if i.condition_code() != ConditionCode::None => {
-                let (cc, lhs, rhs) = self.condition(f, i.condition_code())?;
-                let c = self.emit(f, InstKind::Cmp { cc, lhs, rhs }, TyId::BOOL);
+                let c = self.condition(f, i.condition_code())?;
                 let t = self.target(i.near_branch_target())?;
                 let e = self.target(i.next_ip())?;
                 self.end_block(f, Terminator::Branch { c, t, f: e, args: ListRef::EMPTY });
@@ -199,6 +236,13 @@ impl Lifter {
                     }
                 };
                 self.end_block(f, term);
+                Ok(true)
+            }
+            // jmp [rip+x]: a tail call through the GOT. Other indirect jumps are
+            // usually jump tables, which need recovering into a `Switch`.
+            FlowControl::IndirectBranch if i.op0_kind() == OpKind::Memory && i.is_ip_rel_memory_operand() => {
+                let callee = self.callee(f, &i)?;
+                self.end_block(f, Terminator::TailCall { callee, args: ListRef::EMPTY });
                 Ok(true)
             }
             FlowControl::Return => {
@@ -247,47 +291,134 @@ impl Lifter {
                 }
                 _ => return Err(self.unsupported()),
             },
-            Mnemonic::Lea if i.op0_register().size() == 8 => {
+            Mnemonic::Lea => {
                 let p = self.ea(f, i)?;
-                self.write(f, i.op0_register(), p)?;
+                match i.op0_register().size() {
+                    8 => self.write(f, i.op0_register(), p)?,
+                    // lea eax, [rdi+rsi]: 32-bit arithmetic on the low half
+                    4 => {
+                        let v = self.emit(f, InstKind::Cast { kind: CastKind::Trunc, v: p }, TyId::B4);
+                        self.write(f, i.op0_register(), v)?;
+                    }
+                    _ => return Err(self.unsupported()),
+                }
             }
             Mnemonic::Add | Mnemonic::Sub | Mnemonic::And | Mnemonic::Or | Mnemonic::Xor
             | Mnemonic::Cmp | Mnemonic::Test => self.alu(f, i)?,
+            Mnemonic::Inc | Mnemonic::Dec | Mnemonic::Neg | Mnemonic::Not => self.unary(f, i)?,
+            Mnemonic::Shl | Mnemonic::Shr | Mnemonic::Sar => self.shift(f, i)?,
+            // two- and three-operand forms; one-operand imul writes rdx:rax
+            Mnemonic::Imul if i.op_count() >= 2 => {
+                let dst = i.op0_register();
+                let sz = dst.size();
+                let (lhs, rhs) = if i.op_count() == 3 {
+                    (self.operand(f, i, 1, sz)?, self.konst(f, imm(i, 2, sz), TyId::unknown(sz)))
+                } else {
+                    (self.read(f, dst)?, self.operand(f, i, 1, sz)?)
+                };
+                let v = self.emit(f, InstKind::Bin { op: BinOp::Mul, lhs, rhs }, TyId::unknown(sz));
+                self.write(f, dst, v)?;
+                self.flags = Flags::Unknown; // only CF/OF (overflow) are defined
+            }
+            Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd => {
+                let dst = i.op0_register();
+                let src_sz = self.op_size(i, 1)?;
+                let v = self.operand(f, i, 1, src_sz)?;
+                let v = if src_sz == dst.size() {
+                    v // movsxd r32, r/m32 is a plain mov
+                } else {
+                    let kind = if i.mnemonic() == Mnemonic::Movzx { CastKind::ZExt } else { CastKind::SExt };
+                    self.emit(f, InstKind::Cast { kind, v }, TyId::unknown(dst.size()))
+                };
+                self.write(f, dst, v)?;
+            }
+            Mnemonic::Div | Mnemonic::Idiv => self.div(f, i)?,
+            // cqo / cdq: rdx (edx) = the sign of rax (eax), ready for idiv
+            Mnemonic::Cqo | Mnemonic::Cdq => {
+                let (lo, hi, bits) =
+                    if i.mnemonic() == Mnemonic::Cqo { (Register::RAX, Register::RDX, 63) } else { (Register::EAX, Register::EDX, 31) };
+                let v = self.read(f, lo)?;
+                let ty = f.insts[v].ty;
+                let s = self.konst(f, bits, TyId::B1);
+                let sign = self.emit(f, InstKind::Bin { op: BinOp::AShr, lhs: v, rhs: s }, ty);
+                self.write(f, hi, sign)?;
+            }
+            // cdqe / cwde: sign-extend the low half of rax (eax) in place
+            Mnemonic::Cdqe | Mnemonic::Cwde => {
+                let (src, dst) = if i.mnemonic() == Mnemonic::Cdqe { (Register::EAX, Register::RAX) } else { (Register::AX, Register::EAX) };
+                let v = self.read(f, src)?;
+                let v = self.emit(f, InstKind::Cast { kind: CastKind::SExt, v }, TyId::unknown(dst.size()));
+                self.write(f, dst, v)?;
+            }
+            Mnemonic::Push => {
+                let val = match i.op0_kind() {
+                    OpKind::Register if i.op0_register().size() == 8 => self.read(f, i.op0_register())?,
+                    k if is_imm(k) => self.konst(f, imm(i, 0, 8), TyId::B8),
+                    OpKind::Memory if i.memory_size().size() == 8 => {
+                        let ptr = self.ea(f, i)?;
+                        self.emit(f, InstKind::Load { ptr, align: 1, volatile: false }, TyId::B8)
+                    }
+                    _ => return Err(self.unsupported()),
+                };
+                let sp = self.read(f, Register::RSP)?;
+                let sp = self.emit(f, InstKind::PtrOffset { base: sp, index: None, scale: 1, disp: -8 }, TyId::PTR);
+                self.emit(f, InstKind::Store { ptr: sp, val, align: 1 }, TyId::UNIT);
+                self.write(f, Register::RSP, sp)?;
+            }
+            Mnemonic::Pop => self.pop(f, i)?,
+            // leave: mov rsp, rbp; pop rbp
+            Mnemonic::Leave => {
+                let bp = self.read(f, Register::RBP)?;
+                self.write(f, Register::RSP, bp)?;
+                self.pop(f, i)?;
+            }
+            m if cmov_or_setcc(m) == Some(true) => {
+                let dst = i.op0_register();
+                let sz = dst.size();
+                // the old value stays when the condition is false (a 32-bit cmov still
+                // zero-extends it), and a memory source is loaded either way
+                let old = self.read(f, dst)?;
+                let src = self.operand(f, i, 1, sz)?;
+                let c = self.condition(f, i.condition_code())?;
+                let v = self.emit(f, InstKind::Select { c, t: src, f: old }, TyId::unknown(sz));
+                self.write(f, dst, v)?;
+            }
+            m if cmov_or_setcc(m) == Some(false) => {
+                let c = self.condition(f, i.condition_code())?;
+                let v = self.emit(f, InstKind::Cast { kind: CastKind::ZExt, v: c }, TyId::B1);
+                let dst = self.dst(f, i)?;
+                self.put(f, dst, v)?;
+            }
             _ => return Err(self.unsupported()),
         }
         Ok(())
     }
 
-    /// Register/register or register/immediate ALU ops.
+    /// ALU ops with register, immediate or memory operands (`add [rdi], eax` loads,
+    /// adds and stores).
     fn alu(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
-        if i.op0_kind() != OpKind::Register {
-            return Err(self.unsupported());
-        }
         let m = i.mnemonic();
-        let dst = i.op0_register();
-        let sz = dst.size();
+        let sz = self.op_size(i, 0)?;
         let ty = TyId::unknown(sz);
-        let same_reg = i.op1_kind() == OpKind::Register && i.op1_register() == dst;
+        let same_reg = i.op0_kind() == OpKind::Register && i.op1_kind() == OpKind::Register
+            && i.op1_register() == i.op0_register();
 
         // xor eax, eax: the zeroing idiom becomes a constant, no data dependency
         if m == Mnemonic::Xor && same_reg {
             let z = self.konst(f, 0, ty);
-            self.write(f, dst, z)?;
-            self.flags = Flags::Res { res: z };
+            self.write(f, i.op0_register(), z)?;
+            self.flags = Flags::Logic { res: z };
             return Ok(());
         }
 
-        let lhs = self.read(f, dst)?;
-        let rhs = match i.op1_kind() {
-            OpKind::Register => self.read(f, i.op1_register())?,
-            k if is_imm(k) => self.konst(f, imm(i, 1, sz), ty),
-            _ => return Err(self.unsupported()),
-        };
+        let dst = self.dst(f, i)?;
+        let lhs = self.get(f, dst, sz)?;
+        let rhs = if same_reg { lhs } else { self.operand(f, i, 1, sz)? };
         self.flags = match m {
-            // cmp emits nothing; the Jcc that reads the flags emits the comparison
+            // cmp emits nothing; the instruction that reads the flags emits the comparison
             Mnemonic::Cmp => Flags::Sub { lhs, rhs },
             // test rax, rax: ZF/SF come straight from rax
-            Mnemonic::Test if same_reg => Flags::Res { res: lhs },
+            Mnemonic::Test if same_reg => Flags::Logic { res: lhs },
             _ => {
                 let op = match m {
                     Mnemonic::Add => BinOp::Add,
@@ -298,37 +429,312 @@ impl Lifter {
                 };
                 let res = self.emit(f, InstKind::Bin { op, lhs, rhs }, ty);
                 if m != Mnemonic::Test {
-                    self.write(f, dst, res)?;
+                    self.put(f, dst, res)?;
                 }
-                if m == Mnemonic::Sub { Flags::Sub { lhs, rhs } } else { Flags::Res { res } }
+                match m {
+                    Mnemonic::Sub => Flags::Sub { lhs, rhs },
+                    Mnemonic::Add => Flags::Add { lhs, rhs, res },
+                    _ => Flags::Logic { res },
+                }
             }
         };
         Ok(())
     }
 
-    /// Turn the pending flags plus a condition code into an IR comparison.
-    fn condition(&mut self, f: &mut Function, cc: ConditionCode) -> Result<(Cond, ValueId, ValueId), LiftError> {
+    /// inc, dec, neg, not on a register or memory.
+    fn unary(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
+        let sz = self.op_size(i, 0)?;
+        let ty = TyId::unknown(sz);
+        let dst = self.dst(f, i)?;
+        let v = self.get(f, dst, sz)?;
+        let (kind, flags) = match i.mnemonic() {
+            Mnemonic::Inc | Mnemonic::Dec => {
+                let one = self.konst(f, 1, ty);
+                let op = if i.mnemonic() == Mnemonic::Inc { BinOp::Add } else { BinOp::Sub };
+                (InstKind::Bin { op, lhs: v, rhs: one }, None) // CF is left as it was: model ZF/SF only
+            }
+            // neg sets the flags of `0 - v`
+            Mnemonic::Neg => {
+                let zero = self.konst(f, 0, ty);
+                (InstKind::Un { op: UnOp::Neg, v }, Some(Flags::Sub { lhs: zero, rhs: v }))
+            }
+            _ => (InstKind::Un { op: UnOp::Not, v }, Some(self.flags)), // not leaves the flags alone
+        };
+        let res = self.emit(f, kind, ty);
+        self.put(f, dst, res)?;
+        self.flags = flags.unwrap_or(Flags::Res { res });
+        Ok(())
+    }
+
+    /// shl / shr / sar by an immediate or by cl.
+    fn shift(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
+        let sz = self.op_size(i, 0)?;
+        let ty = TyId::unknown(sz);
+        let op = match i.mnemonic() {
+            Mnemonic::Shl => BinOp::Shl,
+            Mnemonic::Shr => BinOp::LShr,
+            _ => BinOp::AShr,
+        };
+        // x86 masks the count to 5 bits (6 for 64-bit operands)
+        let mask = if sz == 8 { 63 } else { 31 };
+        let (count, flags_known) = match i.op1_kind() {
+            k if is_imm(k) => {
+                let n = i.immediate(1) & mask;
+                if n == 0 {
+                    return Ok(()); // no effect, not even on the flags
+                }
+                if n >= sz as u64 * 8 {
+                    // 8/16-bit operands can shift everything out, which Rust's
+                    // wrapping shifts (count mod width) don't model
+                    return Err(self.unsupported());
+                }
+                (self.konst(f, n, TyId::B1), true)
+            }
+            // a count of 0 leaves the flags alone, so they are unknown after this
+            OpKind::Register if i.op1_register() == Register::CL && sz >= 4 => {
+                let cl = self.read(f, Register::CL)?;
+                let m = self.konst(f, mask, TyId::B1);
+                (self.emit(f, InstKind::Bin { op: BinOp::And, lhs: cl, rhs: m }, TyId::B1), false)
+            }
+            _ => return Err(self.unsupported()),
+        };
+        let dst = self.dst(f, i)?;
+        let v = self.get(f, dst, sz)?;
+        let res = self.emit(f, InstKind::Bin { op, lhs: v, rhs: count }, ty);
+        self.put(f, dst, res)?;
+        self.flags = if flags_known { Flags::Res { res } } else { Flags::Unknown };
+        Ok(())
+    }
+
+    /// div / idiv with a 32 or 64-bit divisor. The dividend is rdx:rax, which this
+    /// handles when rdx only extends rax: zero for div (`xor edx, edx`), the sign of
+    /// rax for idiv (`cqo`). Then it is a plain division of rax.
+    fn div(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
+        let sz = self.op_size(i, 0)?;
+        let (lo, hi) = match sz {
+            8 => (Register::RAX, Register::RDX),
+            4 => (Register::EAX, Register::EDX),
+            _ => return Err(self.unsupported()), // 8/16-bit divide ax / dx:ax
+        };
+        let l = self.read(f, lo)?;
+        let h = self.read(f, hi)?;
+        let signed = i.mnemonic() == Mnemonic::Idiv;
+        let extends = if signed {
+            matches!(f.insts[h].kind, InstKind::Bin { op: BinOp::AShr, lhs, rhs }
+                if lhs == l && const_of(f, rhs) == Some(sz as u64 * 8 - 1))
+        } else {
+            // `xor edx, edx` leaves rdx = ZExt(0)
+            match f.insts[h].kind {
+                InstKind::Cast { kind: CastKind::ZExt, v } => const_of(f, v) == Some(0),
+                _ => const_of(f, h) == Some(0),
+            }
+        };
+        if !extends {
+            return Err(self.unsupported());
+        }
+        let d = self.operand(f, i, 0, sz)?;
+        let ty = TyId::unknown(sz);
+        let (qop, rop) = if signed { (BinOp::SDiv, BinOp::SRem) } else { (BinOp::UDiv, BinOp::URem) };
+        let q = self.emit(f, InstKind::Bin { op: qop, lhs: l, rhs: d }, ty);
+        let r = self.emit(f, InstKind::Bin { op: rop, lhs: l, rhs: d }, ty);
+        self.write(f, lo, q)?;
+        self.write(f, hi, r)?;
+        self.flags = Flags::Unknown;
+        Ok(())
+    }
+
+    /// pop r / pop [mem], and the pop half of `leave` (into rbp).
+    fn pop(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
+        let sp = self.read(f, Register::RSP)?;
+        let v = self.emit(f, InstKind::Load { ptr: sp, align: 1, volatile: false }, TyId::B8);
+        let sp = self.emit(f, InstKind::PtrOffset { base: sp, index: None, scale: 1, disp: 8 }, TyId::PTR);
+        self.write(f, Register::RSP, sp)?;
+        match (i.mnemonic(), i.op0_kind()) {
+            (Mnemonic::Leave, _) => self.write(f, Register::RBP, v),
+            (_, OpKind::Register) if i.op0_register().size() == 8 => self.write(f, i.op0_register(), v),
+            // the address uses rsp after the increment
+            (_, OpKind::Memory) if i.memory_size().size() == 8 => {
+                let ptr = self.ea(f, i)?;
+                self.emit(f, InstKind::Store { ptr, val: v, align: 1 }, TyId::UNIT);
+                Ok(())
+            }
+            _ => Err(self.unsupported()),
+        }
+    }
+
+    /// A System V call: `rax = callee(rdi, rsi, rdx, rcx, r8, r9)` and rdx is the high
+    /// half of the result; the other caller-saved registers are clobbered and the
+    /// flags are unknown. Every argument
+    /// register is passed, since which ones the callee reads isn't known here.
+    fn call(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
+        let callee = self.callee(f, i)?;
+        let mut args = [callee; 6];
+        for (a, &r) in args.iter_mut().zip(&ARG_REGS) {
+            *a = self.read_full(f, r.number());
+        }
+        let call = self.emit(f, InstKind::Call { callee, args: ListRef::EMPTY }, TyId::B8);
+        self.calls.push((call, args));
+        let zero = self.konst(f, 0, TyId::B8);
+        let st = &mut self.state[self.cur];
+        for r in CLOBBERED {
+            st.out[r.number()] = Some(zero);
+            st.clobbered |= 1 << r.number();
+        }
+        st.out[Register::RAX.number()] = Some(call);
+        let hi = self.emit(f, InstKind::CallHi(call), TyId::B8);
+        self.state[self.cur].out[Register::RDX.number()] = Some(hi);
+        self.flags = Flags::Unknown;
+        Ok(())
+    }
+
+    /// The target of a call or indirect jump, as a pointer value.
+    fn callee(&mut self, f: &mut Function, i: &Instruction) -> Result<ValueId, LiftError> {
+        let a = match i.op0_kind() {
+            OpKind::NearBranch64 => self.konst(f, i.near_branch_target(), TyId::B8),
+            OpKind::Register if i.op0_register().size() == 8 => self.read(f, i.op0_register())?,
+            OpKind::Memory if i.memory_size().size() == 8 => {
+                let ptr = self.ea(f, i)?;
+                self.emit(f, InstKind::Load { ptr, align: 1, volatile: false }, TyId::B8)
+            }
+            _ => return Err(self.unsupported()),
+        };
+        Ok(self.emit(f, InstKind::IntToPtr(a), TyId::PTR))
+    }
+
+    // ---------- operands ----------
+
+    /// Size in bytes of a register or memory operand; only GPR-sized ones are handled.
+    fn op_size(&self, i: &Instruction, op: u32) -> Result<usize, LiftError> {
+        let sz = match i.op_kind(op) {
+            OpKind::Register => i.op_register(op).size(),
+            OpKind::Memory => i.memory_size().size(),
+            _ => 0,
+        };
+        if matches!(sz, 1 | 2 | 4 | 8) { Ok(sz) } else { Err(self.unsupported()) }
+    }
+
+    /// Read source operand `op` as a `size`-byte value: a register, an immediate, or a
+    /// load from the memory operand.
+    fn operand(&mut self, f: &mut Function, i: &Instruction, op: u32, size: usize) -> Result<ValueId, LiftError> {
+        match i.op_kind(op) {
+            OpKind::Register => self.read(f, i.op_register(op)),
+            k if is_imm(k) => Ok(self.konst(f, imm(i, op, size), TyId::unknown(size))),
+            OpKind::Memory => {
+                let sz = self.op_size(i, op)?;
+                let ptr = self.ea(f, i)?;
+                Ok(self.emit(f, InstKind::Load { ptr, align: 1, volatile: false }, TyId::unknown(sz)))
+            }
+            _ => Err(self.unsupported()),
+        }
+    }
+
+    /// The destination (operand 0), with its address computed once for read-modify-write.
+    fn dst(&mut self, f: &mut Function, i: &Instruction) -> Result<Dst, LiftError> {
+        match i.op0_kind() {
+            OpKind::Register => Ok(Dst::Reg(i.op0_register())),
+            OpKind::Memory => {
+                self.op_size(i, 0)?;
+                Ok(Dst::Mem(self.ea(f, i)?))
+            }
+            _ => Err(self.unsupported()),
+        }
+    }
+
+    fn get(&mut self, f: &mut Function, d: Dst, size: usize) -> Result<ValueId, LiftError> {
+        match d {
+            Dst::Reg(r) => self.read(f, r),
+            Dst::Mem(ptr) => Ok(self.emit(f, InstKind::Load { ptr, align: 1, volatile: false }, TyId::unknown(size))),
+        }
+    }
+
+    fn put(&mut self, f: &mut Function, d: Dst, val: ValueId) -> Result<(), LiftError> {
+        match d {
+            Dst::Reg(r) => self.write(f, r, val),
+            Dst::Mem(ptr) => {
+                self.emit(f, InstKind::Store { ptr, val, align: 1 }, TyId::UNIT);
+                Ok(())
+            }
+        }
+    }
+
+    /// Turn the pending flags plus a condition code into a `Bool` value.
+    fn condition(&mut self, f: &mut Function, cc: ConditionCode) -> Result<ValueId, LiftError> {
         use ConditionCode as C;
-        match self.flags {
-            Flags::Unknown => Err(LiftError::FlagsNotInBlock { ip: self.ip }),
+        let (cond, lhs, rhs) = match self.flags {
+            Flags::Unknown => return Err(LiftError::FlagsNotInBlock { ip: self.ip }),
             Flags::Sub { lhs, rhs } => {
                 let cond = match cc {
                     C::e => Cond::Eq, C::ne => Cond::Ne,
                     C::b => Cond::Ult, C::ae => Cond::Uge, C::be => Cond::Ule, C::a => Cond::Ugt,
                     C::l => Cond::Slt, C::ge => Cond::Sge, C::le => Cond::Sle, C::g => Cond::Sgt,
+                    // sign of the difference
+                    C::s | C::ns => {
+                        let res = self.emit(f, InstKind::Bin { op: BinOp::Sub, lhs, rhs }, f.insts[lhs].ty);
+                        return Ok(self.sign(f, res, cc == C::s));
+                    }
+                    // signed overflow: the operands' signs differ and the result's
+                    // sign differs from lhs, i.e. ((lhs ^ rhs) & (lhs ^ res)) < 0
+                    C::o | C::no => {
+                        let ty = f.insts[lhs].ty;
+                        let res = self.emit(f, InstKind::Bin { op: BinOp::Sub, lhs, rhs }, ty);
+                        let a = self.emit(f, InstKind::Bin { op: BinOp::Xor, lhs, rhs }, ty);
+                        let b = self.emit(f, InstKind::Bin { op: BinOp::Xor, lhs, rhs: res }, ty);
+                        let x = self.emit(f, InstKind::Bin { op: BinOp::And, lhs: a, rhs: b }, ty);
+                        return Ok(self.sign(f, x, cc == C::o));
+                    }
                     _ => return Err(self.unsupported()),
                 };
-                Ok((cond, lhs, rhs))
+                (cond, lhs, rhs)
+            }
+            Flags::Logic { res } => {
+                // CF = OF = 0, so the unsigned conditions reduce to ZF and the signed
+                // ones to a signed compare of the result with zero
+                let cond = match cc {
+                    C::e | C::be => Cond::Eq, C::ne | C::a => Cond::Ne,
+                    C::s | C::l => Cond::Slt, C::ns | C::ge => Cond::Sge,
+                    C::le => Cond::Sle, C::g => Cond::Sgt,
+                    C::b | C::o => return Ok(self.konst(f, 0, TyId::BOOL)),
+                    C::ae | C::no => return Ok(self.konst(f, 1, TyId::BOOL)),
+                    _ => return Err(self.unsupported()),
+                };
+                (cond, res, self.konst(f, 0, f.insts[res].ty))
+            }
+            Flags::Add { lhs, rhs, res } => {
+                let cond = match cc {
+                    C::e => Cond::Eq, C::ne => Cond::Ne,
+                    C::s | C::ns => return Ok(self.sign(f, res, cc == C::s)),
+                    // carry: the sum wrapped
+                    C::b => return Ok(self.emit(f, InstKind::Cmp { cc: Cond::Ult, lhs: res, rhs: lhs }, TyId::BOOL)),
+                    C::ae => return Ok(self.emit(f, InstKind::Cmp { cc: Cond::Uge, lhs: res, rhs: lhs }, TyId::BOOL)),
+                    // signed overflow: both operands' signs differ from the result's,
+                    // i.e. ((lhs ^ res) & (rhs ^ res)) < 0
+                    C::o | C::no => {
+                        let ty = f.insts[res].ty;
+                        let a = self.emit(f, InstKind::Bin { op: BinOp::Xor, lhs, rhs: res }, ty);
+                        let b = self.emit(f, InstKind::Bin { op: BinOp::Xor, lhs: rhs, rhs: res }, ty);
+                        let x = self.emit(f, InstKind::Bin { op: BinOp::And, lhs: a, rhs: b }, ty);
+                        return Ok(self.sign(f, x, cc == C::o));
+                    }
+                    _ => return Err(self.unsupported()),
+                };
+                (cond, res, self.konst(f, 0, f.insts[res].ty))
             }
             Flags::Res { res } => {
                 let cond = match cc {
                     C::e => Cond::Eq, C::ne => Cond::Ne, C::s => Cond::Slt, C::ns => Cond::Sge,
                     _ => return Err(self.unsupported()),
                 };
-                let zero = self.konst(f, 0, f.insts[res].ty);
-                Ok((cond, res, zero))
+                (cond, res, self.konst(f, 0, f.insts[res].ty))
             }
-        }
+        };
+        Ok(self.emit(f, InstKind::Cmp { cc: cond, lhs, rhs }, TyId::BOOL))
+    }
+
+    /// `v < 0` (signed) if `neg`, else `v >= 0`.
+    fn sign(&mut self, f: &mut Function, v: ValueId, neg: bool) -> ValueId {
+        let zero = self.konst(f, 0, f.insts[v].ty);
+        let cc = if neg { Cond::Slt } else { Cond::Sge };
+        self.emit(f, InstKind::Cmp { cc, lhs: v, rhs: zero }, TyId::BOOL)
     }
 
     /// Effective address of the memory operand as one `PtrOffset` node.
@@ -364,25 +770,48 @@ impl Lifter {
     // ---------- register file ----------
 
     fn read(&mut self, f: &mut Function, reg: Register) -> Result<ValueId, LiftError> {
-        if !reg.is_gpr() || matches!(reg, Register::AH | Register::CH | Register::DH | Register::BH) {
+        if !reg.is_gpr() {
             return Err(self.unsupported());
         }
         let n = reg.full_register().number();
-        let full = match self.state[self.cur].out[n] {
-            Some(v) => v,
-            None => self.live_in(f, self.cur, n),
-        };
+        if self.state[self.cur].clobbered & (1 << n) != 0 {
+            return Err(LiftError::ClobberedRead { ip: self.ip, reg });
+        }
+        let full = self.read_full(f, n);
         let sz = reg.size();
         if sz == 8 {
             return Ok(full);
         }
-        // eax after `mov eax, x` is ZExt(x); read x back instead of Trunc(ZExt(x)).
-        if let InstKind::Cast { kind: CastKind::ZExt, v } = f.insts[full].kind {
-            if f.insts[v].ty == TyId::unknown(sz) {
-                return Ok(v);
+        if is_high_byte(reg) {
+            let eight = self.konst(f, 8, TyId::B1);
+            let v = self.emit(f, InstKind::Bin { op: BinOp::LShr, lhs: full, rhs: eight }, TyId::B8);
+            return Ok(self.emit(f, InstKind::Cast { kind: CastKind::Trunc, v }, TyId::B1));
+        }
+        match f.insts[full].kind {
+            // eax after `mov eax, x` is ZExt(x); read x back instead of Trunc(ZExt(x)).
+            InstKind::Cast { kind: CastKind::ZExt, v } if f.insts[v].ty == TyId::unknown(sz) => return Ok(v),
+            // al after `mov al, x` is (old & !0xff) | ZExt(x); read x back.
+            InstKind::Bin { op: BinOp::Or, lhs, rhs } => {
+                if let (InstKind::Bin { op: BinOp::And, rhs: m, .. }, InstKind::Cast { kind: CastKind::ZExt, v }) =
+                    (f.insts[lhs].kind, f.insts[rhs].kind)
+                {
+                    if f.insts[v].ty == TyId::unknown(sz) && const_of(f, m) == Some(!low_mask(sz)) {
+                        return Ok(v);
+                    }
+                }
             }
+            _ => {}
         }
         Ok(self.emit(f, InstKind::Cast { kind: CastKind::Trunc, v: full }, TyId::unknown(sz)))
+    }
+
+    /// The 64-bit value of GPR `n`, creating a live-in if the block hasn't seen it yet.
+    /// Doesn't check for clobbering.
+    fn read_full(&mut self, f: &mut Function, n: usize) -> ValueId {
+        match self.state[self.cur].out[n] {
+            Some(v) => v,
+            None => self.live_in(f, self.cur, n),
+        }
     }
 
     fn write(&mut self, f: &mut Function, reg: Register, v: ValueId) -> Result<(), LiftError> {
@@ -394,10 +823,24 @@ impl Lifter {
             8 => v,
             // writing a 32-bit register zero-extends into the 64-bit one
             4 => self.emit(f, InstKind::Cast { kind: CastKind::ZExt, v }, TyId::B8),
-            // 8/16-bit writes merge into the old value; not handled in this sketch
-            _ => return Err(self.unsupported()),
+            // 8/16-bit writes merge into the old value: (old & !mask) | (ZExt(v) << shift).
+            // A clobbered old value is the call's zero; only the written bits are defined.
+            sz => {
+                let old = self.read_full(f, n);
+                let (mask, shift) = if is_high_byte(reg) { (0xff00, 8) } else { (low_mask(sz), 0) };
+                let mut wide = self.emit(f, InstKind::Cast { kind: CastKind::ZExt, v }, TyId::B8);
+                if shift != 0 {
+                    let s = self.konst(f, shift, TyId::B1);
+                    wide = self.emit(f, InstKind::Bin { op: BinOp::Shl, lhs: wide, rhs: s }, TyId::B8);
+                }
+                let m = self.konst(f, !mask, TyId::B8);
+                let kept = self.emit(f, InstKind::Bin { op: BinOp::And, lhs: old, rhs: m }, TyId::B8);
+                self.emit(f, InstKind::Bin { op: BinOp::Or, lhs: kept, rhs: wide }, TyId::B8)
+            }
         };
-        self.state[self.cur].out[n] = Some(v);
+        let st = &mut self.state[self.cur];
+        st.out[n] = Some(v);
+        st.clobbered &= !(1 << n);
         Ok(())
     }
 
@@ -456,13 +899,21 @@ impl Lifter {
             }
             if !changed { break; }
         }
-        // 2. Write each block's parameter list, in register order.
+        // 2. Write each call's argument list.
+        for &(call, args) in &self.calls {
+            let start = f.value_pool.len() as u32;
+            f.value_pool.extend_from_slice(&args);
+            if let InstKind::Call { args, .. } = &mut f.insts[call].kind {
+                *args = ListRef { start, len: 6 };
+            }
+        }
+        // 3. Write each block's parameter list, in register order.
         for b in 0..n {
             let start = f.value_pool.len();
             f.value_pool.extend(self.state[b].params.iter().flatten());
             f.blocks[BlockId::new(b)].params = ListRef { start: start as u32, len: (f.value_pool.len() - start) as u32 };
         }
-        // 3. Write edge arguments in the same order (Branch: true args, then false args).
+        // 4. Write edge arguments in the same order (Branch: true args, then false args).
         for b in 0..n {
             let start = f.value_pool.len();
             for s in succs(f.blocks[BlockId::new(b)].term).into_iter().flatten() {
@@ -500,4 +951,32 @@ fn is_imm(k: OpKind) -> bool {
 fn imm(i: &Instruction, op: u32, size: usize) -> u64 {
     let v = i.immediate(op);
     if size >= 8 { v } else { v & ((1u64 << (size * 8)) - 1) }
+}
+
+fn is_high_byte(r: Register) -> bool {
+    matches!(r, Register::AH | Register::CH | Register::DH | Register::BH)
+}
+
+/// The bits an 8/16/32-bit register write replaces.
+fn low_mask(size: usize) -> u64 {
+    (1u64 << (size * 8)) - 1
+}
+
+fn const_of(f: &Function, v: ValueId) -> Option<u64> {
+    match f.insts[v].kind {
+        InstKind::Const(c) => Some(f.consts[c.index()] as u64),
+        _ => None,
+    }
+}
+
+/// `Some(true)` for CMOVcc, `Some(false)` for SETcc.
+fn cmov_or_setcc(m: Mnemonic) -> Option<bool> {
+    use Mnemonic::*;
+    match m {
+        Cmovo | Cmovno | Cmovb | Cmovae | Cmove | Cmovne | Cmovbe | Cmova | Cmovs | Cmovns | Cmovp | Cmovnp
+        | Cmovl | Cmovge | Cmovle | Cmovg => Some(true),
+        Seto | Setno | Setb | Setae | Sete | Setne | Setbe | Seta | Sets | Setns | Setp | Setnp | Setl | Setge
+        | Setle | Setg => Some(false),
+        _ => None,
+    }
 }

@@ -3,6 +3,7 @@ pub mod abi;
 pub mod borrow;
 pub mod cfg;
 pub mod check;
+pub mod discover;
 pub mod dump;
 pub mod emit;
 pub mod frame;

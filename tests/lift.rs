@@ -1,5 +1,5 @@
 mod common;
-use chungusite::{dump::dump, ir::Function, lift::{LiftError, Lifter}};
+use chungusite::{dump::dump, ir::{BlockId, Function}, lift::{LiftError, Lifter}};
 use iced_x86::code_asm::*;
 
 #[test]
@@ -41,4 +41,13 @@ fn reports_unsupported_instead_of_guessing() {
     let mut f = Function::with_capacity(8, 2);
     let err = Lifter::new().lift(&code, 0, &mut f).unwrap_err();
     assert!(matches!(err, LiftError::Unsupported { ip: 0, .. }), "{err:?}");
+}
+
+#[test]
+fn endbr64_is_a_nop() {
+    // endbr64 ; mov eax, 1 ; ret (what gcc emits by default with CET on)
+    let code = [0xF3, 0x0F, 0x1E, 0xFA, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3];
+    let mut f = Function::with_capacity(16, 2);
+    Lifter::new().lift(&code, 0x1000, &mut f).unwrap();
+    assert_eq!(f.blocks[BlockId::from_u32(0)].insts.len, 2, "const + zext, nothing for endbr64");
 }

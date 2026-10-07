@@ -1,5 +1,5 @@
 mod common;
-use chungusite::{dump::dump, ir::{BlockId, Function}, lift::{LiftError, Lifter}};
+use chungusite::{dump::dump, ir::{BlockId, Function}, lift::{LiftError, Lifter}, verify::verify};
 use iced_x86::code_asm::*;
 
 #[test]
@@ -35,7 +35,7 @@ bb3(v17):
 #[test]
 fn reports_unsupported_instead_of_guessing() {
     let mut a = CodeAssembler::new(64).unwrap();
-    a.mov(al, 1).unwrap(); // 8-bit write needs a merge, not handled yet
+    a.mul(rcx).unwrap(); // rdx:rax = rax * rcx needs a 128-bit product, not handled yet
     a.ret().unwrap();
     let code = a.assemble(0).unwrap();
     let mut f = Function::with_capacity(8, 2);
@@ -50,4 +50,153 @@ fn endbr64_is_a_nop() {
     let mut f = Function::with_capacity(16, 2);
     Lifter::new().lift(&code, 0x1000, &mut f).unwrap();
     assert_eq!(f.blocks[BlockId::from_u32(0)].insts.len, 2, "const + zext, nothing for endbr64");
+}
+
+/// Lift `build`'s code at 0x1000, check it verifies, and return the IR dump.
+fn ir(build: impl FnOnce(&mut CodeAssembler)) -> String {
+    let mut a = CodeAssembler::new(64).unwrap();
+    build(&mut a);
+    let code = a.assemble(0x1000).unwrap();
+    let mut f = Function::with_capacity(64, 8);
+    Lifter::new().lift(&code, 0x1000, &mut f).unwrap();
+    verify(&f).unwrap();
+    dump(&f)
+}
+
+#[test]
+fn call_passes_argument_registers_and_clobbers_the_rest() {
+    let out = ir(|a| {
+        a.mov(rdi, rsi).unwrap();
+        a.call(0x2000).unwrap();
+        a.add(rax, rdx).unwrap(); // rdx is the high half of the result
+        a.ret().unwrap();
+    });
+    // live-ins rcx, rdx, rsi, r8, r9; the arguments are rdi (= rsi), rsi, rdx, rcx, r8, r9
+    let expected = "\
+bb0(v4, v3, v0, v5, v6):
+  v1 = const 0x2000
+  v2 = inttoptr v1
+  v7 = call v2(v0, v0, v3, v4, v5, v6)
+  v8 = const 0x0
+  v9 = callhi v7
+  v10 = Add v7, v9
+  ret v10
+";
+    assert_eq!(out, expected);
+
+    // rcx is clobbered by the call, so reading it is an error rather than a guess
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.call(0x2000).unwrap();
+    a.mov(rax, rcx).unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0x1000).unwrap();
+    let err = Lifter::new().lift(&code, 0x1000, &mut Function::with_capacity(16, 2)).unwrap_err();
+    assert_eq!(err, LiftError::ClobberedRead { ip: 0x1005, reg: iced_x86::Register::RCX });
+}
+
+#[test]
+fn push_and_pop_move_rsp() {
+    let out = ir(|a| {
+        a.push(rbx).unwrap();
+        a.mov(rbx, rdi).unwrap();
+        a.pop(rbx).unwrap();
+        a.ret().unwrap();
+    });
+    let expected = "\
+bb0(v7, v0, v1, v4):
+  v2 = ptr v1 + -8
+  store v2 <- v0
+  v5 = load v2
+  v6 = ptr v2 + 8
+  ret v7
+";
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn setcc_and_cmov_read_the_flags() {
+    let out = ir(|a| {
+        a.cmp(rdi, rsi).unwrap();
+        a.setl(al).unwrap();
+        a.cmovb(rdi, rsi).unwrap();
+        a.ret().unwrap();
+    });
+    // setl merges into rax: (rax & !0xff) | ZExt(cond)
+    let expected = "\
+bb0(v4, v1, v0):
+  v2 = cmp.Slt v0, v1
+  v3 = ZExt v2
+  v5 = ZExt v3
+  v6 = const 0xffffffffffffff00
+  v7 = And v4, v6
+  v8 = Or v7, v5
+  v9 = cmp.Ult v0, v1
+  v10 = select v9, v1, v0
+  ret v8
+";
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn memory_operands_load_and_store() {
+    let out = ir(|a| {
+        a.add(dword_ptr(rdi + 4), esi).unwrap();
+        a.cmp(byte_ptr(rdi), 0).unwrap();
+        a.movzx(eax, byte_ptr(rdi + 1)).unwrap();
+        a.ret().unwrap();
+    });
+    let expected = "\
+bb0(v3, v0):
+  v1 = ptr v0 + 4
+  v2 = load v1
+  v4 = Trunc v3
+  v5 = Add v2, v4
+  store v1 <- v5
+  v7 = ptr v0 + 0
+  v8 = load v7
+  v9 = const 0x0
+  v10 = ptr v0 + 1
+  v11 = load v10
+  v12 = ZExt v11
+  v13 = ZExt v12
+  ret v13
+";
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn shifts_divides_and_sign_extension() {
+    let out = ir(|a| {
+        a.mov(rax, rdi).unwrap();
+        a.cqo().unwrap();
+        a.idiv(rsi).unwrap();
+        a.shl(rax, 3).unwrap();
+        a.sar(rdx, cl).unwrap();
+        a.movsxd(rcx, edx).unwrap();
+        a.add(rax, rcx).unwrap();
+        a.ret().unwrap();
+    });
+    assert!(out.contains("AShr v0, v1") && out.contains("SDiv v0, v3") && out.contains("SRem v0, v3"), "{out}");
+    assert!(out.contains("Shl v4, v6"), "{out}");
+    assert!(out.contains("SExt"), "{out}");
+}
+
+#[test]
+fn byte_register_write_reads_back_without_a_mask() {
+    let out = ir(|a| {
+        a.mov(al, 1).unwrap();
+        a.mov(cl, al).unwrap(); // reads the byte straight back
+        a.mov(ah, cl).unwrap();
+        a.ret().unwrap();
+    });
+    assert!(!out.contains("Trunc"), "al and cl read back as the written byte:\n{out}");
+    assert!(out.contains("const 0xffffffffffff00ff"), "ah merges into bits 8..16:\n{out}");
+}
+
+#[test]
+fn traps_end_the_block() {
+    let out = ir(|a| {
+        a.ud2().unwrap();
+    });
+    assert_eq!(out, "bb0():\n  Unreachable\n");
 }

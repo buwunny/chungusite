@@ -46,6 +46,10 @@ pub struct EmitStats {
     pub raw_by: [usize; 4],
     /// Instructions or terminators the emitter can't express yet (`todo!()`).
     pub todo: usize,
+    /// Raw twins emitted after this function (`program.rs`), and their raw
+    /// loads, stores and copies (not counted in `raw` or `raw_by`).
+    pub twins: usize,
+    pub twin_raw: usize,
     /// Functions whose control flow is irreducible, emitted as a
     /// `loop { match bb { .. } }` state machine instead of structured code.
     pub state_machines: usize,
@@ -84,6 +88,9 @@ pub struct CallInfo {
     pub free: bool,
     /// Safe mode: it can be written as slice operations (`memcpy`, `memset`).
     pub builtin: Option<crate::libc::Builtin>,
+    /// A call to a function's raw twin (fast-mode code): counted as raw, like
+    /// an FFI call.
+    pub raw: bool,
 }
 
 /// The whole-program context a function is emitted in (`program.rs`).
@@ -827,8 +834,8 @@ impl Emitter<'_> {
                 let (lets, a) = self.call_args(args, &pass);
                 (format!("unsafe {{ {lets}{p}({}) }}", a.join(", ")), ret, ret2)
             }
-            Some(CallInfo { path: Some(p), ret, ret2, foreign, .. }) => {
-                if foreign {
+            Some(CallInfo { path: Some(p), ret, ret2, foreign, raw, .. }) => {
+                if foreign || raw {
                     self.stats.raw += 1;
                 }
                 if ret2 && foreign {

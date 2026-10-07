@@ -382,7 +382,14 @@ fn find_roots(f: &Function, cfg: &Cfg, callees: &Callees) -> (Vec<Root>, HashMap
                     Some(c) => Root::Global(c as u64),
                     None => continue,
                 },
-                InstKind::Call { .. } if callees.call.get(&id).is_some_and(|c| c.alloc.is_some()) => Root::Alloc(id),
+                // an allocation whose size arguments are there
+                InstKind::Call { args, .. }
+                    if callees.call.get(&id).and_then(|c| c.alloc).is_some_and(|(a, b)| {
+                        (a.max(b.unwrap_or(0)) as u32) < args.len
+                    }) =>
+                {
+                    Root::Alloc(id)
+                }
                 _ => continue,
             };
             starts.insert(id, add(&mut roots, r));
@@ -440,7 +447,7 @@ fn transfer(f: &Function, id: ValueId, o: &[Origin], starts: &HashMap<ValueId, u
             match index {
                 None => b,
                 // With scale 1 either register may be the pointer.
-                Some(i) if scale == 1 => b.join(of(i)).unknown(),
+                Some(i) if scale == 1 => sum(roots, of(base), of(i)),
                 Some(_) => b.unknown(),
             }
         }
@@ -448,9 +455,7 @@ fn transfer(f: &Function, id: ValueId, o: &[Origin], starts: &HashMap<ValueId, u
             (false, true) => konst(f, rhs).map_or(of(lhs).unknown(), |c| of(lhs).shift(c)),
             (true, false) => konst(f, lhs).map_or(of(rhs).unknown(), |c| of(rhs).shift(c)),
             (true, true) => Origin::NONE,
-            // Both derived: keep both (over-approximate) so the analysis stays
-            // monotone and reaches a fixpoint.
-            (false, false) => of(lhs).join(of(rhs)).unknown(),
+            (false, false) => sum(roots, of(lhs), of(rhs)),
         },
         Bin { op: BinOp::Sub, lhs, rhs } => match konst(f, rhs) {
             Some(c) if of(rhs).is_none() => of(lhs).shift(c.wrapping_neg()),
@@ -477,6 +482,37 @@ fn transfer(f: &Function, id: ValueId, o: &[Origin], starts: &HashMap<ValueId, u
         },
         _ => Origin::NONE,
     }
+}
+
+/// Roots that are certainly pointers: everything but arguments, which may be
+/// integers.
+fn pointer_roots(roots: &[Root]) -> u64 {
+    let mut m = 1 << OTHER;
+    for (r, root) in roots.iter().enumerate() {
+        if !matches!(root, Root::Param(_)) {
+            m |= 1 << r;
+        }
+    }
+    m
+}
+
+/// `a + b` where both may be derived. If one side certainly points into an
+/// object (the frame, a global, an allocation) and the other only comes from
+/// arguments, the argument is an index. Otherwise keep both (over-approximate),
+/// so the analysis stays monotone and reaches a fixpoint.
+fn sum(roots: &[Root], a: Origin, b: Origin) -> Origin {
+    let ptr = pointer_roots(roots);
+    match (a.roots & ptr != 0, b.roots & ptr != 0) {
+        (true, false) => a.unknown(),
+        (false, true) => b.unknown(),
+        _ => a.join(b).unknown(),
+    }
+}
+
+/// An operand of pointer arithmetic that `sum` treated as an index.
+fn is_index(roots: &[Root], o: &[Origin], result: ValueId, v: ValueId) -> bool {
+    let ptr = pointer_roots(roots);
+    o[result.index()].roots & ptr != 0 && o[v.index()].roots & ptr == 0
 }
 
 fn origins(f: &Function, cfg: &Cfg, roots: &[Root], starts: &HashMap<ValueId, u8>, callees: &Callees) -> Vec<Origin> {
@@ -592,7 +628,7 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callee
                     let kept = o[id.index()].roots;
                     if !is_pointer_difference(k, o) {
                         crate::verify::for_each_operand(k, f, |v| {
-                            if o[v.index()].roots & !kept != 0 {
+                            if o[v.index()].roots & !kept != 0 && !is_index(roots, o, id, v) {
                                 fx.add(v, FactKind::Escape);
                             }
                         });

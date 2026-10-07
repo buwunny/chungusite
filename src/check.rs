@@ -89,10 +89,14 @@ pub fn check(shared: &str, funcs: &[&str], dir: &Path) -> std::io::Result<Report
 const HEADER: &str = "#![allow(unused_mut, unused_variables, unused_assignments, unreachable_code, non_snake_case, \
 non_upper_case_globals, unused_parens, unused_unsafe, dead_code, clippy::all)]\n";
 
-/// The function's signature with a body that type-checks as anything.
+/// Every function's signature (a function's source may hold its raw twin too),
+/// with a body that type-checks as anything.
 fn stub(f: &str) -> String {
-    let sig = f.lines().find(|l| l.starts_with("pub ")).unwrap_or("");
-    format!("{sig} loop {{}} }}\n")
+    let mut out = String::new();
+    for sig in f.lines().filter(|l| l.starts_with("pub ")) {
+        let _ = writeln!(out, "{sig} loop {{}} }}");
+    }
+    out
 }
 
 /// rustc's JSON diagnostics for one file.
@@ -163,7 +167,7 @@ mod tests {
     fn errors_map_to_the_function_they_are_in() {
         let ok = "pub fn ok(x: &mut [u8]) -> u64 {\n    x[0] = 1;\n    0\n}\n";
         let bad = "pub fn bad(x: &mut [u8]) -> u64 {\n    let a = &mut x[0..];\n    let b = &mut x[1..];\n    a[0] = b[0];\n    0\n}\n";
-        let calls = "pub fn calls(x: &mut [u8]) -> u64 {\n    ok(x) + bad(x)\n}\n";
+        let calls = "pub fn calls(x: &mut [u8]) -> u64 {\n    ok(x) + bad(x) + twin(0)\n}\n\npub fn twin(x: u64) -> u64 {\n    x\n}\n";
         let dir = std::env::temp_dir().join(format!("chungusite-check-test-{}", std::process::id()));
         let r = check("", &[ok, bad, calls], &dir).unwrap();
         let _ = std::fs::remove_dir_all(&dir);

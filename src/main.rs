@@ -267,6 +267,9 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     }
 
     eprintln!("chungusite: lifted {ok} of {} functions ({mode_name} mode)", funcs.len());
+    if let Some(b) = bin.filter(|b| b.discovered > 0) {
+        eprintln!("  no symbol table: {} functions found from unwind tables and control flow, named sub_<addr>", b.discovered);
+    }
     if total.checked + total.raw > 0 {
         eprintln!("  memory accesses: {} bounds-checked, {} raw", total.checked, total.raw);
     }
@@ -326,7 +329,7 @@ fn select<'a>(bin: &Binary<'a>, cli: &Cli) -> Result<Vec<FuncBytes<'a>>, String>
     if cli.functions.is_empty() && cli.addrs.is_empty() {
         if bin.funcs.is_empty() {
             return Err(format!(
-                "no function symbols found (stripped binary?); use --addr with --size, e.g. --addr {:#x} --size 0x100",
+                "no functions found (no symbols, unwind tables or code reachable from the entry point); use --addr with --size, e.g. --addr {:#x} --size 0x100",
                 bin.entry()
             ));
         }

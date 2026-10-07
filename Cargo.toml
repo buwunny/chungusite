@@ -1,0 +1,16 @@
+[package]
+name = "chungusite"
+version = "0.1.0"
+edition = "2021"
+description = "x86_64 to Rust decompiler"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
+
+[dev-dependencies]
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "code_asm"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

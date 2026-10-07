@@ -443,7 +443,7 @@ impl Emitter<'_> {
             }
             other => {
                 self.stats.todo += 1;
-                let s = format!("{other:?}").replace('"', "'");
+                let s = format!("{other:?}").replace('"', "'").replace('{', "{{").replace('}', "}}");
                 if ty == TyId::UNIT {
                     return Stmt::Effect(format!("todo!(\"{s}\")"));
                 }

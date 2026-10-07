@@ -134,7 +134,7 @@ pub fn for_each_operand(k: InstKind, f: &Function, mut cb: impl FnMut(ValueId)) 
         Const(_) | Param(_) | BlockParam(_) | FuncRef(_) | ImportRef(_) | AddrOfLocal(_)
         | AddrOfGlobal(_) | Opaque { .. } => {}
         Bin { lhs, rhs, .. } | Cmp { lhs, rhs, .. } => { cb(lhs); cb(rhs) }
-        Un { v, .. } | Cast { v, .. } | IntToPtr(v) | PtrToInt(v) => cb(v),
+        Un { v, .. } | Cast { v, .. } | IntToPtr(v) | PtrToInt(v) | CallHi(v) => cb(v),
         Select { c, t, f: e } => { cb(c); cb(t); cb(e) }
         Call { callee, args } => { cb(callee); args.get(&f.value_pool).iter().copied().for_each(&mut cb) }
         PtrOffset { base, index, .. } => { cb(base); if let Some(i) = index { cb(i) } }

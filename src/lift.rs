@@ -212,7 +212,7 @@ impl Lifter {
 
     fn lift_data(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
         match i.mnemonic() {
-            Mnemonic::Nop => {}
+            Mnemonic::Nop | Mnemonic::Endbr64 => {} // endbr64: CET landing pad, no effect on data
             Mnemonic::Mov => match (i.op0_kind(), i.op1_kind()) {
                 // mov rax, rcx: no instruction at all, just rename in the register file
                 (OpKind::Register, OpKind::Register) => {

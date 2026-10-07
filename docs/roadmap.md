@@ -1,6 +1,6 @@
 # What's left for a working decompiler
 
-The pipeline runs end to end today: `chungusite <binary>` reads an ELF, Mach-O or PE file, lifts each function, cleans the SSA, and emits Rust that compiles in both modes ([cli.md](cli.md)). What limits it is coverage. On chungusite's own debug build (11,600 functions), 10,600 lift (up from 1,920 before the lifter learned calls, the stack, conditional moves and memory operands), and the output for all of them type-checks. Calls still emit as `todo!()` until step 2. In safe mode 4,511 of 190,853 memory accesses come out bounds-checked. Release-mode decompilation of the whole binary takes about 0.8 s, single-threaded.
+The pipeline runs end to end today: `chungusite <binary>` reads an ELF, Mach-O or PE file, lifts each function, cleans the SSA, and emits Rust that compiles in both modes ([cli.md](cli.md)). What limits it is coverage. On chungusite's own debug build (11,600 functions), 10,600 lift (up from 1,920 before the lifter learned calls, the stack, conditional moves and memory operands), and the output for all of them type-checks. Calls still emit as `todo!()` until step 2. In safe mode 4,511 of 190,853 memory accesses come out bounds-checked. Lifting and emission run in parallel (`-j`); `librustc_driver.so` (157 MB, 92,000 functions) takes about 0.9 s on 4 cores.
 
 The ML refinement layer (`src/refine`, behind the `ml` feature; see docs/ml-runtime.md) is left out of this list on purpose. It plugs in at step 5 and is optional: everything below works without it. The CLI does not call it yet; wiring it in is a `--refine` flag that runs after safe mode, once the models are trained.
 
@@ -51,7 +51,11 @@ Done: `src/structure.rs` turns every reducible CFG into `if`/`else`, `loop` with
 
 ## 6. Globals and data
 
-RIP-relative accesses are lifted as constant addresses, so they read the original process's memory. Map them to `static`s built from the binary's `.data`/`.rodata` (strings, tables, vtables), and name them from symbols.
+Done for the common case ([cli.md](cli.md#globals)): constant addresses into data sections become `static`s named from data symbols, and loader-filled pointer slots (GOT, vtables) point at the right static or function. Still to do:
+
+- Typed statics: today every static is `Bytes<N>` or `Words<N>`. Once types (step 5) know an access is a `u32` table or a `&str`, emit `[u32; N]` or a string.
+- Thread-locals (`fs:`-relative accesses) are still unsupported in the lifter.
+- Mach-O chained fixups and PE base relocations aren't read, so pointer slots in those formats keep their file bytes.
 
 ## 7. Remaining safe-mode stages
 
@@ -60,8 +64,8 @@ Stages 5 to 7 in [ownership.md](ownership.md): call summaries and moves (`malloc
 ## 8. Binary handling
 
 - Stripped binaries: discover functions from the entry point, call targets and `.eh_frame`, instead of requiring `--addr`/`--size`.
-- Demangle C++ and Rust symbol names.
-- Lift functions in parallel with `rayon`, one `Lifter` and `Function` per thread, as ir.md plans.
+- ~~Demangle C++ and Rust symbol names.~~ Done.
+- ~~Lift functions in parallel with `rayon`, one `Lifter` and `Function` per thread, as ir.md plans.~~ Done (`-j`).
 
 ## 9. Checking the output means the same thing
 

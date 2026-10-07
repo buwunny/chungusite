@@ -72,6 +72,8 @@ struct Emitter<'a> {
     /// used outside the block that defines them).
     hoisted: Vec<bool>,
     tail_name: &'a dyn Fn(u64) -> Option<String>,
+    /// Rust expression for a constant address that points into the binary's data.
+    global_of: &'a dyn Fn(u64) -> Option<String>,
     stats: EmitStats,
 }
 
@@ -84,10 +86,24 @@ pub fn emit_function(
     name_of: &dyn Fn(u64) -> Option<String>,
     out: &mut String,
 ) -> EmitStats {
-    emit_function_with(f, name, mode, true, name_of, out)
+    emit_function_with(f, name, mode, true, name_of, &|_| None, out)
 }
 
-/// `emit_function`, choosing whether to structure control flow. With
+/// `emit_function`, plus `global_of`, which turns a constant address used as a
+/// pointer into a Rust expression (the address of a `static`), or `None` to keep
+/// the raw address.
+pub fn emit_function_with_globals(
+    f: &Function,
+    name: &str,
+    mode: Mode,
+    name_of: &dyn Fn(u64) -> Option<String>,
+    global_of: &dyn Fn(u64) -> Option<String>,
+    out: &mut String,
+) -> EmitStats {
+    emit_function_with(f, name, mode, true, name_of, global_of, out)
+}
+
+/// `emit_function_with_globals`, choosing whether to structure control flow. With
 /// `structure: false` every function with a branch is a state machine.
 pub fn emit_function_with(
     f: &Function,
@@ -95,6 +111,7 @@ pub fn emit_function_with(
     mode: Mode,
     structure: bool,
     name_of: &dyn Fn(u64) -> Option<String>,
+    global_of: &dyn Fn(u64) -> Option<String>,
     out: &mut String,
 ) -> EmitStats {
     let cfg = Cfg::new(f);
@@ -122,6 +139,7 @@ pub fn emit_function_with(
         entry_param,
         hoisted: hoisted(f, &cfg),
         tail_name: name_of,
+        global_of,
         stats: EmitStats::default(),
     };
 
@@ -475,7 +493,11 @@ impl Emitter<'_> {
                     d => format!("{s}.wrapping_add({d:#x})"),
                 }
             }
-            IntToPtr(v) | PtrToInt(v) => n(v),
+            IntToPtr(v) => match f.insts[v].kind {
+                Const(c) => (self.global_of)(f.consts[c.index()] as u64).unwrap_or_else(|| n(v)),
+                _ => n(v),
+            },
+            PtrToInt(v) => n(v),
             Load { ptr, .. } => self.load(ptr, ty),
             Store { ptr, val, .. } => return Stmt::Effect(self.store(ptr, val)),
             MemCopy { dst, src, len } => {

@@ -96,13 +96,35 @@ pub fn verify(f: &Function) -> Result<(), VerifyError> {
         }
     }
 
-    // Every value-producing instruction belongs to some block.
-    for (id, inst) in f.insts.iter() {
-        if !placed[id.index()] && inst.ty != TyId::UNIT {
-            return Err(VerifyError::NotPlaced { value: id });
+    // Every value something uses belongs to some block. (Passes may drop unused
+    // instructions from block lists; they stay in the arena so ids remain stable.)
+    let mut unplaced = None;
+    for (_, blk) in f.blocks.iter() {
+        for &id in blk.insts.get(&f.value_pool) {
+            for_each_operand(f.insts[id].kind, f, |v| {
+                if !placed[v.index()] { unplaced.get_or_insert(v); }
+            });
+        }
+        let term_uses = match blk.term {
+            Terminator::Jump { args, .. } | Terminator::TailCall { args, .. } => args.get(&f.value_pool),
+            Terminator::Branch { args, .. } => args.get(&f.value_pool),
+            _ => &[],
+        };
+        let extra = match blk.term {
+            Terminator::Branch { c, .. } => Some(c),
+            Terminator::Return(r) => r,
+            Terminator::TailCall { callee, .. } => Some(callee),
+            Terminator::Switch { v, .. } => Some(v),
+            _ => None,
+        };
+        for &v in term_uses.iter().chain(extra.as_ref()) {
+            if !placed[v.index()] { unplaced.get_or_insert(v); }
         }
     }
-    Ok(())
+    match unplaced {
+        Some(value) => Err(VerifyError::NotPlaced { value }),
+        None => Ok(()),
+    }
 }
 
 /// Calls `cb` with every value an instruction reads.

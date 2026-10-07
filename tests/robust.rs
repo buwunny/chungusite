@@ -1,6 +1,6 @@
 //! Branch targets and arbitrary bytes must never panic the lifter, and anything it
 //! accepts must pass the verifier (no dangling ids, no edge dropping a value).
-use chungusite::{ir::*, lift::{LiftError, Lifter}, verify::verify};
+use chungusite::{borrow::analyze, ir::*, lift::{LiftError, Lifter}, opt::clean, verify::verify};
 use iced_x86::code_asm::*;
 
 fn lift(code: &[u8]) -> (Result<(), LiftError>, Function) {
@@ -113,8 +113,13 @@ fn random_supported_programs_verify() {
         }
         a.ret().unwrap();
         let code = a.assemble(0x1000).unwrap();
-        if lift(&code).0.is_ok() {
+        let (r, mut f) = lift(&code);
+        if r.is_ok() {
             ok += 1;
+            // Cleanup must keep the function well formed, and analysis must not panic.
+            clean(&mut f);
+            verify(&f).unwrap_or_else(|e| panic!("after clean: {e:?} for {code:02x?}"));
+            analyze(&f);
         }
     }
     // Make sure the generator really exercises the success path.

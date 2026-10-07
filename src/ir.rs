@@ -242,6 +242,19 @@ pub enum Terminator {
     Unreachable,
 }
 
+impl Terminator {
+    /// Successor blocks, in edge-argument order (Branch: true edge, then false edge).
+    /// `Switch` tables are not produced by the lifter yet and are not listed.
+    #[inline]
+    pub fn successors(self) -> [Option<BlockId>; 2] {
+        match self {
+            Terminator::Jump { to, .. } => [Some(to), None],
+            Terminator::Branch { t, f, .. } => [Some(t), Some(f)],
+            _ => [None, None],
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug)] pub enum BinOp { Add, Sub, Mul, UDiv, SDiv, URem, SRem, And, Or, Xor, Shl, LShr, AShr, RotL, RotR }
 #[derive(Copy, Clone, Debug)] pub enum UnOp { Neg, Not, Bswap, Popcnt, Ctz, Clz }
 #[derive(Copy, Clone, Debug)] pub enum Cond { Eq, Ne, Ult, Ule, Ugt, Uge, Slt, Sle, Sgt, Sge }

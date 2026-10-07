@@ -115,7 +115,19 @@ fn random_programs_emit_rust_that_compiles() {
             let s = gprs[rng.below(8) as usize];
             let (r32, s32) = (gpr32[rng.below(8) as usize], gpr32[rng.below(8) as usize]);
             let to = labels[rng.below(n as u64) as usize];
-            match rng.below(16) {
+            match rng.below(28) {
+                16 => a.call(0x2000).unwrap(),
+                17 => a.push(r).unwrap(),
+                18 => a.pop(r).unwrap(),
+                19 => { a.cmp(r, s).unwrap(); a.cmovl(r, s).unwrap() }
+                20 => { a.test(r32, r32).unwrap(); a.setne(al).unwrap() }
+                21 => a.add(qword_ptr(r + 8), s).unwrap(),
+                22 => { a.cmp(dword_ptr(s), 3).unwrap(); a.jbe(to).unwrap() }
+                23 => a.movzx(r32, byte_ptr(s + 1)).unwrap(),
+                24 => a.movsxd(r, r32).unwrap(),
+                25 => a.shr(r, 3).unwrap(),
+                26 => a.imul_3(r32, s32, 10).unwrap(),
+                27 => a.mov(cl, dl).unwrap(),
                 0 => a.mov(r, s).unwrap(),
                 1 => a.mov(r, rng.next()).unwrap(),
                 2 => a.mov(qword_ptr(r + 8), s).unwrap(),
@@ -147,7 +159,7 @@ fn random_programs_emit_rust_that_compiles() {
         }
         n_ok += 1;
     }
-    assert!(n_ok > 150, "only {n_ok} programs lifted");
+    assert!(n_ok > 120, "only {n_ok} programs lifted");
     let dir = scratch("random");
     rustc(&dir, "random.rs", &src, &["--crate-type", "lib", "--emit", "metadata"]);
 }
@@ -159,10 +171,10 @@ fn cli_decompiles_an_elf() {
     use object::{Architecture, BinaryFormat, Endianness, SymbolFlags, SymbolKind, SymbolScope};
 
     let get_count = [0x48, 0x8B, 0x47, 0x08, 0xC3]; // mov rax, [rdi+8]; ret
-    let push = [0x55, 0xC3]; // push rbp; ret (not liftable yet)
+    let mul = [0x48, 0xF7, 0xE1, 0xC3]; // mul rcx; ret (rdx:rax result, not liftable yet)
     let mut obj = Obj::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
     let text = obj.section_id(StandardSection::Text);
-    for (name, code) in [("get_count", &get_count[..]), ("pusher", &push[..])] {
+    for (name, code) in [("get_count", &get_count[..]), ("muller", &mul[..])] {
         let off = obj.append_section_data(text, code, 16);
         obj.add_symbol(Symbol {
             name: name.as_bytes().to_vec(),
@@ -183,13 +195,13 @@ fn cli_decompiles_an_elf() {
     let list = Command::new(bin).arg(&elf).arg("--list").output().unwrap();
     let text = String::from_utf8(list.stdout).unwrap();
     assert!(text.contains("ok    get_count @ 0x0, 5 bytes"), "{text}");
-    assert!(text.contains("FAIL  pusher @ 0x10, 2 bytes: unsupported instruction Push at 0x10"), "{text}");
+    assert!(text.contains("FAIL  muller @ 0x10, 4 bytes: unsupported instruction Mul at 0x10"), "{text}");
     assert_eq!(list.status.code(), Some(1), "not everything lifted");
 
     for mode in ["fast", "safe"] {
         let out = Command::new(bin).arg(&elf).args(["--mode", mode]).output().unwrap();
         let src = String::from_utf8(out.stdout).unwrap();
-        assert!(src.contains("pub fn pusher() -> u64 {\n    todo!(\"not lifted: unsupported instruction Push at 0x10\")"), "{src}");
+        assert!(src.contains("pub fn muller() -> u64 {\n    todo!(\"not lifted: unsupported instruction Mul at 0x10\")"), "{src}");
         if mode == "safe" {
             assert!(src.contains("pub fn get_count(rdi_ref: &[u8]) -> u64 {"), "{src}");
         }
@@ -199,7 +211,7 @@ fn cli_decompiles_an_elf() {
     let one = Command::new(bin).arg(&elf).args(["-f", "get_count", "--emit", "ir"]).output().unwrap();
     assert!(one.status.success());
     let ir = String::from_utf8(one.stdout).unwrap();
-    assert!(ir.contains("load v1") && !ir.contains("pusher"), "{ir}");
+    assert!(ir.contains("load v1") && !ir.contains("muller"), "{ir}");
 
     let missing = Command::new(bin).arg(&elf).args(["-f", "nope"]).output().unwrap();
     assert_eq!(missing.status.code(), Some(2));

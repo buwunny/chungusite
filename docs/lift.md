@@ -1,6 +1,21 @@
 # Lifting x86_64 with iced-x86
 
-[`src/lift.rs`](../src/lift.rs) turns decoded `iced_x86::Instruction`s into the IR from [ir.md](ir.md). It covers `NOP`/`ENDBR64`, register and immediate `MOV`s, loads and stores (`MOV [RAX+8], RCX`), `LEA`, `ADD/SUB/AND/OR/XOR/CMP/TEST`, `Jcc`, `JMP` and `RET`. Anything else returns `LiftError::Unsupported` so the caller can decide what to do. It never guesses.
+[`src/lift.rs`](../src/lift.rs) turns decoded `iced_x86::Instruction`s into the IR from [ir.md](ir.md). It covers:
+
+- data movement: `MOV` in every register, immediate and memory form, including 8 and 16-bit writes (merged into the old value) and `AH`-style high bytes; `MOVZX`, `MOVSX`, `MOVSXD`, `LEA`, `CDQE`/`CWDE`;
+- arithmetic: `ADD/SUB/AND/OR/XOR/CMP/TEST`, `INC/DEC/NEG/NOT`, `SHL/SHR/SAR` (immediate or `CL` count), two and three-operand `IMUL`, and `DIV`/`IDIV` when `rdx` only extends `rax` (`xor edx, edx` or `CQO`/`CDQ` first). Any of them can take a memory operand: the lifter loads it, and a memory destination is stored back;
+- flags: `Jcc`, `CMOVcc` (`Select`) and `SETcc` (`Cmp` zero-extended to a byte) all read the same lazy flags, including carry and overflow after `ADD`/`SUB`/`CMP`;
+- the stack: `PUSH`, `POP` and `LEAVE` move `rsp` with a `PtrOffset` and a store or load;
+- calls: `CALL` (direct, register or memory) becomes `InstKind::Call` with the System V argument registers; `JMP [RIP+x]` is a tail call through the GOT;
+- `JMP`, `RET`, `NOP`/`ENDBR64`, and `UD2`/`INT3`/`HLT`, which end the block as `Unreachable`.
+
+Anything else returns `LiftError::Unsupported` so the caller can decide what to do. It never guesses.
+
+## Calls
+
+A call is `rax = callee(rdi, rsi, rdx, rcx, r8, r9)`. All six argument registers are passed because which ones the callee reads isn't known yet; argument recovery (roadmap step 2) trims them. Afterwards `rdx` is `CallHi(call)`, the high half of a 16-byte `rax:rdx` result (which Rust uses for fat pointers and pairs), and the other caller-saved registers (`rcx`, `rsi`, `rdi`, `r8`-`r11`) are clobbered, as are the flags. Reading a clobbered register later in the same block is `LiftError::ClobberedRead`. A successor block that reads one gets zero: the ABI leaves the value undefined, and the usual way to get there is falling through past a call that never returns, such as a panic.
+
+The argument lists go into `value_pool` in `finalize`, after every block's instruction list, because a block's instructions must stay one contiguous run of the pool.
 
 ## Example
 
@@ -79,6 +94,9 @@ After lifting, `opt::clean` removes trivial block params and dead code; see [own
 
 ## Not handled yet
 
-- 8 and 16-bit register writes, which need a merge with the old value, and `AH`-style high-byte registers.
-- Flags that cross blocks (`LiftError::FlagsNotInBlock`), plus conditions other than ZF/SF after non-`CMP` ops.
-- `CALL`, indirect jumps (jump tables), stack frame and `RSP` tracking, and FS/GS (TLS) accesses.
+- SSE and AVX (`MOVUPS`, `MOVAPS`, `MOVSD`, `XORPS`, ...), the largest group of failures left.
+- Indirect jumps other than `JMP [RIP+x]`, which are mostly jump tables to recover into `Terminator::Switch`.
+- One-operand `MUL`/`IMUL` and `DIV` with a real 128-bit dividend, which need a 128-bit product.
+- `ADC`/`SBB`, atomics (`LOCK XADD`, `CMPXCHG`), `BSR`/`TZCNT`/`BSWAP`/`BT`, rotates, and string ops (`MOVSQ`).
+- Flags that cross blocks (`LiftError::FlagsNotInBlock`), and parity, plus the signed conditions after `ADD`.
+- FS/GS (TLS) accesses.

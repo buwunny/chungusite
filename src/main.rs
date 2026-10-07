@@ -315,6 +315,7 @@ fn describe(e: &LiftError) -> String {
         LiftError::FlagsNotInBlock { ip } => format!("branch at {ip:#x} reads flags set in another block"),
         LiftError::BranchOutOfRange { ip, target } => format!("branch at {ip:#x} leaves the function (to {target:#x})"),
         LiftError::TargetInsideInstruction { target } => format!("branch into the middle of an instruction at {target:#x}"),
+        LiftError::ClobberedRead { ip, reg } => format!("{reg:?} read at {ip:#x} after a call clobbered it"),
     }
 }
 

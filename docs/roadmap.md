@@ -1,6 +1,6 @@
 # What's left for a working decompiler
 
-The pipeline runs end to end today: `chungusite <binary>` reads an ELF, Mach-O or PE file, lifts each function, cleans the SSA, and emits Rust that compiles in both modes ([cli.md](cli.md)). What limits it is coverage. On chungusite's own debug build (11,600 functions), 1,920 lift, and the output for all of them type-checks. In safe mode 2,259 of 7,914 memory accesses come out bounds-checked. Release-mode decompilation of the whole binary takes under 0.1 s.
+The pipeline runs end to end today: `chungusite <binary>` reads an ELF, Mach-O or PE file, lifts each function, cleans the SSA, and emits Rust that compiles in both modes ([cli.md](cli.md)). What limits it is coverage. On chungusite's own debug build (11,600 functions), 10,600 lift (up from 1,920 before the lifter learned calls, the stack, conditional moves and memory operands), and the output for all of them type-checks. Calls still emit as `todo!()` until step 2. In safe mode 4,511 of 190,853 memory accesses come out bounds-checked. Release-mode decompilation of the whole binary takes about 0.8 s, single-threaded.
 
 The ML refinement layer (`src/refine`, behind the `ml` feature; see docs/ml-runtime.md) is left out of this list on purpose. It plugs in at step 5 and is optional: everything below works without it. The CLI does not call it yet; wiring it in is a `--refine` flag that runs after safe mode, once the models are trained.
 
@@ -8,24 +8,15 @@ The ML refinement layer (`src/refine`, behind the `ml` feature; see docs/ml-runt
 
 ## 1. Lifter coverage (the blocker for real code)
 
-Failures on the 11,600-function sample, by the first unsupported instruction in each function, most common first:
+`CALL`, `PUSH`/`POP`, the 8/16-bit `MOV` forms, `CMOVcc`/`SETcc`, memory operands, `MOVZX`/`MOVSX`, shifts, `IMUL`, `INC`/`DEC`/`NEG`/`NOT` and `DIV`/`IDIV` after `CQO` or `xor edx, edx` are lifted now ([lift.md](lift.md)). What still fails on the 11,580-function sample, by the first unsupported instruction in each function:
 
 | Cause | Functions | What's needed |
 |---|---|---|
-| `CALL` | 4,605 | a `Call` instruction plus the System V clobber set (rax, rcx, rdx, rsi, rdi, r8-r11 become unknown after it) |
-| `PUSH`/`POP` | 1,603 | RSP tracking: `push` is `rsp -= 8; store`, `pop` the reverse. Prologues and epilogues are in nearly every non-leaf function |
-| `MOV` forms | 1,152 | 8/16-bit register writes (merge into the old value), segment and other operand forms |
-| `CMOVcc`, `SETcc` | ~880 | `Select` and `Cmp` from the pending flags, which the IR already has |
-| `CMP`/`TEST` with memory operands | ~600 | load the operand, then the existing flag logic |
-| `MOVZX`, `MOVSX`, `MOVSXD` | ~180 | `Cast` ZExt/SExt |
-| `SHL`/`SHR`/`SAR`, `IMUL`, `MUL`, `INC`/`DEC`, `NEG`/`NOT` | ~350 | `Bin`/`Un`, plus their flags |
-| ALU ops with memory operands | ~40 | load, op, store |
-| Indirect `JMP` | 57 | jump-table recovery into `Terminator::Switch` (the emitter needs a case for it too) |
-| SSE (`MOVUPS`, `MOVAPS`, `MOVSD`, ...) | ~150 | scalar float first (`F32`/`F64` exist in `Ty`), then vectors |
-
-Flags that cross a block boundary (`LiftError::FlagsNotInBlock`) also need handling: materialize the flag values at the block exit when a successor reads them.
-
-`CALL` plus `PUSH`/`POP` alone accounts for most failures. Those two together are the single biggest win.
+| SSE (`MOVUPS`, `XORPS`, `MOVDQA`, `MOVAPS`, `MOVD`, ...) | ~600 | 16-byte copies first (`MOVUPS` pairs are mostly memcpy of two qwords), then scalar float (`F32`/`F64` exist in `Ty`), then vectors |
+| Indirect `JMP` | 136 | jump-table recovery into `Terminator::Switch` (the emitter needs a case for it too) |
+| `MUL` (one operand) | 46 | a 128-bit product: `rax` is the low half, `rdx` the high half, OF/CF = high != 0 |
+| `SBB`, `ADC`, `XADD`, `CMPXCHG`, `BSR`, `TZCNT`, `BT`, `BSWAP`, `ROL`, `MOVSQ`, ... | ~150 | one at a time; atomics need an `Atomic` op or `Opaque` |
+| Flags across blocks | 20 | materialize the flag values at the block exit when a successor reads them (`LiftError::FlagsNotInBlock`) |
 
 ## 2. Calls and signatures
 

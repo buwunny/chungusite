@@ -199,6 +199,9 @@ pub enum InstKind {
     FuncRef(FuncId),             // direct callee as a value
     ImportRef(Symbol),           // libc/WinAPI import as a value
     Call { callee: ValueId, args: ListRef },
+    /// rdx after the `Call` it names: the high half of a two-register (rax:rdx)
+    /// result, which System V uses for 16-byte return values.
+    CallHi(ValueId),
 
     // ---- Tier::Raw: what the lifter produces; fast mode emits these directly ----
     /// base + index*scale + disp, i.e. an x86 effective address. Pointer typed.
@@ -269,7 +272,7 @@ impl InstKind {
         use InstKind::*;
         match self {
             Const(_) | Param(_) | BlockParam(_) | Bin { .. } | Un { .. } | Cmp { .. } | Cast { .. }
-            | Select { .. } | FuncRef(_) | ImportRef(_) | Call { .. } => Tier::Pure,
+            | Select { .. } | FuncRef(_) | ImportRef(_) | Call { .. } | CallHi(_) => Tier::Pure,
             PtrOffset { .. } | AddrOfLocal(_) | AddrOfGlobal(_) | IntToPtr(_) | PtrToInt(_)
             | Load { .. } | Store { .. } | MemCopy { .. } | Opaque { .. } => Tier::Raw,
             Copy(_) | Move(_) | Assign { .. } | Borrow { .. } | Aggregate { .. } => Tier::Safe,

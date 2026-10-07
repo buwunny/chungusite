@@ -355,7 +355,7 @@ impl Program {
                 if extern_of.contains_key(&name) {
                     continue;
                 }
-                let mut ident = rust_ident(&name);
+                let mut ident = crate::names::sanitize(&name);
                 let n = idents.entry(ident.clone()).or_insert(0);
                 *n += 1;
                 if *n > 1 {
@@ -393,7 +393,7 @@ impl Program {
     /// Emit every selected function that lifted, in parallel: `(source, stats)`,
     /// or `None` for the others. A function is `unsafe` if it does something
     /// unsafe itself or calls a decompiled function that is.
-    pub fn emit_all(&self, mode: Mode) -> Vec<Option<(String, EmitStats)>> {
+    pub fn emit_all(&self, mode: Mode, global_of: &(dyn Fn(u64) -> Option<String> + Sync)) -> Vec<Option<(String, EmitStats)>> {
         // In safe mode a decompiled caller can only pass addresses, so functions
         // that are called take integers.
         let mut called = vec![false; self.funcs.len()];
@@ -411,7 +411,7 @@ impl Program {
             .map(|(i, f)| {
                 let ir = f.ir.as_ref().ok().filter(|_| f.selected)?;
                 let call = |s: Site| self.call_info(i, s);
-                let env = Env { sig: Some(f.sig), call: &call, demote: called[i] };
+                let env = Env { sig: Some(f.sig), call: &call, demote: called[i], structure: true, global_of };
                 let mut src = String::new();
                 let stats = emit_function_in(ir, &f.ident, mode, &env, &mut src);
                 Some((src, stats))
@@ -481,27 +481,6 @@ fn site_sig(t: &Target, guess: u8, sigs: &[Sig], guessed: &HashMap<Target, Sig>)
         Target::Import(n) => crate::libc::lookup(n).or_else(|| guessed.get(t).copied()).unwrap_or_default(),
         Target::Indirect => Sig { args: guess, ret: true, ..Sig::default() },
     }
-}
-
-/// A valid Rust identifier for a symbol name.
-fn rust_ident(name: &str) -> String {
-    let mut s: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
-    if s.is_empty() || s.starts_with(|c: char| c.is_ascii_digit()) || syn_keyword(&s) {
-        s.insert_str(0, "f_");
-    }
-    s
-}
-
-fn syn_keyword(s: &str) -> bool {
-    matches!(
-        s,
-        "as" | "break" | "const" | "continue" | "crate" | "else" | "enum" | "extern" | "false" | "fn" | "for"
-            | "if" | "impl" | "in" | "let" | "loop" | "match" | "mod" | "move" | "mut" | "pub" | "ref"
-            | "return" | "self" | "Self" | "static" | "struct" | "super" | "trait" | "true" | "type"
-            | "unsafe" | "use" | "where" | "while" | "async" | "await" | "dyn" | "abstract" | "become"
-            | "box" | "do" | "final" | "macro" | "override" | "priv" | "typeof" | "unsized" | "virtual"
-            | "yield" | "try" | "gen" | "_"
-    )
 }
 
 /// One line for a lift error.

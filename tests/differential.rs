@@ -178,7 +178,7 @@ fn decompile(obj: &[u8], cases: &[Case]) -> (Vec<Decompiled>, [String; 2]) {
         })
         .collect();
     let program = Program::build(inputs, Some(obj), false);
-    let [fast, safe] = [Mode::Fast, Mode::Safe].map(|m| program.emit_all(m));
+    let [fast, safe] = [Mode::Fast, Mode::Safe].map(|m| program.emit_all(m, &|_| None));
     let decompiled = cases
         .iter()
         .map(|case| {

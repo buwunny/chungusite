@@ -33,7 +33,7 @@ fn addr(i: usize) -> u64 {
 }
 
 fn emitted(p: &Program, mode: Mode) -> Vec<String> {
-    p.emit_all(mode).into_iter().map(|o| o.expect("lifted").0).collect()
+    p.emit_all(mode, &|_| None).into_iter().map(|o| o.expect("lifted").0).collect()
 }
 
 #[test]

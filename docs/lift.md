@@ -77,9 +77,10 @@ register file at each block exit:
 - `tests/spike.rs` checks the spike's exact IR and register mapping, and that each of the 16 GPRs lands in its own slot.
 - `tests/robust.rs` covers bad branch targets: into the middle of an instruction, past the end, a fall-through off the end, and flags coming from another block. Each returns a `LiftError`. It also lifts 20,000 random byte strings without a panic, and 2,000 random programs built from supported instructions with random jumps, all of which must pass the verifier.
 
+After lifting, `opt::clean` removes trivial block params and dead code; see [ownership.md](ownership.md) for that pass and the safe-mode analyses built on it.
+
 ## Not handled yet
 
 - 8 and 16-bit register writes, which need a merge with the old value, and `AH`-style high-byte registers.
 - Flags that cross blocks (`LiftError::FlagsNotInBlock`), plus conditions other than ZF/SF after non-`CMP` ops.
 - `CALL`, indirect jumps (jump tables), stack frame and `RSP` tracking, and FS/GS (TLS) accesses.
-- Removing trivial block params, where the same value arrives on every edge. That's a separate cleanup pass (Braun et al.).

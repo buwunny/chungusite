@@ -483,11 +483,7 @@ impl Lifter {
 }
 
 fn succs(t: Terminator) -> [Option<BlockId>; 2] {
-    match t {
-        Terminator::Jump { to, .. } => [Some(to), None],
-        Terminator::Branch { t, f, .. } => [Some(t), Some(f)],
-        _ => [None, None],
-    }
+    t.successors()
 }
 
 #[inline]

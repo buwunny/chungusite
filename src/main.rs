@@ -222,6 +222,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 total.checked += s.checked;
                 total.raw += s.raw;
                 total.todo += s.todo;
+                total.state_machines += s.state_machines;
             }
         }
     }
@@ -234,6 +235,9 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     eprintln!("chungusite: lifted {ok} of {} functions ({mode_name} mode)", funcs.len());
     if total.checked + total.raw > 0 {
         eprintln!("  memory accesses: {} bounds-checked, {} raw", total.checked, total.raw);
+    }
+    if total.state_machines > 0 {
+        eprintln!("  {} with irreducible control flow, kept as a `loop {{ match bb }}` state machine", total.state_machines);
     }
     if total.todo > 0 {
         eprintln!("  {} todo!() left where the emitter can't express an instruction yet", total.todo);

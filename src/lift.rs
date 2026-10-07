@@ -32,6 +32,8 @@ pub enum LiftError {
     FlagsNotInBlock { ip: u64 },
     /// A conditional branch (or its fall-through) leaves the code being lifted.
     BranchOutOfRange { ip: u64, target: u64 },
+    /// A branch targets the middle of another instruction (overlapping code).
+    TargetInsideInstruction { target: u64 },
 }
 
 /// Lazy flags: remember what set them, and only build a `Cmp` when a Jcc reads them.
@@ -98,6 +100,9 @@ impl Lifter {
             dec.decode_out(&mut self.insn);
             self.ip = self.insn.ip();
             if next_leader < self.leaders.len() && self.ip >= self.leaders[next_leader] {
+                if self.ip > self.leaders[next_leader] {
+                    return Err(LiftError::TargetInsideInstruction { target: self.leaders[next_leader] });
+                }
                 if open {
                     self.end_block(f, Terminator::Jump { to: BlockId::new(next_leader), args: ListRef::EMPTY });
                 }
@@ -114,6 +119,15 @@ impl Lifter {
         }
         self.finalize(f);
         Ok(())
+    }
+
+    /// The 64-bit value `reg` holds when block `b` exits, if the block reads or
+    /// writes it. Valid after `lift` until the next call.
+    pub fn reg_out(&self, b: BlockId, reg: Register) -> Option<ValueId> {
+        if !reg.is_gpr() {
+            return None;
+        }
+        self.state.get(b.index())?.out[reg.full_register().number()]
     }
 
     // ---------- pass 1 ----------
@@ -358,10 +372,17 @@ impl Lifter {
             Some(v) => v,
             None => self.live_in(f, self.cur, n),
         };
-        Ok(match reg.size() {
-            8 => full,
-            sz => self.emit(f, InstKind::Cast { kind: CastKind::Trunc, v: full }, TyId::unknown(sz)),
-        })
+        let sz = reg.size();
+        if sz == 8 {
+            return Ok(full);
+        }
+        // eax after `mov eax, x` is ZExt(x); read x back instead of Trunc(ZExt(x)).
+        if let InstKind::Cast { kind: CastKind::ZExt, v } = f.insts[full].kind {
+            if f.insts[v].ty == TyId::unknown(sz) {
+                return Ok(v);
+            }
+        }
+        Ok(self.emit(f, InstKind::Cast { kind: CastKind::Trunc, v: full }, TyId::unknown(sz)))
     }
 
     fn write(&mut self, f: &mut Function, reg: Register, v: ValueId) -> Result<(), LiftError> {

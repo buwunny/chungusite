@@ -14,8 +14,14 @@ pub trait Idx: Copy {
 
 /// Stored as index+1 in a NonZeroU32 so Option<Id> is still 4 bytes.
 macro_rules! idx { ($($n:ident),*) => {$(
-    #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+    #[derive(Copy, Clone, PartialEq, Eq, Hash)]
     pub struct $n(pub NonZeroU32);
+    /// Prints the index, not the stored index+1: `ValueId(0)` is the first value.
+    impl std::fmt::Debug for $n {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, concat!(stringify!($n), "({})"), self.0.get() - 1)
+        }
+    }
     impl $n {
         #[inline]
         pub const fn from_u32(i: u32) -> Self {
@@ -41,6 +47,12 @@ impl<I: Idx, T> Arena<I, T> {
     /// Drops the contents but keeps the capacity, so the next function reuses it.
     #[inline] pub fn clear(&mut self) { self.data.clear() }
     pub fn iter(&self) -> impl Iterator<Item = (I, &T)> { self.data.iter().enumerate().map(|(i, t)| (I::new(i), t)) }
+}
+
+impl<I: Idx + std::fmt::Debug, T: std::fmt::Debug> std::fmt::Debug for Arena<I, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
 }
 
 impl<I: Idx, T> std::ops::Index<I> for Arena<I, T> {
@@ -113,6 +125,7 @@ impl TyTable {
 impl Default for TyTable { fn default() -> Self { Self::new() } }
 
 // ---------- function body ----------
+#[derive(Debug)]
 pub struct Function {
     pub name: Symbol,
     pub sig: SigId,
@@ -157,6 +170,7 @@ impl Function {
     }
 }
 
+#[derive(Debug)]
 pub struct Block {
     pub insts: ListRef,          // into value_pool, in order
     pub params: ListRef,         // block params instead of phi nodes

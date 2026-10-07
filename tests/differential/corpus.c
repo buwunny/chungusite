@@ -18,10 +18,13 @@
  * upper bits of rax undefined for narrower returns. Integer arguments narrower than
  * 64 bits reach the decompiled code with random upper register bits, as they may
  * from a real caller. Keep functions free of libc names: the originals are linked
- * into a Rust program.
+ * into a Rust program. Calling libc is fine.
  */
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
+
+#define NOINLINE __attribute__((noinline))
 
 /* ---- straight-line integer code ---- */
 
@@ -318,3 +321,87 @@ char *str_chr(char *s, uint8_t c) {
     for (; *s; s++) if ((uint8_t)*s == c) return s;
     return NULL;
 }
+
+/* ---- calls, signatures and stack frames ---- */
+
+// @diff mix: u64(u64, u64)
+NOINLINE uint64_t mix(uint64_t a, uint64_t b) { return a * 31 + (b ^ (b >> 7)); }
+
+// @diff call_mix: u64(u64, u64)
+uint64_t call_mix(uint64_t a, uint64_t b) { return mix(a, b) + mix(b, 3); }
+
+// Values live across calls sit in callee-saved registers, pushed and popped.
+// @diff across_calls: u64(u64, u64, u64)
+uint64_t across_calls(uint64_t a, uint64_t b, uint64_t c) {
+    uint64_t x = mix(a, b);
+    uint64_t y = mix(c, x);
+    return x ^ y ^ a ^ c;
+}
+
+// A tail call with the arguments swapped: `jmp mix`.
+// @diff tail_swap: u64(u64, u64)
+uint64_t tail_swap(uint64_t a, uint64_t b) { return mix(b, a); }
+
+// Not in the corpus itself: called through its symbol, as an extern.
+NOINLINE uint64_t hidden_square(uint64_t x) { return x * x + 1; }
+
+// @diff call_hidden: u64(u64)
+uint64_t call_hidden(uint64_t x) { return hidden_square(x) + hidden_square(x + 1); }
+
+// @diff bump: void(buf:8)
+NOINLINE void bump(uint64_t *p) { *p += 3; }
+
+// A void function calling a void function.
+// @diff bump_twice: void(buf:8)
+void bump_twice(uint64_t *p) { bump(p); bump(p); }
+
+// @diff store_sum: void(buf:8, u64, u64)
+NOINLINE void store_sum(uint64_t *out, uint64_t a, uint64_t b) { *out = a + b; }
+
+// An address-taken local: it stays in the frame and its address is passed on.
+// @diff via_local: u64(u64, u64)
+uint64_t via_local(uint64_t a, uint64_t b) {
+    uint64_t r;
+    store_sum(&r, a, b);
+    return r * 2;
+}
+
+// @diff eight_args: u64(u64, u64, u64, u64, u64, u64, u64, u64)
+NOINLINE uint64_t eight_args(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f, uint64_t g, uint64_t h) {
+    return a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f + 7 * g + 8 * h;
+}
+
+// Two arguments go on the stack.
+// @diff call_eight: u64(u64, u64)
+uint64_t call_eight(uint64_t x, uint64_t y) { return eight_args(x, y, 1, 2, 3, 4, x ^ y, 5) + 1; }
+
+// @diff fib_rec: u64(u64:0..18)
+NOINLINE uint64_t fib_rec(uint64_t n) { return n < 2 ? n : fib_rec(n - 1) + fib_rec(n - 2); }
+
+// @diff len_plus: u64(str:32)
+uint64_t len_plus(const char *s) { return strlen(s) + 1; }
+
+// @diff copy_n: void(buf:64, buf:64, u64:0..65)
+void copy_n(uint8_t *d, const uint8_t *s, uint64_t n) { memcpy(d, s, n); }
+
+// An array on the stack, indexed.
+// @diff stack_table: u64(u64:0..16, u64)
+uint64_t stack_table(uint64_t i, uint64_t k) {
+    volatile uint64_t t[16];
+    for (int j = 0; j < 16; j++) t[j] = k * (uint64_t)j + (uint64_t)j;
+    return t[i];
+}
+
+// A buffer on the stack, passed to a callee and read back.
+// @diff stack_buf: u64(u64, u64)
+uint64_t stack_buf(uint64_t a, uint64_t b) {
+    uint64_t buf[4];
+    store_sum(&buf[0], a, b);
+    store_sum(&buf[1], b, 7);
+    bump(&buf[1]);
+    return buf[0] ^ buf[1];
+}
+
+// @diff max_of3: i64(i64, i64, i64)
+NOINLINE int64_t max2(int64_t a, int64_t b) { return a > b ? a : b; }
+int64_t max_of3(int64_t a, int64_t b, int64_t c) { return max2(max2(a, b), c); }

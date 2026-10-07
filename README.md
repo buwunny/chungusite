@@ -12,4 +12,4 @@ chungusite ./prog --mode safe -o prog.rs  # decompile to Rust
 
 - [docs/cli.md](docs/cli.md): the command and what its output looks like
 - [docs/roadmap.md](docs/roadmap.md): what's left before it handles real-world binaries
-- [docs/ir.md](docs/ir.md), [docs/lift.md](docs/lift.md), [docs/ownership.md](docs/ownership.md): the design
+- [docs/ir.md](docs/ir.md), [docs/lift.md](docs/lift.md), [docs/calls.md](docs/calls.md), [docs/ownership.md](docs/ownership.md): the design

@@ -29,7 +29,7 @@ A function that fails to lift still appears in the output as a stub whose body i
 
 ## What the Rust looks like
 
-The emitter is [`src/emit.rs`](../src/emit.rs). Every IR value is a Rust integer (`u8`..`u64`, or `bool` for comparisons), and pointers are `u64` addresses. That way the output type-checks however the binary mixes pointers and integers. Arguments are named after the registers they arrive in, in System V order (`rdi, rsi, rdx, rcx, r8, r9`), followed by any other register the function reads on entry. Every function returns `rax` as a `u64`.
+The emitter is [`src/emit.rs`](../src/emit.rs). Every IR value is a Rust integer (`u8`..`u64`, or `bool` for comparisons), and pointers are `u64` addresses. That way the output type-checks however the binary mixes pointers and integers. Signatures are recovered for the whole program at once ([calls.md](calls.md)): arguments are named after the registers they arrive in, in System V order (`rdi, rsi, rdx, rcx, r8, r9`, then `arg6`, `arg7`, ... from the stack), and a function returns `u64`, `(u64, u64)` (rax:rdx) or nothing. Calls to other decompiled functions use their names, and everything else they call is declared in a `mod ffi` at the top of the file. Stack slots become `let` bindings; a function that takes the address of one keeps a `frame` array.
 
 **Fast mode** is an `unsafe fn` with every load and store as an unaligned raw access:
 

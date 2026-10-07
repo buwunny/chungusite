@@ -131,10 +131,11 @@ pub fn verify(f: &Function) -> Result<(), VerifyError> {
 pub fn for_each_operand(k: InstKind, f: &Function, mut cb: impl FnMut(ValueId)) {
     use InstKind::*;
     match k {
-        Const(_) | Param(_) | BlockParam(_) | FuncRef(_) | ImportRef(_) | AddrOfLocal(_)
+        Const(_) | Undef | Param(_) | BlockParam(_) | FuncRef(_) | ImportRef(_) | AddrOfLocal(_)
         | AddrOfGlobal(_) | Opaque { .. } => {}
         Bin { lhs, rhs, .. } | Cmp { lhs, rhs, .. } => { cb(lhs); cb(rhs) }
-        Un { v, .. } | Cast { v, .. } | IntToPtr(v) | PtrToInt(v) | CallHi(v) => cb(v),
+        Un { v, .. } | Cast { v, .. } | IntToPtr(v) | PtrToInt(v) | CallOut { call: v, .. } => cb(v),
+        Exit { regs } => regs.get(&f.value_pool).iter().copied().for_each(&mut cb),
         Select { c, t, f: e } => { cb(c); cb(t); cb(e) }
         Call { callee, args } => { cb(callee); args.get(&f.value_pool).iter().copied().for_each(&mut cb) }
         PtrOffset { base, index, .. } => { cb(base); if let Some(i) = index { cb(i) } }

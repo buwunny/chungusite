@@ -1,11 +1,15 @@
 //! chungusite: x86_64 to Rust decompiler. See docs/ir.md for the IR design.
+pub mod abi;
 pub mod borrow;
 pub mod cfg;
 pub mod dump;
 pub mod emit;
+pub mod frame;
 pub mod ir;
+pub mod libc;
 pub mod lift;
 pub mod load;
 pub mod opt;
+pub mod program;
 pub mod refine;
 pub mod verify;

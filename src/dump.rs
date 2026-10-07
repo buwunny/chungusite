@@ -21,6 +21,7 @@ fn write_fn(s: &mut String, f: &Function) -> fmt::Result {
             let k = f.insts[id].kind;
             let body = match k {
                 InstKind::Const(c) => format!("const {:#x}", f.consts[c.index()]),
+                InstKind::Undef => "undef".to_string(),
                 InstKind::Param(i) => format!("param r{i}"),
                 InstKind::Bin { op, lhs, rhs } => format!("{op:?} {}, {}", v(lhs), v(rhs)),
                 InstKind::Cmp { cc, lhs, rhs } => format!("cmp.{cc:?} {}, {}", v(lhs), v(rhs)),
@@ -33,13 +34,14 @@ fn write_fn(s: &mut String, f: &Function) -> fmt::Result {
                 InstKind::Un { op, v: x } => format!("{op:?} {}", v(x)),
                 InstKind::Select { c, t, f: e } => format!("select {}, {}, {}", v(c), v(t), v(e)),
                 InstKind::Call { callee, args } => format!("call {}({})", v(callee), list(f, args)),
-                InstKind::CallHi(x) => format!("callhi {}", v(x)),
+                InstKind::CallOut { call, reg } => format!("callout {} r{reg}", v(call)),
+                InstKind::Exit { regs } => format!("exit {}", list(f, regs)),
                 InstKind::Load { ptr, .. } => format!("load {}", v(ptr)),
                 InstKind::Store { ptr, val, .. } => format!("store {} <- {}", v(ptr), v(val)),
                 other => format!("{other:?}"),
             };
             match k {
-                InstKind::Store { .. } => writeln!(s, "  {body}")?,
+                InstKind::Store { .. } | InstKind::Exit { .. } => writeln!(s, "  {body}")?,
                 _ => writeln!(s, "  {} = {body}", v(id))?,
             }
         }
@@ -52,6 +54,7 @@ fn write_fn(s: &mut String, f: &Function) -> fmt::Result {
                 format!("br {} bb{}({}) bb{}({})", v(c), t.index(), show(&a[..nt]), e.index(), show(&a[nt..]))
             }
             Terminator::Return(r) => format!("ret {}", r.map(v).unwrap_or_default()),
+            Terminator::TailCall { callee, args } => format!("tailcall {}({})", v(callee), list(f, args)),
             other => format!("{other:?}"),
         };
         writeln!(s, "  {t}")?;

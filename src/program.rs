@@ -18,6 +18,7 @@ use crate::emit::{emit_function_in, CallInfo, EmitStats, Env, Mode};
 use crate::ir::*;
 use crate::lift::Lifter;
 use crate::opt::clean;
+use crate::types::{FnTypes, FuncRef, StructNames, TypeModel};
 use crate::verify::verify;
 use object::{Object, ObjectKind, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationTarget, SectionKind};
 use rayon::prelude::*;
@@ -61,6 +62,8 @@ pub struct Func {
     /// The IR straight out of the lifter, if `build` was asked to keep it.
     pub raw_ir: Option<String>,
     pub sig: Sig,
+    /// Recovered types (`types.rs`), for selected functions that lifted.
+    pub types: Option<FnTypes>,
     sites: Vec<Site>,
     targets: Vec<Target>,
     guesses: Vec<u8>,
@@ -78,6 +81,22 @@ pub struct Program {
     pub funcs: Vec<Func>,
     pub externs: Vec<Extern>,
     extern_of: HashMap<String, usize>,
+    /// Struct types the signatures use, defined once in `prelude`.
+    pub structs: StructNames,
+}
+
+/// Where types come from (`types.rs`).
+pub struct TypeOptions<'m> {
+    /// Read argument and struct types from the binary's DWARF, if it has any.
+    pub debug_info: bool,
+    /// A model that proposes types (the ML type model); checked like debug info.
+    pub model: Option<&'m dyn TypeModel>,
+}
+
+impl Default for TypeOptions<'_> {
+    fn default() -> Self {
+        TypeOptions { debug_info: true, model: None }
+    }
 }
 
 /// Names for call targets, from the object file.
@@ -179,6 +198,11 @@ impl Program {
     /// Lift, resolve, infer signatures and rewrite every function. `file` is the
     /// whole binary, for relocations and import names (`None` for raw bytes).
     pub fn build(inputs: Vec<Input>, file: Option<&[u8]>, keep_raw_ir: bool) -> Program {
+        Self::build_with(inputs, file, keep_raw_ir, &TypeOptions::default())
+    }
+
+    /// `build`, with types from `types` (debug info and a model, or neither).
+    pub fn build_with(inputs: Vec<Input>, file: Option<&[u8]>, keep_raw_ir: bool, types: &TypeOptions) -> Program {
         let syms = file.map(Symbols::parse).unwrap_or_default();
         let by_addr: HashMap<u64, usize> = inputs.iter().enumerate().map(|(i, x)| (x.addr, i)).rev().collect();
         let mut by_name: HashMap<String, usize> = HashMap::new();
@@ -257,7 +281,7 @@ impl Program {
                     }
                     Err(_) => Default::default(),
                 };
-                Func { name: x.name, ident: x.ident, addr: x.addr, selected: x.selected, ir, raw_ir, sig: Sig::default(), sites, targets, guesses }
+                Func { name: x.name, ident: x.ident, addr: x.addr, selected: x.selected, ir, raw_ir, sig: Sig::default(), types: None, sites, targets, guesses }
             })
             .collect();
 
@@ -365,7 +389,38 @@ impl Program {
                 externs.push(Extern { name, ident, sig });
             }
         }
-        Program { funcs, externs, extern_of }
+        // 6. Types, for the functions that are emitted.
+        let dwarf = file.filter(|_| types.debug_info).map(crate::dwarf::DebugInfo::parse);
+        let mut models: Vec<&dyn TypeModel> = Vec::new();
+        if let Some(d) = &dwarf {
+            models.push(d);
+        }
+        if let Some(m) = types.model {
+            models.push(m);
+        }
+        funcs.par_iter_mut().for_each(|f| {
+            let Ok(ir) = &f.ir else { return };
+            if f.selected {
+                f.types = Some(crate::types::infer(&FuncRef { name: &f.name, addr: f.addr, ir, sig: f.sig }, &f.ident, &models));
+            }
+        });
+        // Argument names must not shadow functions or statics.
+        let mut taken: std::collections::HashSet<String> = funcs.iter().map(|f| f.ident.clone()).collect();
+        if let Some(Ok(obj)) = file.map(object::File::parse) {
+            taken.extend(obj.symbols().chain(obj.dynamic_symbols()).filter_map(|s| s.name().ok().map(crate::names::sanitize)));
+        }
+        let mut structs = StructNames::default();
+        for f in &mut funcs {
+            if let Some(t) = &mut f.types {
+                t.fix_names(&taken);
+                for p in t.structs_mut() {
+                    if let crate::types::PointeeTy::Struct(s) = &p.ty {
+                        p.ident = structs.name(s);
+                    }
+                }
+            }
+        }
+        Program { funcs, externs, extern_of, structs }
     }
 
     /// The callee of each call site in function `i`, for the emitter.
@@ -374,13 +429,17 @@ impl Program {
         let k = f.sites.iter().position(|&s| s == site)?;
         let ext = |name: &str| {
             let e = &self.externs[*self.extern_of.get(name)?];
-            Some(CallInfo { path: Some(format!("ffi::{}", e.ident)), ret: e.sig.ret, ret2: e.sig.ret2, foreign: true })
+            Some(CallInfo { path: Some(format!("ffi::{}", e.ident)), ret: e.sig.ret, ret2: e.sig.ret2, foreign: true, ..Default::default() })
         };
         match &f.targets[k] {
             Target::Func(j) => {
                 let g = &self.funcs[*j];
-                if g.selected && g.ir.is_ok() {
-                    Some(CallInfo { path: Some(g.ident.clone()), ret: g.sig.ret, ret2: g.sig.ret2, foreign: false })
+                if let (true, Ok(ir)) = (g.selected, &g.ir) {
+                    let (params, ret_ty) = match &g.types {
+                        Some(t) => (t.arg_types(ir, g.sig), t.ret.filter(|_| g.sig.ret && !g.sig.ret2)),
+                        None => (Vec::new(), None),
+                    };
+                    Some(CallInfo { path: Some(g.ident.clone()), ret: g.sig.ret, ret2: g.sig.ret2, foreign: false, params, ret_ty })
                 } else {
                     ext(&g.name)
                 }
@@ -411,7 +470,7 @@ impl Program {
             .map(|(i, f)| {
                 let ir = f.ir.as_ref().ok().filter(|_| f.selected)?;
                 let call = |s: Site| self.call_info(i, s);
-                let env = Env { sig: Some(f.sig), call: &call, demote: called[i], structure: true, global_of };
+                let env = Env { sig: Some(f.sig), call: &call, demote: called[i], structure: true, global_of, types: f.types.as_ref() };
                 let mut src = String::new();
                 let stats = emit_function_in(ir, &f.ident, mode, &env, &mut src);
                 Some((src, stats))
@@ -444,10 +503,15 @@ impl Program {
 
     /// `mod ffi`, declaring every extern the emitted code calls; empty if none.
     pub fn prelude(&self) -> String {
-        if self.externs.is_empty() {
-            return String::new();
+        let mut s = String::new();
+        if !self.structs.is_empty() {
+            s.push_str("\n// Types of what pointer arguments point to (debug info, or inferred from the accesses).\n");
+            s.push_str(&self.structs.defs());
         }
-        let mut s = String::from("\n/// Functions the decompiled code calls but doesn't define.\npub mod ffi {\n");
+        if self.externs.is_empty() {
+            return s;
+        }
+        s.push_str("\n/// Functions the decompiled code calls but doesn't define.\npub mod ffi {\n");
         if self.externs.iter().any(|e| e.sig.ret2) {
             s.push_str("    /// A 16-byte result, returned in rax:rdx.\n    #[repr(C)]\n    pub struct Pair(pub u64, pub u64);\n\n");
         }

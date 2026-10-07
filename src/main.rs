@@ -12,7 +12,7 @@ use chungusite::{
     ir::Function,
     load::{Binary, FuncBytes},
     names::rust_ident,
-    program::{Input, Program},
+    program::{Input, Program, TypeOptions},
 };
 use clap::{Parser, ValueEnum};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -63,6 +63,10 @@ struct Cli {
     #[arg(long)]
     skip_failed: bool,
 
+    /// Don't read argument and struct types from DWARF; infer them from the code only.
+    #[arg(long)]
+    no_debug_info: bool,
+
     /// Worker threads (default: one per CPU, or RAYON_NUM_THREADS).
     #[arg(short, long)]
     jobs: Option<usize>,
@@ -84,6 +88,9 @@ enum Emit {
     RawIr,
     /// What safe mode's borrow inference concludes for each argument.
     Borrows,
+    /// What type recovery concludes for each argument and the return value, and
+    /// which debug-info proposals the code accepted or rejected.
+    Types,
 }
 
 fn parse_addr(s: &str) -> Result<u64, String> {
@@ -178,13 +185,14 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         }
     }
     let file = bin.map(|_| &data[..]);
-    let program = Program::build(inputs, file, cli.emit == Emit::RawIr);
+    let types = TypeOptions { debug_info: !cli.no_debug_info, ..TypeOptions::default() };
+    let program = Program::build_with(inputs, file, cli.emit == Emit::RawIr, &types);
     let emitted = if rust { program.emit_all(mode, &global_of) } else { Vec::new() };
 
     let mut out = String::new();
     if rust {
         let _ = writeln!(out, "// Decompiled by chungusite from {source} (--mode {mode_name}).");
-        out.push_str("#![allow(unused_mut, unused_variables, unused_assignments, unreachable_code, non_snake_case, non_upper_case_globals, unused_parens, unused_unsafe, clippy::all)]\n");
+        out.push_str("#![allow(unused_mut, unused_variables, unused_assignments, unreachable_code, non_snake_case, non_upper_case_globals, non_camel_case_types, unused_parens, unused_unsafe, clippy::all)]\n");
         out.push_str(&program.prelude());
     }
     let mut failures: BTreeMap<String, usize> = BTreeMap::new();
@@ -222,6 +230,12 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             (Ok(ir), Emit::Borrows) => {
                 let _ = writeln!(out, "\n; {header}");
                 borrows(ir, &mut out);
+            }
+            (Ok(_), Emit::Types) => {
+                let _ = writeln!(out, "\n; {header}");
+                for n in pf.types.iter().flat_map(|t| &t.notes) {
+                    let _ = writeln!(out, "  {n}");
+                }
             }
             (Ok(ir), Emit::Rust) => {
                 let (body, s) = emitted[i].as_ref().expect("emitted");
@@ -273,6 +287,20 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     if !statics.is_empty() {
         let bytes: u64 = statics.iter().map(|i| i.len).sum();
         eprintln!("  {} statics ({bytes} bytes) from the binary's data sections", statics.len());
+    }
+    let (mut narrow, mut ptrs, mut rets, mut named) = (0, 0, 0, 0);
+    for &i in &index {
+        for t in program.funcs[i].types.iter() {
+            narrow += t.params.iter().filter(|p| p.pointee.is_none() && p.int.bytes < 8).count();
+            ptrs += t.params.iter().filter(|p| p.pointee.is_some()).count();
+            named += t.params.iter().filter(|p| p.name.is_some()).count();
+            rets += t.ret.is_some() as usize;
+        }
+    }
+    if narrow + ptrs + rets > 0 {
+        eprintln!(
+            "  types: {narrow} integer arguments narrower than u64, {ptrs} pointer arguments typed, {rets} narrower return values, {named} arguments named from debug info"
+        );
     }
     if total.state_machines > 0 {
         eprintln!("  {} with irreducible control flow, kept as a `loop {{ match bb }}` state machine", total.state_machines);

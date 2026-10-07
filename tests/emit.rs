@@ -206,7 +206,9 @@ fn cli_decompiles_an_elf() {
         let src = String::from_utf8(out.stdout).unwrap();
         assert!(src.contains("pub fn muller() -> u64 {\n    todo!(\"not lifted: unsupported instruction Mul at 0x10\")"), "{src}");
         if mode == "safe" {
-            assert!(src.contains("pub fn get_count(rdi_ref: &[u8]) -> u64 {"), "{src}");
+            // one field at +8: a struct recovered from the access (`types.rs`)
+            assert!(src.contains("pub fn get_count(rdi_ref: &S_get_count_rdi) -> u64 {"), "{src}");
+            assert!(src.contains("let v2: u64 = rdi_ref.f8;"), "{src}");
         }
         rustc(&dir, &format!("{mode}.rs"), &src, &["--crate-type", "lib", "--emit", "metadata"]);
     }

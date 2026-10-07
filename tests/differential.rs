@@ -2,7 +2,7 @@
 //! the same thing as the machine code it came from?
 //!
 //! `tests/differential/corpus.c` is compiled with every C compiler found (`cc`,
-//! `clang`) at -O1, -O2 and -Os. Each function in the object file is lifted, cleaned
+//! `clang`) at -O1, -O2 and -Os, and at -O2 with debug info (-g). Each function in the object file is lifted, cleaned
 //! and emitted in both modes, exactly as the CLI does. A generated Rust program links
 //! the original object file next to the decompiled source and calls both on the
 //! same random inputs, comparing return values and every byte of every buffer
@@ -44,7 +44,9 @@ const KNOWN_BAD: &[(&str, &str)] = &[
     ("/switch8/", "jump/lookup table in .rodata: globals aren't mapped to statics yet"),
 ];
 
-const OPT_LEVELS: [&str; 3] = ["-O1", "-O2", "-Os"];
+/// Compiler flags per variant. `-g` adds DWARF, so argument and struct types come
+/// from debug info (`dwarf.rs`) instead of being inferred.
+const OPT_LEVELS: [&str; 4] = ["-O1", "-O2", "-Os", "-O2 -g"];
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
@@ -161,8 +163,6 @@ struct Decompiled {
     result: Result<[String; 2], String>,
 }
 
-const SYSV: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
-
 /// Decompile the object file the way the CLI does: every function, so calls see
 /// their callees' signatures, with the corpus cases selected for emission. Also
 /// returns each mode's prelude (the `extern "C"` block for callees that aren't
@@ -205,36 +205,47 @@ fn decompile(obj: &[u8], cases: &[Case]) -> (Vec<Decompiled>, [String; 2]) {
 // Generating the runner program
 
 /// How to pass each parameter of an emitted function, from its signature line, e.g.
-/// `pub unsafe fn get8(mut rdi: u64, mut rsi: u64) -> u64 {`. Errs when the harness
-/// can't call it (a slice for an argument that the C code takes as an integer).
+/// `pub unsafe fn get8(mut rdi: u64, esi: u32) -> u64 {` or
+/// `pub fn field_sum(r: &rec) -> u64 {`. Parameters come in C order (rdi..r9, then
+/// the stack), whatever they are named. Errs when the harness can't call it (a
+/// reference for an argument that the C code takes as an integer).
 fn call_args(src: &str, case: &Case) -> Result<String, String> {
     let sig = src.lines().find(|l| l.starts_with("pub ")).ok_or("no signature in emitted code")?;
     let close = sig.rfind(") -> ").or_else(|| sig.rfind(") {")).ok_or("unexpected signature")?;
     let params = &sig[sig.find('(').unwrap() + 1..close];
     let mut out = Vec::new();
+    let mut pos = 0;
     for p in params.split(", ").filter(|p| !p.is_empty()) {
         let p = p.strip_prefix("mut ").unwrap_or(p);
         let (name, ty) = p.split_once(": ").ok_or_else(|| format!("unexpected parameter `{p}`"))?;
-        let reg = name.strip_suffix("_ref").unwrap_or(name);
-        // rdi..r9, then arg6, arg7, ... on the stack; `_rdx` is an argument the
-        // decompiled function takes but doesn't use
-        let idx = SYSV
-            .iter()
-            .position(|&r| r == reg)
-            .or_else(|| reg.strip_prefix("arg").and_then(|n| n.parse().ok()))
-            .filter(|&i| i < case.args.len());
-        out.push(match (ty, idx) {
-            ("u64", Some(i)) => format!("a.reg({i})"),
-            ("u64", None) if reg == "rsp" => "a.stack()".to_string(),
-            ("u64", None) => "a.junk()".to_string(),
-            (_, Some(i)) if matches!(case.args[i], Arg::Buf(_) | Arg::Str(_)) => match ty {
-                "&[u8]" => format!("a.shared({i})"),
-                "&mut [u8]" => format!("a.slice({i})"),
-                "Option<&[u8]>" => format!("Some(a.shared({i}))"),
-                "Option<&mut [u8]>" => format!("Some(a.slice({i}))"),
-                _ => return Err(format!("unexpected parameter type `{ty}`")),
-            },
-            _ => return Err(format!("safe mode takes `{reg}` as `{ty}`, but the C function has no pointer argument there")),
+        if name == "rsp" {
+            out.push("a.stack()".to_string());
+            continue;
+        }
+        let idx = Some(pos).filter(|&i| i < case.args.len());
+        pos += 1;
+        let int = matches!(ty, "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64");
+        let buf = idx.is_some_and(|i| matches!(case.args[i], Arg::Buf(_) | Arg::Str(_)));
+        let inner = ty.strip_prefix("Option<").and_then(|t| t.strip_suffix('>')).unwrap_or(ty);
+        let reference = match (inner.strip_prefix("&mut "), inner.strip_prefix('&')) {
+            (Some(t), _) => Some((true, t.starts_with('['))),
+            (None, Some(t)) => Some((false, t.starts_with('['))),
+            _ => None,
+        };
+        out.push(match (idx, reference) {
+            (Some(i), None) if int => format!("a.reg({i}) as {ty}"),
+            (None, None) if int => format!("a.junk() as {ty}"),
+            (Some(i), None) if ty.starts_with("*mut ") => format!("a.reg({i}) as *mut _"),
+            (Some(i), Some((mutbl, slice))) if buf => {
+                let r = match (mutbl, slice) {
+                    (true, true) => format!("a.s({i})"),
+                    (false, true) => format!("&*a.s({i})"),
+                    (true, false) => format!("a.r({i})"),
+                    (false, false) => format!("&*a.r({i})"),
+                };
+                if inner == ty { r } else { format!("Some({r})") }
+            }
+            _ => return Err(format!("the decompiled code takes `{name}` as `{ty}`, which doesn't fit the C argument there")),
         });
     }
     Ok(out.join(", "))
@@ -306,7 +317,8 @@ fn runner_source(funcs: &[&Decompiled], prelude: &[String; 2]) -> (String, Strin
             Ok(args) if !src.lines().find(|l| l.starts_with("pub ")).unwrap_or("").contains(") -> ") => {
                 format!("Ok(|a: &mut Args| unsafe {{ {m}::{}({args}); 0 }})", c.name)
             }
-            Ok(args) => format!("Ok(|a: &mut Args| unsafe {{ {m}::{}({args}) }})", c.name),
+            // a narrower return type is compared on its low bits (`ret_key`)
+            Ok(args) => format!("Ok(|a: &mut Args| unsafe {{ {m}::{}({args}) as u64 }})", c.name),
             Err(e) => format!("Err({e:?})"),
         };
         let _ = writeln!(
@@ -417,6 +429,19 @@ impl Args {
         unsafe { std::slice::from_raw_parts_mut(self.bufs[i].as_mut_ptr(), self.bufs[i].len()) }
     }
     fn shared(&mut self, i: usize) -> &'static [u8] { self.slice(i) }
+    /// The buffer as a slice of `T` (a recovered element type).
+    fn s<T>(&mut self, i: usize) -> &'static mut [T] {
+        let p = self.bufs[i].as_mut_ptr();
+        assert!(p as usize % std::mem::align_of::<T>() == 0, "buffer not aligned for the element type");
+        unsafe { std::slice::from_raw_parts_mut(p as *mut T, self.bufs[i].len() / std::mem::size_of::<T>()) }
+    }
+    /// The buffer as one `T` (a recovered struct or scalar).
+    fn r<T>(&mut self, i: usize) -> &'static mut T {
+        let p = self.bufs[i].as_mut_ptr();
+        assert!(std::mem::size_of::<T>() <= self.bufs[i].len(), "recovered type is larger than the buffer");
+        assert!(p as usize % std::mem::align_of::<T>() == 0, "buffer not aligned for the recovered type");
+        unsafe { &mut *(p as *mut T) }
+    }
     fn stack(&mut self) -> u64 { self.stack.as_mut_ptr() as u64 + 4096 }
     fn junk(&mut self) -> u64 { self.junk }
     fn base(&self, i: usize) -> u64 { self.bufs[i].as_ptr() as u64 }
@@ -553,7 +578,7 @@ fn check_variant(v: &Variant, cases: &[Case], corpus: &Path, root: &Path) -> Vec
     let dir = root.join(&v.label);
     std::fs::create_dir_all(&dir).unwrap();
     let obj = dir.join("corpus.o");
-    let out = Command::new(&v.cc).args([v.opt, "-c", "-o"]).arg(&obj).arg(corpus).output().unwrap();
+    let out = Command::new(&v.cc).args(v.opt.split(' ')).args(["-c", "-o"]).arg(&obj).arg(corpus).output().unwrap();
     assert!(out.status.success(), "{} {} failed on corpus.c:\n{}", v.cc, v.opt, String::from_utf8_lossy(&out.stderr));
 
     let (decompiled, prelude) = decompile(&std::fs::read(&obj).unwrap(), cases);
@@ -627,7 +652,7 @@ fn decompiled_c_matches_the_original() {
     for cc in &ccs {
         let label = compiler_label(cc);
         for opt in OPT_LEVELS {
-            variants.push(Variant { label: format!("{label}{opt}"), cc: cc.clone(), opt });
+            variants.push(Variant { label: format!("{label}{}", opt.replace(" ", "")), cc: cc.clone(), opt });
         }
     }
 

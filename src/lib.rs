@@ -2,6 +2,7 @@
 pub mod abi;
 pub mod borrow;
 pub mod cfg;
+pub mod discover;
 pub mod dump;
 pub mod dwarf;
 pub mod emit;

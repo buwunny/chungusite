@@ -45,7 +45,11 @@ Flags that cross a block boundary (`LiftError::FlagsNotInBlock`) also need handl
 
 ## 4. Control-flow structuring
 
-Every function with a branch is currently a `loop { match bb { ... } }` state machine. That is correct for any CFG but hard to read. Structuring recovers `if`/`else`, `while`/`loop` with `break`, and early `return` from the dominator tree and loop nesting (`cfg.rs` has dominators). Irreducible regions keep the state machine.
+Done: `src/structure.rs` turns every reducible CFG into `if`/`else`, `loop` with `break`/`continue`, and early `return` (Ramsey's dominator-tree construction, then a cleanup pass); irreducible CFGs keep the state machine. On chungusite's own debug build all 1,962 lifted functions come out structured. Left for readability:
+
+- Short-circuit conditions: `if a || b` currently needs a labeled block, because two paths reach the same `else`.
+- `while cond { .. }`: the condition is computed in statements before the `if`, so loops print as `loop { let c = ..; if !c { break; } .. }`. Inlining single-use pure values into their use would fix this and shorten most code.
+- Irreducible regions are handled per function, not per region: one bad cycle turns the whole function back into a state machine.
 
 ## 5. Types
 

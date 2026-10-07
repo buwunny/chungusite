@@ -8,4 +8,5 @@ pub mod lift;
 pub mod load;
 pub mod opt;
 pub mod refine;
+pub mod structure;
 pub mod verify;

@@ -7,11 +7,14 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
+cpp_demangle = "0.5.1"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
 object = { version = "0.40.0", default-features = false, features = ["read_core", "elf", "macho", "pe", "coff", "std"] }
 # ML refinement (names/types). load-dynamic: libonnxruntime is loaded at runtime from
 # ORT_DYLIB_PATH, so the build downloads nothing. ort is pinned: its 2.0 RCs change API.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-24"], optional = true }
+rayon = "1.12.0"
+rustc-demangle = "0.1.28"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 
 [features]

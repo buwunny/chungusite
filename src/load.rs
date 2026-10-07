@@ -1,18 +1,69 @@
 //! Read x86_64 machine code out of an object file (ELF, Mach-O or PE) with `object`,
-//! and find the functions in it from the symbol table.
-use object::{Architecture, Object, ObjectSection, ObjectSymbol, SectionKind, SymbolKind};
+//! and find the functions and data in it from the symbol table.
+use object::{
+    Architecture, Object, ObjectKind, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationFlags, RelocationTarget,
+    SectionKind, SymbolKind,
+};
+use std::collections::BTreeMap;
+use rayon::prelude::*;
 
 /// A function found in the binary: its name, load address and bytes.
 pub struct FuncBytes<'a> {
+    /// The symbol as it appears in the binary (mangled).
     pub name: String,
+    /// The demangled name without hash or parameter list, if `name` is a Rust or C++ symbol.
+    pub demangled: Option<String>,
     pub addr: u64,
     pub bytes: &'a [u8],
+}
+
+impl FuncBytes<'_> {
+    /// The name to show people: demangled if possible.
+    pub fn pretty(&self) -> &str {
+        self.demangled.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// An allocated data section: `.data`, `.rodata`, `.bss`, `__const`, `.rdata`...
+pub struct DataSection<'a> {
+    pub name: String,
+    pub addr: u64,
+    pub size: u64,
+    /// The file contents; `None` for zero-initialized sections (`.bss`).
+    pub bytes: Option<&'a [u8]>,
+    /// Writable at run time (`.data`, `.bss`), so its static must be `static mut`.
+    pub writable: bool,
+}
+
+/// A data object symbol (`STT_OBJECT`): a named static, string or table.
+pub struct DataSym {
+    pub name: String,
+    pub demangled: Option<String>,
+    pub addr: u64,
+    /// 0 when the symbol table doesn't say.
+    pub size: u64,
+    /// Index into `Binary::data`.
+    pub section: usize,
+}
+
+impl DataSym {
+    pub fn pretty(&self) -> &str {
+        self.demangled.as_deref().unwrap_or(&self.name)
+    }
 }
 
 pub struct Binary<'a> {
     file: object::File<'a>,
     /// Defined functions, sorted by address, one per address.
     pub funcs: Vec<FuncBytes<'a>>,
+    /// Allocated data sections, sorted by address. Empty for relocatable objects,
+    /// whose section addresses are all 0 and mean nothing until linked.
+    pub data: Vec<DataSection<'a>>,
+    /// Data symbols inside `data`, sorted by address, one per address.
+    pub data_syms: Vec<DataSym>,
+    /// Pointer-sized slots in `data` that the dynamic loader fills in (GOT entries,
+    /// vtables, pointer tables in a PIE), and what they point to.
+    pub pointers: BTreeMap<u64, u64>,
 }
 
 #[derive(Debug)]
@@ -37,6 +88,15 @@ impl<'a> Binary<'a> {
         if file.architecture() != Architecture::X86_64 {
             return Err(LoadError::Arch(file.architecture()));
         }
+
+        // Start address of every symbol, per section, for symbols without a size.
+        let mut starts: Vec<(usize, u64)> = file
+            .symbols()
+            .filter_map(|s| Some((s.section_index()?.0, s.address())))
+            .collect();
+        starts.sort_unstable();
+        starts.dedup();
+
         let mut funcs = Vec::new();
         // The static symbol table first; a stripped binary still has its dynamic exports.
         for sym in file.symbols().chain(file.dynamic_symbols()) {
@@ -48,15 +108,68 @@ impl<'a> Binary<'a> {
             if sec.kind() != SectionKind::Text {
                 continue;
             }
-            let size = if sym.size() > 0 { sym.size() } else { size_to_next_symbol(&file, sym.address(), &sec) };
+            let size = if sym.size() > 0 { sym.size() } else { size_to_next_symbol(&starts, sym.address(), &sec) };
             let Ok(Some(bytes)) = sec.data_range(sym.address(), size) else { continue };
             let name = sym.name().unwrap_or("").to_string();
             let name = if name.is_empty() { format!("sub_{:x}", sym.address()) } else { name };
-            funcs.push(FuncBytes { name, addr: sym.address(), bytes });
+            funcs.push(FuncBytes { name, demangled: None, addr: sym.address(), bytes });
         }
         funcs.sort_by_key(|f| f.addr);
         funcs.dedup_by_key(|f| f.addr);
-        Ok(Binary { file, funcs })
+
+        let mut sections = Vec::new();
+        if file.kind() != ObjectKind::Relocatable {
+            for sec in file.sections() {
+                let writable = match sec.kind() {
+                    SectionKind::Data | SectionKind::UninitializedData => true,
+                    SectionKind::ReadOnlyData | SectionKind::ReadOnlyDataWithRel | SectionKind::ReadOnlyString => false,
+                    _ => continue,
+                };
+                if sec.address() == 0 || sec.size() == 0 {
+                    continue;
+                }
+                let bytes = match sec.kind() {
+                    SectionKind::UninitializedData => None,
+                    _ => match sec.data() {
+                        Ok(d) if d.len() as u64 == sec.size() => Some(d),
+                        _ => continue,
+                    },
+                };
+                let name = sec.name().unwrap_or("").to_string();
+                sections.push((sec.index().0, DataSection { name, addr: sec.address(), size: sec.size(), bytes, writable }));
+            }
+            sections.sort_by_key(|(_, s)| s.addr);
+        }
+
+        let mut data_syms = Vec::new();
+        for sym in file.symbols().chain(file.dynamic_symbols()) {
+            if sym.kind() != SymbolKind::Data || !sym.is_definition() {
+                continue;
+            }
+            let Some(idx) = sym.section_index() else { continue };
+            let Some(section) = sections.iter().position(|(i, _)| *i == idx.0) else { continue };
+            let s = &sections[section].1;
+            let (addr, end) = (sym.address(), s.addr + s.size);
+            if addr < s.addr || addr >= end {
+                continue;
+            }
+            let Ok(name) = sym.name() else { continue };
+            if name.is_empty() {
+                continue;
+            }
+            let size = sym.size().min(end - addr);
+            data_syms.push(DataSym { name: name.to_string(), demangled: None, addr, size, section });
+        }
+        data_syms.sort_by(|a, b| a.addr.cmp(&b.addr).then(b.size.cmp(&a.size)));
+        data_syms.dedup_by_key(|s| s.addr);
+
+        // Demangling is the slowest part of loading a big binary; it is per symbol.
+        funcs.par_iter_mut().for_each(|f| f.demangled = demangle(&f.name));
+        data_syms.par_iter_mut().for_each(|s| s.demangled = demangle(&s.name));
+
+        let data: Vec<DataSection> = sections.into_iter().map(|(_, s)| s).collect();
+        let pointers = if data.is_empty() { BTreeMap::new() } else { pointers(&file, &data) };
+        Ok(Binary { file, funcs, data, data_syms, pointers })
     }
 
     pub fn entry(&self) -> u64 {
@@ -82,17 +195,98 @@ impl<'a> Binary<'a> {
     pub fn name_at(&self, addr: u64) -> Option<&str> {
         self.func_at(addr).map(|f| f.name.as_str())
     }
+
+    /// The data section containing `addr`.
+    pub fn data_section_at(&self, addr: u64) -> Option<usize> {
+        let i = self.data.partition_point(|s| s.addr <= addr).checked_sub(1)?;
+        (addr < self.data[i].addr + self.data[i].size).then_some(i)
+    }
+}
+
+/// Slots the loader fills with an address: 64-bit dynamic relocations whose
+/// target is known (`R_X86_64_RELATIVE`, or a symbol the binary defines), plus,
+/// for a binary without dynamic relocations (static, non-PIE), every nonzero GOT slot.
+fn pointers(file: &object::File, data: &[DataSection]) -> BTreeMap<u64, u64> {
+    use object::elf::{R_X86_64_64, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT, R_X86_64_RELATIVE};
+    let mut out = BTreeMap::new();
+    let dynsyms = file.dynamic_symbol_table();
+    let mut relocated = false;
+    for (at, r) in file.dynamic_relocations().into_iter().flatten() {
+        relocated = true;
+        let RelocationFlags::Elf { r_type } = r.flags() else { continue };
+        if !matches!(r_type, R_X86_64_64 | R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT | R_X86_64_RELATIVE) {
+            continue;
+        }
+        let target = match r.target() {
+            RelocationTarget::Absolute => r.addend() as u64,
+            RelocationTarget::Symbol(i) => {
+                let Some(sym) = dynsyms.as_ref().and_then(|t| t.symbol_by_index(i).ok()) else { continue };
+                if !sym.is_definition() {
+                    continue; // an import: resolved from another library at run time
+                }
+                sym.address().wrapping_add(r.addend() as u64)
+            }
+            _ => continue,
+        };
+        out.insert(at, target);
+    }
+    for sec in data {
+        if relocated || !matches!(sec.name.as_str(), ".got" | ".got.plt" | "__got") {
+            continue;
+        }
+        let Some(bytes) = sec.bytes else { continue };
+        for (k, w) in bytes.chunks_exact(8).enumerate() {
+            let at = sec.addr + 8 * k as u64;
+            let v = u64::from_le_bytes(w.try_into().unwrap());
+            if v != 0 {
+                out.insert(at, v);
+            }
+        }
+    }
+    out
 }
 
 /// Symbols without a size (common in hand-written assembly): run to the next
-/// symbol in the same section, or to the end of the section.
-fn size_to_next_symbol(file: &object::File, addr: u64, sec: &object::Section) -> u64 {
+/// symbol in the same section, or to the end of the section. `starts` is every
+/// (section index, symbol address), sorted.
+fn size_to_next_symbol(starts: &[(usize, u64)], addr: u64, sec: &object::Section) -> u64 {
     let end = sec.address() + sec.size();
-    let next = file
-        .symbols()
-        .filter(|s| s.section_index() == Some(sec.index()) && s.address() > addr)
-        .map(|s| s.address())
-        .min()
-        .unwrap_or(end);
+    let key = (sec.index().0, addr);
+    let i = starts.partition_point(|&s| s <= key);
+    let next = starts.get(i).filter(|s| s.0 == key.0).map_or(end, |s| s.1);
     next.min(end) - addr
+}
+
+/// Demangle a Rust (legacy or v0) or Itanium C++ symbol, without the Rust hash
+/// or the C++ parameter list: `_ZN4core3ptr13drop_in_place17h0123E` becomes
+/// `core::ptr::drop_in_place`, `_ZN3foo3barEi` becomes `foo::bar`. Mach-O's
+/// extra leading underscore is accepted. `None` for anything else.
+pub fn demangle(sym: &str) -> Option<String> {
+    let s = if sym.starts_with("__Z") || sym.starts_with("__R") { &sym[1..] } else { sym };
+    if !(s.starts_with("_Z") || s.starts_with("_R")) {
+        return None;
+    }
+    if let Ok(d) = rustc_demangle::try_demangle(s) {
+        return Some(format!("{d:#}"));
+    }
+    let d = cpp_demangle::Symbol::new(s).ok()?;
+    let opts = cpp_demangle::DemangleOptions::new().no_params().no_return_type();
+    d.demangle_with_options(&opts).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::demangle;
+
+    #[test]
+    fn demangles_rust_and_cpp() {
+        let d = |s| demangle(s).unwrap_or_default();
+        assert_eq!(d("_ZN4core3ptr13drop_in_place17h0123456789abcdefE"), "core::ptr::drop_in_place");
+        assert_eq!(d("__ZN4core3ptr13drop_in_place17h0123456789abcdefE"), "core::ptr::drop_in_place");
+        assert_eq!(d("_RNvCs1234_7mycrate3foo"), "mycrate::foo");
+        assert_eq!(d("_ZN3foo3barEi"), "foo::bar");
+        assert_eq!(d("_ZNSt6vectorIiSaIiEE9push_backERKi"), "std::vector<int, std::allocator<int> >::push_back");
+        assert_eq!(demangle("main"), None);
+        assert_eq!(demangle("_Zgarbage"), None);
+    }
 }

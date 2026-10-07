@@ -7,17 +7,14 @@
 use chungusite::{
     borrow::{analyze, Class},
     dump::dump,
-    emit::{emit_function_with_globals, EmitStats, Mode},
+    emit::{EmitStats, Mode},
     globals::{Globals, Item, PRELUDE},
     ir::Function,
-    lift::{LiftError, Lifter},
     load::{Binary, FuncBytes},
     names::rust_ident,
-    opt::clean,
-    verify::verify,
+    program::{Input, Program},
 };
 use clap::{Parser, ValueEnum};
-use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -126,16 +123,20 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     let data;
     let hex_bytes;
     let bin;
-    let (funcs, source, bin): (Vec<FuncBytes>, String, Option<&Binary>) = match (&cli.hex, &cli.input) {
+    // `all` is every function in the binary: signatures depend on the callees,
+    // whether or not they are printed. `funcs` is what was asked for.
+    let (all, funcs, source, bin): (Vec<FuncBytes>, Vec<FuncBytes>, String, Option<&Binary>) = match (&cli.hex, &cli.input) {
         (Some(h), _) => {
             hex_bytes = parse_hex(h)?;
-            let f = FuncBytes { name: "func".into(), demangled: None, addr: 0x1000, bytes: &hex_bytes };
-            (vec![f], "hex input".into(), None)
+            data = Vec::new();
+            let f = || FuncBytes { name: "func".into(), demangled: None, addr: 0x1000, bytes: &hex_bytes };
+            (vec![f()], vec![f()], "hex input".into(), None)
         }
         (None, Some(path)) => {
             data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
             bin = Binary::parse(&data).map_err(|e| format!("{}: {e}", path.display()))?;
-            (select(&bin, cli)?, path.display().to_string(), Some(&bin))
+            let all = bin.funcs.iter().map(copy).collect();
+            (all, select(&bin, cli)?, path.display().to_string(), Some(&bin))
         }
         (None, None) => unreachable!("clap requires one"),
     };
@@ -151,45 +152,96 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     // so they (and the output) don't depend on scheduling.
     let mut used = HashSet::new();
     let idents: Vec<String> = funcs.iter().map(|f| rust_ident(f.pretty(), f.addr, &mut used)).collect();
-    // Call targets are named by their identifier in the output.
+    // Function pointers in data are named by their identifier in the output.
     let by_addr: HashMap<u64, &str> = funcs.iter().zip(&idents).map(|(f, i)| (f.addr, i.as_str())).collect();
-    let name_of = |addr: u64| by_addr.get(&addr).map(|s| s.to_string());
     let globals = bin.filter(|_| rust).map(|b| Globals::new(b, used, &by_addr));
     let global_of = |addr: u64| globals.as_ref().and_then(|g| g.expr(addr));
 
-    // Each function is independent: lift, clean and emit them in parallel, one
-    // Lifter and Function per worker thread, then stitch the text together in order.
-    let done: Vec<Done> = funcs
-        .par_iter()
-        .zip(&idents)
-        .map_init(
-            || (Lifter::new(), Function::with_capacity(256, 16)),
-            |(lifter, func), (fb, ident)| process(cli, mode, fb, ident, lifter, func, &name_of, &global_of, &globals),
-        )
+    // Lift everything, recover signatures, and emit, in parallel (`program.rs`).
+    // A selected function is one of `all` (by address) or bytes of its own (--size).
+    let mut inputs: Vec<Input> = all
+        .iter()
+        .map(|f| Input { name: f.name.clone(), ident: String::new(), addr: f.addr, bytes: f.bytes, selected: false })
         .collect();
+    let mut index = Vec::with_capacity(funcs.len());
+    for (fb, ident) in funcs.iter().zip(&idents) {
+        match inputs.iter().position(|x| x.addr == fb.addr && x.bytes.len() == fb.bytes.len() && !x.selected) {
+            Some(i) => {
+                inputs[i].ident = ident.clone();
+                inputs[i].selected = true;
+                index.push(i);
+            }
+            None => {
+                index.push(inputs.len());
+                inputs.push(Input { name: fb.name.clone(), ident: ident.clone(), addr: fb.addr, bytes: fb.bytes, selected: true });
+            }
+        }
+    }
+    let file = bin.map(|_| &data[..]);
+    let program = Program::build(inputs, file, cli.emit == Emit::RawIr);
+    let emitted = if rust { program.emit_all(mode, &global_of) } else { Vec::new() };
 
     let mut out = String::new();
     if rust {
         let _ = writeln!(out, "// Decompiled by chungusite from {source} (--mode {mode_name}).");
         out.push_str("#![allow(unused_mut, unused_variables, unused_assignments, unreachable_code, non_snake_case, non_upper_case_globals, unused_parens, unused_unsafe, clippy::all)]\n");
+        out.push_str(&program.prelude());
     }
     let mut failures: BTreeMap<String, usize> = BTreeMap::new();
     let mut statics = BTreeSet::new();
     let (mut ok, mut total) = (0, EmitStats::default());
-    for d in done {
-        out.push_str(&d.text);
-        match d.failure {
-            None => ok += 1,
-            Some(kind) => *failures.entry(kind).or_default() += 1,
+    for (fb, &i) in funcs.iter().zip(&index) {
+        let pf = &program.funcs[i];
+        let header = format!("{} @ {:#x}, {} bytes", fb.pretty(), fb.addr, fb.bytes.len());
+        match &pf.ir {
+            Ok(_) => ok += 1,
+            Err(e) => *failures.entry(failure_kind(e)).or_default() += 1,
         }
-        if let Some(note) = d.note {
-            eprintln!("{note}");
+        if cli.list {
+            let _ = match &pf.ir {
+                Ok(_) => writeln!(out, "ok    {header}"),
+                Err(e) => writeln!(out, "FAIL  {header}: {e}"),
+            };
+            continue;
         }
-        total.checked += d.stats.checked;
-        total.raw += d.stats.raw;
-        total.todo += d.stats.todo;
-        total.state_machines += d.stats.state_machines;
-        statics.extend(d.statics);
+        match (&pf.ir, cli.emit) {
+            (Err(e), _) if cli.skip_failed => eprintln!("skipped {header}: {e}"),
+            (Err(e), Emit::Rust) => {
+                let _ = writeln!(out, "\n// {header}\n// not lifted: {e}");
+                let _ = writeln!(out, "pub fn {}() -> u64 {{\n    todo!({:?})\n}}", pf.ident, format!("not lifted: {e}"));
+            }
+            (Err(e), _) => {
+                let _ = writeln!(out, "\n; {header}\n; not lifted: {e}");
+            }
+            (Ok(ir), Emit::Ir) => {
+                let _ = writeln!(out, "\n; {header}\n{}", dump(ir));
+            }
+            (Ok(_), Emit::RawIr) => {
+                let _ = writeln!(out, "\n; {header}\n{}", pf.raw_ir.as_deref().unwrap_or(""));
+            }
+            (Ok(ir), Emit::Borrows) => {
+                let _ = writeln!(out, "\n; {header}");
+                borrows(ir, &mut out);
+            }
+            (Ok(ir), Emit::Rust) => {
+                let (body, s) = emitted[i].as_ref().expect("emitted");
+                let _ = write!(out, "\n// {header}");
+                if s.checked + s.raw > 0 {
+                    let _ = write!(out, "; {} of {} memory accesses bounds-checked", s.checked, s.checked + s.raw);
+                }
+                out.push('\n');
+                out.push_str(body);
+                total.checked += s.checked;
+                total.raw += s.raw;
+                total.todo += s.todo;
+                total.state_machines += s.state_machines;
+                if let Some(g) = &globals {
+                    let mut items = Vec::new();
+                    g.referenced(ir, &mut items);
+                    statics.extend(items);
+                }
+            }
+        }
     }
     if let Some(g) = &globals {
         if !statics.is_empty() {
@@ -239,95 +291,6 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     Ok(if ok == funcs.len() { ExitCode::SUCCESS } else { ExitCode::from(1) })
 }
 
-/// What one function contributes to the output.
-struct Done {
-    text: String,
-    /// The failure group, if it didn't lift.
-    failure: Option<String>,
-    /// A message for stderr.
-    note: Option<String>,
-    stats: EmitStats,
-    statics: Vec<Item>,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn process(
-    cli: &Cli,
-    mode: Mode,
-    fb: &FuncBytes,
-    ident: &str,
-    lifter: &mut Lifter,
-    func: &mut Function,
-    name_of: &(dyn Fn(u64) -> Option<String> + Sync),
-    global_of: &(dyn Fn(u64) -> Option<String> + Sync),
-    globals: &Option<Globals>,
-) -> Done {
-    let mut raw_ir = String::new();
-    let lifted = lifter
-        .lift(fb.bytes, fb.addr, func)
-        .map_err(|e| describe(&e))
-        .and_then(|()| verify(func).map_err(|e| format!("lifted IR failed verification: {e:?}")))
-        .and_then(|()| {
-            if cli.emit == Emit::RawIr {
-                raw_ir = dump(func);
-            }
-            clean(func);
-            verify(func).map_err(|e| format!("cleaned IR failed verification: {e:?}"))
-        });
-    let header = format!("{} @ {:#x}, {} bytes", fb.pretty(), fb.addr, fb.bytes.len());
-    let mut d = Done { text: String::new(), failure: None, note: None, stats: EmitStats::default(), statics: Vec::new() };
-    let out = &mut d.text;
-    if let Err(e) = &lifted {
-        d.failure = Some(failure_kind(e));
-    }
-    if cli.list {
-        match &lifted {
-            Ok(()) => {
-                let _ = writeln!(out, "ok    {header}");
-            }
-            Err(e) => {
-                let _ = writeln!(out, "FAIL  {header}: {e}");
-            }
-        }
-        return d;
-    }
-    match (lifted, cli.emit) {
-        (Err(e), _) if cli.skip_failed => d.note = Some(format!("skipped {header}: {e}")),
-        (Err(e), Emit::Rust) => {
-            let _ = writeln!(out, "\n// {header}\n// not lifted: {e}");
-            let _ = writeln!(out, "pub fn {ident}() -> u64 {{\n    todo!({:?})\n}}", format!("not lifted: {e}"));
-        }
-        (Err(e), _) => {
-            let _ = writeln!(out, "\n; {header}\n; not lifted: {e}");
-        }
-        (Ok(()), Emit::Ir) => {
-            let _ = writeln!(out, "\n; {header}\n{}", dump(func));
-        }
-        (Ok(()), Emit::RawIr) => {
-            let _ = writeln!(out, "\n; {header}\n{raw_ir}");
-        }
-        (Ok(()), Emit::Borrows) => {
-            let _ = writeln!(out, "\n; {header}");
-            borrows(func, out);
-        }
-        (Ok(()), Emit::Rust) => {
-            let mut body = String::new();
-            let s = emit_function_with_globals(func, ident, mode, name_of, global_of, &mut body);
-            let _ = write!(out, "\n// {header}");
-            if s.checked + s.raw > 0 {
-                let _ = write!(out, "; {} of {} memory accesses bounds-checked", s.checked, s.checked + s.raw);
-            }
-            out.push('\n');
-            out.push_str(&body);
-            d.stats = s;
-            if let Some(g) = globals {
-                g.referenced(func, &mut d.statics);
-            }
-        }
-    }
-    d
-}
-
 /// One line per argument: what safe mode would make of it.
 fn borrows(func: &Function, out: &mut String) {
     const REG: [&str; 16] =
@@ -354,9 +317,12 @@ fn borrows(func: &Function, out: &mut String) {
     }
 }
 
+fn copy<'a>(f: &FuncBytes<'a>) -> FuncBytes<'a> {
+    FuncBytes { name: f.name.clone(), demangled: f.demangled.clone(), addr: f.addr, bytes: f.bytes }
+}
+
 /// The functions the user asked for, or all of them.
 fn select<'a>(bin: &Binary<'a>, cli: &Cli) -> Result<Vec<FuncBytes<'a>>, String> {
-    let copy = |f: &FuncBytes<'a>| FuncBytes { name: f.name.clone(), demangled: f.demangled.clone(), addr: f.addr, bytes: f.bytes };
     if cli.functions.is_empty() && cli.addrs.is_empty() {
         if bin.funcs.is_empty() {
             return Err(format!(
@@ -387,16 +353,6 @@ fn select<'a>(bin: &Binary<'a>, cli: &Cli) -> Result<Vec<FuncBytes<'a>>, String>
         out.push(f);
     }
     Ok(out)
-}
-
-fn describe(e: &LiftError) -> String {
-    match e {
-        LiftError::Unsupported { ip, mnemonic } => format!("unsupported instruction {mnemonic:?} at {ip:#x}"),
-        LiftError::FlagsNotInBlock { ip } => format!("branch at {ip:#x} reads flags set in another block"),
-        LiftError::BranchOutOfRange { ip, target } => format!("branch at {ip:#x} leaves the function (to {target:#x})"),
-        LiftError::TargetInsideInstruction { target } => format!("branch into the middle of an instruction at {target:#x}"),
-        LiftError::ClobberedRead { ip, reg } => format!("{reg:?} read at {ip:#x} after a call clobbered it"),
-    }
 }
 
 /// Group failures for the summary: by mnemonic for unsupported instructions.

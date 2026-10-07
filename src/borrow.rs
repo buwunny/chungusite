@@ -297,6 +297,8 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin]) -> Vec<Fact> {
                     }
                 }
                 Cmp { .. } => {}
+                // registers after a call, and at a return: bookkeeping, not uses
+                CallOut { .. } | Exit { .. } => {}
                 Opaque { .. } => opaque = true,
                 k => crate::verify::for_each_operand(k, f, |v| add(v, FactKind::Escape, at)),
             }

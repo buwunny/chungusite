@@ -101,6 +101,7 @@ impl TyId {
     pub const BOOL: TyId = TyId::from_u32(4);
     pub const PTR: TyId = TyId::from_u32(5);  // *mut B1, i.e. *mut u8
     pub const UNIT: TyId = TyId::from_u32(6); // stores, which define no value
+    pub const PAIR: TyId = TyId::from_u32(7); // [B8; 2]: a 16-byte rax:rdx return value
 
     #[inline]
     pub fn unknown(bytes: usize) -> TyId {
@@ -117,6 +118,7 @@ impl TyTable {
         for t in [
             Ty::Unknown { bytes: 1 }, Ty::Unknown { bytes: 2 }, Ty::Unknown { bytes: 4 }, Ty::Unknown { bytes: 8 },
             Ty::Bool, Ty::RawPtr { pointee: TyId::B1, mutbl: Mutbl::Mut }, Ty::Array { elem: TyId::B1, len: 0 },
+            Ty::Array { elem: TyId::B8, len: 2 },
         ] { tys.push(t); }
         TyTable { tys }
     }
@@ -187,6 +189,9 @@ pub struct Inst { pub kind: InstKind, pub ty: TyId }
 pub enum InstKind {
     // ---- Tier::Pure: shared by both modes ----
     Const(ConstId),
+    /// A value the ABI leaves undefined: a register a call clobbered, a non-argument
+    /// register read on entry, an uninitialized stack slot. Emitted as zero.
+    Undef,
     Param(u32),
     /// Live-in value of a block (SSA block parameter). The u8 is the x86 GPR number,
     /// kept so the emitter can name it and the lifter can match edge arguments.
@@ -199,9 +204,17 @@ pub enum InstKind {
     FuncRef(FuncId),             // direct callee as a value
     ImportRef(Symbol),           // libc/WinAPI import as a value
     Call { callee: ValueId, args: ListRef },
-    /// rdx after the `Call` it names: the high half of a two-register (rax:rdx)
-    /// result, which System V uses for 16-byte return values.
-    CallHi(ValueId),
+    /// Caller-saved register `reg` (x86 number) after the `Call` named by `call`.
+    /// The ABI leaves it undefined, except rdx, which holds the high half of a
+    /// 16-byte (rax:rdx) result. Compilers that see the callee rely on more: gcc's
+    /// interprocedural register allocation keeps a value in a register the callee
+    /// is known not to touch. `abi::apply` resolves each one from the callee's
+    /// signature.
+    CallOut { call: ValueId, reg: u8 },
+    /// The caller-saved registers at a return (`lift::EXIT_REGS` order), recorded
+    /// when `Lifter::track_exits` is set, so `abi` can tell which registers a
+    /// function preserves and whether it returns rdx too. `abi::apply` removes it.
+    Exit { regs: ListRef },
 
     // ---- Tier::Raw: what the lifter produces; fast mode emits these directly ----
     /// base + index*scale + disp, i.e. an x86 effective address. Pointer typed.
@@ -271,8 +284,8 @@ impl InstKind {
     pub fn tier(&self) -> Tier {
         use InstKind::*;
         match self {
-            Const(_) | Param(_) | BlockParam(_) | Bin { .. } | Un { .. } | Cmp { .. } | Cast { .. }
-            | Select { .. } | FuncRef(_) | ImportRef(_) | Call { .. } | CallHi(_) => Tier::Pure,
+            Const(_) | Undef | Param(_) | BlockParam(_) | Bin { .. } | Un { .. } | Cmp { .. } | Cast { .. }
+            | Select { .. } | FuncRef(_) | ImportRef(_) | Call { .. } | CallOut { .. } | Exit { .. } => Tier::Pure,
             PtrOffset { .. } | AddrOfLocal(_) | AddrOfGlobal(_) | IntToPtr(_) | PtrToInt(_)
             | Load { .. } | Store { .. } | MemCopy { .. } | Opaque { .. } => Tier::Raw,
             Copy(_) | Move(_) | Assign { .. } | Borrow { .. } | Aggregate { .. } => Tier::Safe,

@@ -34,7 +34,7 @@ pub fn clean(f: &mut Function) -> CleanStats {
     stats
 }
 
-fn resolve(repl: &[Option<ValueId>], mut v: ValueId) -> ValueId {
+pub(crate) fn resolve(repl: &[Option<ValueId>], mut v: ValueId) -> ValueId {
     while let Some(r) = repl[v.index()] {
         v = r;
     }
@@ -42,7 +42,7 @@ fn resolve(repl: &[Option<ValueId>], mut v: ValueId) -> ValueId {
 }
 
 /// (start, len) of each edge argument slice into `target` from block `from`.
-fn edges_into(f: &Function, from: BlockId, target: BlockId, out: &mut Vec<usize>) {
+pub(crate) fn edges_into(f: &Function, from: BlockId, target: BlockId, out: &mut Vec<usize>) {
     match f.blocks[from].term {
         Terminator::Jump { to, args } if to == target => out.push(args.start as usize),
         Terminator::Branch { t, f: e, args, .. } => {
@@ -58,7 +58,7 @@ fn edges_into(f: &Function, from: BlockId, target: BlockId, out: &mut Vec<usize>
 }
 
 /// Remove element `at` from the list `l` stored in `pool`, shifting the rest left.
-fn list_remove(pool: &mut [ValueId], l: &mut ListRef, at: usize) {
+pub(crate) fn list_remove(pool: &mut [ValueId], l: &mut ListRef, at: usize) {
     let (s, e) = (l.start as usize, (l.start + l.len) as usize);
     pool.copy_within(at + 1..e, at);
     debug_assert!(at >= s && at < e);
@@ -66,7 +66,7 @@ fn list_remove(pool: &mut [ValueId], l: &mut ListRef, at: usize) {
 }
 
 /// Remove parameter `k` of block `b` and the matching argument on every edge into it.
-fn remove_param(f: &mut Function, b: BlockId, k: usize, scratch: &mut Vec<usize>) {
+pub(crate) fn remove_param(f: &mut Function, b: BlockId, k: usize, scratch: &mut Vec<usize>) {
     for pi in 0..f.blocks.len() {
         let p = BlockId::new(pi);
         scratch.clear();
@@ -132,7 +132,7 @@ fn remove_trivial_params(f: &mut Function, repl: &mut [Option<ValueId>]) -> usiz
 fn is_root(k: InstKind) -> bool {
     matches!(
         k,
-        InstKind::Store { .. } | InstKind::Call { .. } | InstKind::MemCopy { .. } | InstKind::Opaque { .. }
+        InstKind::Store { .. } | InstKind::Call { .. } | InstKind::MemCopy { .. } | InstKind::Opaque { .. } | InstKind::Exit { .. }
             | InstKind::Assign { .. } | InstKind::Load { volatile: true, .. }
     )
 }
@@ -232,7 +232,7 @@ fn remove_dead(f: &mut Function, repl: &[Option<ValueId>]) -> (usize, usize) {
 
 /// Apply the replacement map to every use: instruction operands, conditions,
 /// return values and edge arguments.
-fn rewrite_uses(f: &mut Function, repl: &[Option<ValueId>]) {
+pub(crate) fn rewrite_uses(f: &mut Function, repl: &[Option<ValueId>]) {
     let r = |v: &mut ValueId| *v = resolve(repl, *v);
     for bi in 0..f.blocks.len() {
         let b = BlockId::new(bi);
@@ -265,10 +265,11 @@ fn map_list(pool: &mut [ValueId], l: ListRef, r: impl Fn(&mut ValueId)) {
 pub fn map_operands(k: &mut InstKind, pool: &mut [ValueId], r: impl Fn(&mut ValueId)) {
     use InstKind::*;
     match k {
-        Const(_) | Param(_) | BlockParam(_) | FuncRef(_) | ImportRef(_) | AddrOfLocal(_)
+        Const(_) | Undef | Param(_) | BlockParam(_) | FuncRef(_) | ImportRef(_) | AddrOfLocal(_)
         | AddrOfGlobal(_) | Opaque { .. } | Copy(_) | Move(_) | Borrow { .. } => {}
         Bin { lhs, rhs, .. } | Cmp { lhs, rhs, .. } => { r(lhs); r(rhs) }
-        Un { v, .. } | Cast { v, .. } | IntToPtr(v) | PtrToInt(v) | CallHi(v) => r(v),
+        Un { v, .. } | Cast { v, .. } | IntToPtr(v) | PtrToInt(v) | CallOut { call: v, .. } => r(v),
+        Exit { regs } => map_list(pool, *regs, r),
         Select { c, t, f } => { r(c); r(t); r(f) }
         Call { callee, args } => { r(callee); map_list(pool, *args, r) }
         PtrOffset { base, index, .. } => { r(base); if let Some(i) = index { r(i) } }

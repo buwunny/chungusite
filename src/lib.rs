@@ -2,6 +2,7 @@
 pub mod abi;
 pub mod borrow;
 pub mod cfg;
+pub mod check;
 pub mod dump;
 pub mod emit;
 pub mod frame;
@@ -10,6 +11,7 @@ pub mod ir;
 pub mod libc;
 pub mod lift;
 pub mod load;
+pub mod loans;
 pub mod names;
 pub mod opt;
 pub mod program;

@@ -264,8 +264,8 @@ fn structured_control_flow_matches_the_state_machine() {
         }
         clean(&mut f);
         let (mut st, mut sm) = (String::new(), String::new());
-        let stats = emit_function_with(&f, &format!("st{p}"), Mode::Fast, true, &|_| None, &mut st);
-        emit_function_with(&f, &format!("sm{p}"), Mode::Fast, false, &|_| None, &mut sm);
+        let stats = emit_function_with(&f, &format!("st{p}"), Mode::Fast, true, &|_| None, &|_| None, &mut st);
+        emit_function_with(&f, &format!("sm{p}"), Mode::Fast, false, &|_| None, &|_| None, &mut sm);
         if stats.state_machines > 0 {
             machines += 1;
         } else if st.contains("loop {") || st.contains("if ") {

@@ -2,7 +2,7 @@
 //!
 //!     cargo run                         # built-in samples
 //!     cargo run -- "b8 01 00 00 00 c3"  # your own bytes, hex
-use chungusite::{dump::dump, ir::*, lift::Lifter, verify::verify};
+use chungusite::{borrow::{analyze, Class}, dump::dump, ir::*, lift::Lifter, opt::clean, verify::verify};
 use iced_x86::{Decoder, DecoderOptions, Instruction, Register};
 
 const BASE: u64 = 0x1000;
@@ -63,10 +63,41 @@ fn main() {
                         .collect();
                     println!("  bb{}: {}", b.index(), regs.join(" "));
                 }
+                safe_mode(&mut func);
             }
             Err(e) => println!("lift failed: {e:?}"),
         }
         println!();
+    }
+}
+
+/// Clean the SSA and print what safe mode infers for each argument.
+fn safe_mode(func: &mut Function) {
+    let stats = clean(func);
+    if let Err(e) = verify(func) {
+        println!("cleaned IR failed verification: {e:?}");
+    }
+    println!("\nafter cleanup ({stats:?}):\n{}", dump(func));
+    println!("argument borrows:");
+    let a = analyze(func);
+    for p in &a.params {
+        let class = match p.class {
+            Class::NotPointer => "integer",
+            Class::Shared if p.nullable => "Option<&T>",
+            Class::Mut if p.nullable => "Option<&mut T>",
+            Class::Shared => "&T",
+            Class::Mut => "&mut T",
+            Class::Raw => "raw pointer (escapes)",
+        };
+        let fields: Vec<String> =
+            p.fields.iter().map(|&(o, w)| format!("{o:+}{}", if w { " (written)" } else { "" })).collect();
+        println!(
+            "  {:?}: {class}{}{}{}",
+            GPRS[p.reg as usize],
+            if fields.is_empty() { String::new() } else { format!(", fields at {}", fields.join(", ")) },
+            if p.indexed { ", indexed" } else { "" },
+            if p.returned && p.class != Class::NotPointer { ", return value borrows from it" } else { "" },
+        );
     }
 }
 

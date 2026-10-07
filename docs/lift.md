@@ -54,6 +54,29 @@ bb3(v17):
 6. **Idioms fold during lifting.** `xor r, r` becomes a constant, and `test r, r` reads `r` directly with no `And`.
 7. **SSA wiring is a fix-up pass, not a graph.** Reading an undefined register creates a `BlockParam`. `finalize` propagates live-ins backwards to a fixpoint over the two arrays above, then writes parameter lists and edge arguments into the existing `value_pool`.
 
+## Running and checking it
+
+`cargo run` decodes two built-in samples, lifts them and prints the decoded instructions, the IR, `{:#?}` of the blocks, and each block's exit register file. `cargo run -- "b8 01 00 00 00 83 c0 02"` does the same for your own hex bytes. The first sample is the `mov eax, 1; add eax, 2` spike:
+
+```
+bb0():
+  v0 = const 0x1
+  v1 = ZExt v0          ; eax after the mov, as rax
+  v2 = const 0x2
+  v3 = Add v0, v2       ; reads the 32-bit value back, no Trunc(ZExt(..))
+  v4 = ZExt v3
+  Unreachable           ; the bytes end without a ret
+register file at each block exit:
+  bb0: RAX=v4
+```
+
+`Lifter::reg_out(block, reg)` returns the value a register holds at a block's exit. It accepts any view of the register (`RAX`, `EAX`, `AX`, `AL` all map to the same slot).
+
+[`src/verify.rs`](../src/verify.rs) checks the structure of a lifted function: no dangling value or block ids, every edge passes exactly as many arguments as its target has parameters, nothing uses a store as a value, and every value belongs to a block. Dominance isn't checked yet. The tests run it on everything they lift:
+
+- `tests/spike.rs` checks the spike's exact IR and register mapping, and that each of the 16 GPRs lands in its own slot.
+- `tests/robust.rs` covers bad branch targets: into the middle of an instruction, past the end, a fall-through off the end, and flags coming from another block. Each returns a `LiftError`. It also lifts 20,000 random byte strings without a panic, and 2,000 random programs built from supported instructions with random jumps, all of which must pass the verifier.
+
 ## Not handled yet
 
 - 8 and 16-bit register writes, which need a merge with the old value, and `AH`-style high-byte registers.

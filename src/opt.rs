@@ -268,7 +268,7 @@ pub fn map_operands(k: &mut InstKind, pool: &mut [ValueId], r: impl Fn(&mut Valu
         Const(_) | Param(_) | BlockParam(_) | FuncRef(_) | ImportRef(_) | AddrOfLocal(_)
         | AddrOfGlobal(_) | Opaque { .. } | Copy(_) | Move(_) | Borrow { .. } => {}
         Bin { lhs, rhs, .. } | Cmp { lhs, rhs, .. } => { r(lhs); r(rhs) }
-        Un { v, .. } | Cast { v, .. } | IntToPtr(v) | PtrToInt(v) => r(v),
+        Un { v, .. } | Cast { v, .. } | IntToPtr(v) | PtrToInt(v) | CallHi(v) => r(v),
         Select { c, t, f } => { r(c); r(t); r(f) }
         Call { callee, args } => { r(callee); map_list(pool, *args, r) }
         PtrOffset { base, index, .. } => { r(base); if let Some(i) = index { r(i) } }

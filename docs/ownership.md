@@ -15,7 +15,7 @@ This document is the plan for the whole pipeline. The first stages are implement
 | 1. Clean SSA: trivial block params, dead code | [`src/opt.rs`](../src/opt.rs) | done |
 | 2. Origins: which argument and offset each value points into | [`src/borrow.rs`](../src/borrow.rs) | done, for arguments and RSP |
 | 3. Access facts and per-argument classes (`&`, `&mut`, raw, nullable) | [`src/borrow.rs`](../src/borrow.rs) | done |
-| 4. Stack slots: promote to SSA, or keep as borrowed locals | `borrow::Analysis::stack_slots` | slot discovery done; promotion not yet |
+| 4. Stack slots: promote to SSA, or keep as borrowed locals | `borrow::Analysis::stack_slots`, `frame::promote` | unescaped slots promoted to SSA; the rest live in a `frame` array, not yet borrowed |
 | 5. Call summaries and moves | — | needs `CALL` in the lifter |
 | 6. Loans and lifetimes (Polonius-style constraint solving) | — | design below |
 | 7. Check with rustc, downgrade on failure | — | design below |

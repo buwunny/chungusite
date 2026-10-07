@@ -34,16 +34,21 @@ pub enum LiftError {
     BranchOutOfRange { ip: u64, target: u64 },
     /// A branch targets the middle of another instruction (overlapping code).
     TargetInsideInstruction { target: u64 },
-    /// An instruction reads a register that a `call` earlier in the same block
-    /// clobbered (System V: rcx, rsi, rdi, r8-r11), which the ABI leaves undefined.
-    ClobberedRead { ip: u64, reg: Register },
 }
 
-/// System V integer argument registers, in order.
-const ARG_REGS: [Register; 6] = [Register::RDI, Register::RSI, Register::RDX, Register::RCX, Register::R8, Register::R9];
-/// Registers a System V call clobbers, besides rax and rdx (which hold the result).
-const CLOBBERED: [Register; 7] = [
-    Register::RCX, Register::RSI, Register::RDI, Register::R8, Register::R9, Register::R10, Register::R11,
+/// A call's arguments as the lifter records them: every register a callee could
+/// read. The six argument registers, then rsp (stack arguments), then rax, r10 and
+/// r11, whose values `abi` needs when the callee preserves them.
+pub const CALL_REGS: [Register; 10] = [
+    Register::RDI, Register::RSI, Register::RDX, Register::RCX, Register::R8, Register::R9,
+    Register::RSP, Register::RAX, Register::R10, Register::R11,
+];
+pub const CALL_ARGS: usize = CALL_REGS.len();
+type CallRegs = [ValueId; CALL_ARGS];
+/// Caller-saved registers besides rax: each is a `CallOut` after a call, and an
+/// `Exit` lists them at a return.
+pub const EXIT_REGS: [Register; 8] = [
+    Register::RCX, Register::RDX, Register::RSI, Register::RDI, Register::R8, Register::R9, Register::R10, Register::R11,
 ];
 
 /// Lazy flags: remember what set them, and only build a `Cmp` when a Jcc, CMOVcc or
@@ -68,14 +73,9 @@ struct BlockState {
     out: RegFile,
     /// `BlockParam` created for each live-in GPR.
     params: RegFile,
-    /// GPRs a `call` in this block clobbered and nothing has written since. Reading one
-    /// later in the block is an error. A successor that reads one gets the zero the
-    /// call left in `out`: the ABI leaves the value undefined, and the usual way to get
-    /// there is falling through past a call that never returns.
-    clobbered: u16,
 }
 
-const EMPTY_STATE: BlockState = BlockState { out: [None; NGPR], params: [None; NGPR], clobbered: 0 };
+const EMPTY_STATE: BlockState = BlockState { out: [None; NGPR], params: [None; NGPR] };
 
 /// Where an instruction's destination operand lives.
 #[derive(Copy, Clone)]
@@ -88,9 +88,16 @@ pub struct Lifter {
     insn: Instruction,
     leaders: Vec<u64>,
     state: Vec<BlockState>,
-    /// Each `Call` and its argument registers. The arguments go into `value_pool`
-    /// in `finalize`, after every block's instruction list is in place.
-    calls: Vec<(ValueId, [ValueId; 6])>,
+    /// Each `Call` and its argument registers plus rsp. The arguments go into
+    /// `value_pool` in `finalize`, after every block's instruction list is in place.
+    calls: Vec<(ValueId, CallRegs)>,
+    /// The same for each block that ends in a `TailCall`.
+    tails: Vec<(BlockId, CallRegs)>,
+    /// Each `Exit` and the registers it lists.
+    exits: Vec<(ValueId, [ValueId; 8])>,
+    /// Record the caller-saved registers at each return in an `Exit` instruction,
+    /// for whole-program register summaries (`program.rs` sets this).
+    pub track_exits: bool,
     cur: usize,
     flags: Flags,
     ip: u64,
@@ -107,6 +114,9 @@ impl Lifter {
             leaders: Vec::with_capacity(256),
             state: Vec::with_capacity(256),
             calls: Vec::with_capacity(64),
+            tails: Vec::with_capacity(8),
+            exits: Vec::with_capacity(8),
+            track_exits: false,
             cur: 0,
             flags: Flags::Unknown,
             ip: 0,
@@ -119,6 +129,8 @@ impl Lifter {
         self.find_leaders(code, ip);
         self.state.clear();
         self.calls.clear();
+        self.tails.clear();
+        self.exits.clear();
         for _ in 0..self.leaders.len() {
             self.state.push(EMPTY_STATE);
             f.blocks.push(Block { insts: ListRef::EMPTY, params: ListRef::EMPTY, term: Terminator::Unreachable });
@@ -232,6 +244,8 @@ impl Lifter {
                         // Jump out of this function: a tail call.
                         let a = self.konst(f, i.near_branch_target(), TyId::B8);
                         let callee = self.emit(f, InstKind::IntToPtr(a), TyId::PTR);
+                        let regs = self.call_regs(f);
+                        self.tails.push((BlockId::new(self.cur), regs));
                         Terminator::TailCall { callee, args: ListRef::EMPTY }
                     }
                 };
@@ -242,10 +256,20 @@ impl Lifter {
             // usually jump tables, which need recovering into a `Switch`.
             FlowControl::IndirectBranch if i.op0_kind() == OpKind::Memory && i.is_ip_rel_memory_operand() => {
                 let callee = self.callee(f, &i)?;
+                let regs = self.call_regs(f);
+                self.tails.push((BlockId::new(self.cur), regs));
                 self.end_block(f, Terminator::TailCall { callee, args: ListRef::EMPTY });
                 Ok(true)
             }
             FlowControl::Return => {
+                if self.track_exits {
+                    let mut regs = [ValueId::from_u32(0); 8];
+                    for (v, r) in regs.iter_mut().zip(EXIT_REGS) {
+                        *v = self.read_full(f, r.number());
+                    }
+                    let exit = self.emit(f, InstKind::Exit { regs: ListRef::EMPTY }, TyId::UNIT);
+                    self.exits.push((exit, regs));
+                }
                 let v = self.read(f, Register::RAX)?;
                 self.end_block(f, Terminator::Return(Some(v)));
                 Ok(true)
@@ -562,29 +586,32 @@ impl Lifter {
         }
     }
 
-    /// A System V call: `rax = callee(rdi, rsi, rdx, rcx, r8, r9)` and rdx is the high
-    /// half of the result; the other caller-saved registers are clobbered and the
-    /// flags are unknown. Every argument
-    /// register is passed, since which ones the callee reads isn't known here.
+    /// A System V call: `rax = callee(rdi, rsi, rdx, rcx, r8, r9)`, and every other
+    /// caller-saved register is a `CallOut` of the call; the flags are unknown.
+    /// Every register a callee could read is passed (`CALL_REGS`), since which ones
+    /// it does isn't known here: `abi::apply` trims the list once the callee's
+    /// signature is.
     fn call(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
         let callee = self.callee(f, i)?;
-        let mut args = [callee; 6];
-        for (a, &r) in args.iter_mut().zip(&ARG_REGS) {
-            *a = self.read_full(f, r.number());
-        }
+        let args = self.call_regs(f);
         let call = self.emit(f, InstKind::Call { callee, args: ListRef::EMPTY }, TyId::B8);
         self.calls.push((call, args));
-        let zero = self.konst(f, 0, TyId::B8);
-        let st = &mut self.state[self.cur];
-        for r in CLOBBERED {
-            st.out[r.number()] = Some(zero);
-            st.clobbered |= 1 << r.number();
+        self.state[self.cur].out[Register::RAX.number()] = Some(call);
+        for r in EXIT_REGS {
+            let v = self.emit(f, InstKind::CallOut { call, reg: r.number() as u8 }, TyId::B8);
+            self.state[self.cur].out[r.number()] = Some(v);
         }
-        st.out[Register::RAX.number()] = Some(call);
-        let hi = self.emit(f, InstKind::CallHi(call), TyId::B8);
-        self.state[self.cur].out[Register::RDX.number()] = Some(hi);
         self.flags = Flags::Unknown;
         Ok(())
+    }
+
+    /// The registers at a call or tail call, in `CALL_REGS` order.
+    fn call_regs(&mut self, f: &mut Function) -> CallRegs {
+        let mut regs = [ValueId::from_u32(0); CALL_ARGS];
+        for (a, r) in regs.iter_mut().zip(CALL_REGS) {
+            *a = self.read_full(f, r.number());
+        }
+        regs
     }
 
     /// The target of a call or indirect jump, as a pointer value.
@@ -774,9 +801,6 @@ impl Lifter {
             return Err(self.unsupported());
         }
         let n = reg.full_register().number();
-        if self.state[self.cur].clobbered & (1 << n) != 0 {
-            return Err(LiftError::ClobberedRead { ip: self.ip, reg });
-        }
         let full = self.read_full(f, n);
         let sz = reg.size();
         if sz == 8 {
@@ -824,7 +848,6 @@ impl Lifter {
             // writing a 32-bit register zero-extends into the 64-bit one
             4 => self.emit(f, InstKind::Cast { kind: CastKind::ZExt, v }, TyId::B8),
             // 8/16-bit writes merge into the old value: (old & !mask) | (ZExt(v) << shift).
-            // A clobbered old value is the call's zero; only the written bits are defined.
             sz => {
                 let old = self.read_full(f, n);
                 let (mask, shift) = if is_high_byte(reg) { (0xff00, 8) } else { (low_mask(sz), 0) };
@@ -838,9 +861,7 @@ impl Lifter {
                 self.emit(f, InstKind::Bin { op: BinOp::Or, lhs: kept, rhs: wide }, TyId::B8)
             }
         };
-        let st = &mut self.state[self.cur];
-        st.out[n] = Some(v);
-        st.clobbered &= !(1 << n);
+        self.state[self.cur].out[n] = Some(v);
         Ok(())
     }
 
@@ -899,12 +920,26 @@ impl Lifter {
             }
             if !changed { break; }
         }
-        // 2. Write each call's argument list.
+        // 2. Write each call's and tail call's argument list.
         for &(call, args) in &self.calls {
             let start = f.value_pool.len() as u32;
             f.value_pool.extend_from_slice(&args);
             if let InstKind::Call { args, .. } = &mut f.insts[call].kind {
-                *args = ListRef { start, len: 6 };
+                *args = ListRef { start, len: CALL_ARGS as u32 };
+            }
+        }
+        for &(exit, regs) in &self.exits {
+            let start = f.value_pool.len() as u32;
+            f.value_pool.extend_from_slice(&regs);
+            if let InstKind::Exit { regs } = &mut f.insts[exit].kind {
+                *regs = ListRef { start, len: 8 };
+            }
+        }
+        for &(b, args) in &self.tails {
+            let start = f.value_pool.len() as u32;
+            f.value_pool.extend_from_slice(&args);
+            if let Terminator::TailCall { args, .. } = &mut f.blocks[b].term {
+                *args = ListRef { start, len: CALL_ARGS as u32 };
             }
         }
         // 3. Write each block's parameter list, in register order.

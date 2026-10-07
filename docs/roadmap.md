@@ -33,13 +33,24 @@ Whole-program signature recovery ([calls.md](calls.md)): arguments, stack argume
 - Borrow escaped slots (`&mut frame[..]`) so safe mode can bounds-check them; today frame accesses are raw.
 - Split the frame into one local per object instead of one array.
 
-## 4. Control-flow structuring
+## 4. Control-flow structuring (done)
 
-Done: `src/structure.rs` turns every reducible CFG into `if`/`else`, `loop` with `break`/`continue`, and early `return` (Ramsey's dominator-tree construction, then a cleanup pass); irreducible CFGs keep the state machine. On chungusite's own debug build all 1,962 lifted functions come out structured. Left for readability:
+`src/structure.rs` turns every CFG into `if`/`else`, `while`, `loop` with `break`/`continue`, and early `return` (Ramsey's dominator-tree construction, then a cleanup pass), and the emitter prints a value used once inside the expression that uses it, without moving loads past stores or calls ([cli.md](cli.md#what-the-rust-looks-like)). Before structuring, blocks that only jump on are bypassed, blocks that only test a condition join the test before them in `&&`/`||`, and each irreducible cycle gets a `bb` state variable for that cycle alone, so the rest of the function stays structured. On chungusite's own debug build (19,362 lifted functions), compared with the previous structurer:
 
-- Short-circuit conditions: `if a || b` currently needs a labeled block, because two paths reach the same `else`.
-- `while cond { .. }`: the condition is computed in statements before the `if`, so loops print as `loop { let c = ..; if !c { break; } .. }`. Inlining single-use pure values into their use would fix this and shorten most code.
-- Irreducible regions are handled per function, not per region: one bad cycle turns the whole function back into a state machine.
+| | Before | After |
+|---|---|---|
+| Lines of output (fast mode) | 1,056,524 | 459,570 |
+| `let vN` statements | 577,202 | 30,952 |
+| `while` / `loop` | 0 / 1,539 | 333 / 1,225 |
+| Labeled blocks, in functions that were already structured | 3,817 | 2,895 |
+| Labeled blocks, in the 177 that were state machines | (state machines) | 1,727 |
+| Functions that are a whole-function `loop { match bb }` | 178 | 0 |
+
+Still open:
+
+- The remaining labeled blocks are mostly a nested branch that skips code two other paths share (`'b: { if a { x = 1 } else { if b { r = 0; break 'b; } x = 2 } r = f(x) }`) and loops with several exits to different code. Duplicating small tails would remove most of them.
+- Loops that the compiler rotated (`if c { do { .. } while c }`) print as `loop` with the test at the end; Rust has no `do while`.
+- Expressions are capped at four levels of inlining. Types (step 5) would shorten them further: today every value is an integer, so `as` casts and `wrapping_*` calls are everywhere.
 
 ## 5. Types
 

@@ -5,4 +5,5 @@ pub mod dump;
 pub mod ir;
 pub mod lift;
 pub mod opt;
+pub mod refine;
 pub mod verify;

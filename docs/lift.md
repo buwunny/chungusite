@@ -1,6 +1,6 @@
 # Lifting x86_64 with iced-x86
 
-[`src/lift.rs`](../src/lift.rs) turns decoded `iced_x86::Instruction`s into the IR from [ir.md](ir.md). It covers register and immediate `MOV`s, loads and stores (`MOV [RAX+8], RCX`), `LEA`, `ADD/SUB/AND/OR/XOR/CMP/TEST`, `Jcc`, `JMP` and `RET`. Anything else returns `LiftError::Unsupported` so the caller can decide what to do. It never guesses.
+[`src/lift.rs`](../src/lift.rs) turns decoded `iced_x86::Instruction`s into the IR from [ir.md](ir.md). It covers `NOP`/`ENDBR64`, register and immediate `MOV`s, loads and stores (`MOV [RAX+8], RCX`), `LEA`, `ADD/SUB/AND/OR/XOR/CMP/TEST`, `Jcc`, `JMP` and `RET`. Anything else returns `LiftError::Unsupported` so the caller can decide what to do. It never guesses.
 
 ## Example
 
@@ -56,7 +56,7 @@ bb3(v17):
 
 ## Running and checking it
 
-`cargo run` decodes two built-in samples, lifts them and prints the decoded instructions, the IR, `{:#?}` of the blocks, and each block's exit register file. `cargo run -- "b8 01 00 00 00 83 c0 02"` does the same for your own hex bytes. The first sample is the `mov eax, 1; add eax, 2` spike:
+`chungusite --hex "<bytes>" --emit raw-ir` lifts your own hex bytes (loaded at `0x1000`) and prints the IR before cleanup; `--emit ir` shows it after. See [cli.md](cli.md) for the rest of the command. The `mov eax, 1; add eax, 2` spike (`--hex "b8 01 00 00 00 83 c0 02" --emit raw-ir`):
 
 ```
 bb0():
@@ -66,8 +66,6 @@ bb0():
   v3 = Add v0, v2       ; reads the 32-bit value back, no Trunc(ZExt(..))
   v4 = ZExt v3
   Unreachable           ; the bytes end without a ret
-register file at each block exit:
-  bb0: RAX=v4
 ```
 
 `Lifter::reg_out(block, reg)` returns the value a register holds at a block's exit. It accepts any view of the register (`RAX`, `EAX`, `AX`, `AL` all map to the same slot).

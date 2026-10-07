@@ -8,12 +8,14 @@ use chungusite::{
     borrow::{analyze, Class},
     dump::dump,
     emit::{EmitStats, Mode},
+    globals::{Globals, Item, PRELUDE},
     ir::Function,
     load::{Binary, FuncBytes},
+    names::rust_ident,
     program::{Input, Program},
 };
 use clap::{Parser, ValueEnum};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -60,6 +62,10 @@ struct Cli {
     /// Skip functions that fail to lift instead of emitting a todo!() stub for them.
     #[arg(long)]
     skip_failed: bool,
+
+    /// Worker threads (default: one per CPU, or RAYON_NUM_THREADS).
+    #[arg(short, long)]
+    jobs: Option<usize>,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -111,23 +117,26 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> Result<ExitCode, String> {
+    if let Some(n) = cli.jobs {
+        rayon::ThreadPoolBuilder::new().num_threads(n).build_global().map_err(|e| e.to_string())?;
+    }
     let data;
     let hex_bytes;
     let bin;
     // `all` is every function in the binary: signatures depend on the callees,
     // whether or not they are printed. `funcs` is what was asked for.
-    let (all, funcs, source): (Vec<FuncBytes>, Vec<FuncBytes>, String) = match (&cli.hex, &cli.input) {
+    let (all, funcs, source, bin): (Vec<FuncBytes>, Vec<FuncBytes>, String, Option<&Binary>) = match (&cli.hex, &cli.input) {
         (Some(h), _) => {
             hex_bytes = parse_hex(h)?;
             data = Vec::new();
-            let f = || FuncBytes { name: "func".into(), addr: 0x1000, bytes: &hex_bytes };
-            (vec![f()], vec![f()], "hex input".into())
+            let f = || FuncBytes { name: "func".into(), demangled: None, addr: 0x1000, bytes: &hex_bytes };
+            (vec![f()], vec![f()], "hex input".into(), None)
         }
         (None, Some(path)) => {
             data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
             bin = Binary::parse(&data).map_err(|e| format!("{}: {e}", path.display()))?;
-            let all = bin.funcs.iter().map(|f| FuncBytes { name: f.name.clone(), addr: f.addr, bytes: f.bytes }).collect();
-            (all, select(&bin, cli)?, path.display().to_string())
+            let all = bin.funcs.iter().map(copy).collect();
+            (all, select(&bin, cli)?, path.display().to_string(), Some(&bin))
         }
         (None, None) => unreachable!("clap requires one"),
     };
@@ -137,93 +146,84 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         CliMode::Safe => Mode::Safe,
     };
     let mode_name = if mode == Mode::Fast { "fast" } else { "safe" };
+    let rust = cli.emit == Emit::Rust && !cli.list;
 
-    // Lift everything, recover signatures, and emit, in parallel. A selected
-    // function is either one of `all` (by address) or bytes of its own (--size).
-    let mut idents = HashSet::new();
+    // Identifiers are assigned in address order before anything runs in parallel,
+    // so they (and the output) don't depend on scheduling.
+    let mut used = HashSet::new();
+    let idents: Vec<String> = funcs.iter().map(|f| rust_ident(f.pretty(), f.addr, &mut used)).collect();
+    // Function pointers in data are named by their identifier in the output.
+    let by_addr: HashMap<u64, &str> = funcs.iter().zip(&idents).map(|(f, i)| (f.addr, i.as_str())).collect();
+    let globals = bin.filter(|_| rust).map(|b| Globals::new(b, used, &by_addr));
+    let global_of = |addr: u64| globals.as_ref().and_then(|g| g.expr(addr));
+
+    // Lift everything, recover signatures, and emit, in parallel (`program.rs`).
+    // A selected function is one of `all` (by address) or bytes of its own (--size).
     let mut inputs: Vec<Input> = all
         .iter()
         .map(|f| Input { name: f.name.clone(), ident: String::new(), addr: f.addr, bytes: f.bytes, selected: false })
         .collect();
     let mut index = Vec::with_capacity(funcs.len());
-    for fb in &funcs {
-        let ident = rust_ident(&fb.name, fb.addr, &mut idents);
+    for (fb, ident) in funcs.iter().zip(&idents) {
         match inputs.iter().position(|x| x.addr == fb.addr && x.bytes.len() == fb.bytes.len() && !x.selected) {
             Some(i) => {
-                inputs[i].ident = ident;
+                inputs[i].ident = ident.clone();
                 inputs[i].selected = true;
                 index.push(i);
             }
             None => {
                 index.push(inputs.len());
-                inputs.push(Input { name: fb.name.clone(), ident, addr: fb.addr, bytes: fb.bytes, selected: true });
+                inputs.push(Input { name: fb.name.clone(), ident: ident.clone(), addr: fb.addr, bytes: fb.bytes, selected: true });
             }
         }
     }
-    let file = (!data.is_empty()).then_some(&data[..]);
+    let file = bin.map(|_| &data[..]);
     let program = Program::build(inputs, file, cli.emit == Emit::RawIr);
-    let emitted = if cli.emit == Emit::Rust && !cli.list { program.emit_all(mode) } else { Vec::new() };
+    let emitted = if rust { program.emit_all(mode, &global_of) } else { Vec::new() };
 
     let mut out = String::new();
-    if cli.emit == Emit::Rust && !cli.list {
+    if rust {
         let _ = writeln!(out, "// Decompiled by chungusite from {source} (--mode {mode_name}).");
-        out.push_str("#![allow(unused_mut, unused_variables, unused_assignments, unreachable_code, non_snake_case, unused_parens, unused_unsafe, clippy::all)]\n");
+        out.push_str("#![allow(unused_mut, unused_variables, unused_assignments, unreachable_code, non_snake_case, non_upper_case_globals, unused_parens, unused_unsafe, clippy::all)]\n");
         out.push_str(&program.prelude());
     }
-
     let mut failures: BTreeMap<String, usize> = BTreeMap::new();
+    let mut statics = BTreeSet::new();
     let (mut ok, mut total) = (0, EmitStats::default());
-
     for (fb, &i) in funcs.iter().zip(&index) {
         let pf = &program.funcs[i];
-        let ident = &pf.ident;
-        let header = format!("{} @ {:#x}, {} bytes", fb.name, fb.addr, fb.bytes.len());
-
-        let err = match &pf.ir {
-            Ok(_) => None,
-            Err(e) => {
-                *failures.entry(failure_kind(e)).or_default() += 1;
-                Some(e)
-            }
-        };
+        let header = format!("{} @ {:#x}, {} bytes", fb.pretty(), fb.addr, fb.bytes.len());
+        match &pf.ir {
+            Ok(_) => ok += 1,
+            Err(e) => *failures.entry(failure_kind(e)).or_default() += 1,
+        }
         if cli.list {
-            match &err {
-                None => {
-                    let _ = writeln!(out, "ok    {header}");
-                }
-                Some(e) => {
-                    let _ = writeln!(out, "FAIL  {header}: {e}");
-                }
-            }
-            if err.is_none() {
-                ok += 1;
-            }
+            let _ = match &pf.ir {
+                Ok(_) => writeln!(out, "ok    {header}"),
+                Err(e) => writeln!(out, "FAIL  {header}: {e}"),
+            };
             continue;
         }
-        match (err, cli.emit) {
-            (Some(e), _) if cli.skip_failed => eprintln!("skipped {header}: {e}"),
-            (Some(e), Emit::Rust) => {
+        match (&pf.ir, cli.emit) {
+            (Err(e), _) if cli.skip_failed => eprintln!("skipped {header}: {e}"),
+            (Err(e), Emit::Rust) => {
                 let _ = writeln!(out, "\n// {header}\n// not lifted: {e}");
-                let _ = writeln!(out, "pub fn {ident}() -> u64 {{\n    todo!({:?})\n}}", format!("not lifted: {e}"));
+                let _ = writeln!(out, "pub fn {}() -> u64 {{\n    todo!({:?})\n}}", pf.ident, format!("not lifted: {e}"));
             }
-            (Some(e), _) => {
+            (Err(e), _) => {
                 let _ = writeln!(out, "\n; {header}\n; not lifted: {e}");
             }
-            (None, Emit::Ir) => {
-                ok += 1;
-                let _ = writeln!(out, "\n; {header}\n{}", dump(pf.ir.as_ref().unwrap()));
+            (Ok(ir), Emit::Ir) => {
+                let _ = writeln!(out, "\n; {header}\n{}", dump(ir));
             }
-            (None, Emit::RawIr) => {
-                ok += 1;
+            (Ok(_), Emit::RawIr) => {
                 let _ = writeln!(out, "\n; {header}\n{}", pf.raw_ir.as_deref().unwrap_or(""));
             }
-            (None, Emit::Borrows) => {
-                ok += 1;
+            (Ok(ir), Emit::Borrows) => {
                 let _ = writeln!(out, "\n; {header}");
-                borrows(pf.ir.as_ref().unwrap(), &mut out);
+                borrows(ir, &mut out);
             }
-            (None, Emit::Rust) => {
-                ok += 1;
+            (Ok(ir), Emit::Rust) => {
                 let (body, s) = emitted[i].as_ref().expect("emitted");
                 let _ = write!(out, "\n// {header}");
                 if s.checked + s.raw > 0 {
@@ -234,6 +234,29 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 total.checked += s.checked;
                 total.raw += s.raw;
                 total.todo += s.todo;
+                total.state_machines += s.state_machines;
+                if let Some(g) = &globals {
+                    let mut items = Vec::new();
+                    g.referenced(ir, &mut items);
+                    statics.extend(items);
+                }
+            }
+        }
+    }
+    if let Some(g) = &globals {
+        if !statics.is_empty() {
+            out.push_str("\n// Data the functions above point into, from the binary's data sections.\n");
+            out.push_str(PRELUDE);
+            // Pointers inside the statics pull in more statics, until none are new.
+            let mut todo: Vec<Item> = statics.iter().copied().collect();
+            let mut more = Vec::new();
+            while !todo.is_empty() {
+                for item in &todo {
+                    g.emit_static(item, &mut out, &mut more);
+                }
+                more.sort();
+                more.dedup();
+                todo = more.drain(..).filter(|i| statics.insert(*i)).collect();
             }
         }
     }
@@ -246,6 +269,13 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     eprintln!("chungusite: lifted {ok} of {} functions ({mode_name} mode)", funcs.len());
     if total.checked + total.raw > 0 {
         eprintln!("  memory accesses: {} bounds-checked, {} raw", total.checked, total.raw);
+    }
+    if !statics.is_empty() {
+        let bytes: u64 = statics.iter().map(|i| i.len).sum();
+        eprintln!("  {} statics ({bytes} bytes) from the binary's data sections", statics.len());
+    }
+    if total.state_machines > 0 {
+        eprintln!("  {} with irreducible control flow, kept as a `loop {{ match bb }}` state machine", total.state_machines);
     }
     if total.todo > 0 {
         eprintln!("  {} todo!() left where the emitter can't express an instruction yet", total.todo);
@@ -287,9 +317,12 @@ fn borrows(func: &Function, out: &mut String) {
     }
 }
 
+fn copy<'a>(f: &FuncBytes<'a>) -> FuncBytes<'a> {
+    FuncBytes { name: f.name.clone(), demangled: f.demangled.clone(), addr: f.addr, bytes: f.bytes }
+}
+
 /// The functions the user asked for, or all of them.
 fn select<'a>(bin: &Binary<'a>, cli: &Cli) -> Result<Vec<FuncBytes<'a>>, String> {
-    let copy = |f: &FuncBytes<'a>| FuncBytes { name: f.name.clone(), addr: f.addr, bytes: f.bytes };
     if cli.functions.is_empty() && cli.addrs.is_empty() {
         if bin.funcs.is_empty() {
             return Err(format!(
@@ -301,7 +334,7 @@ fn select<'a>(bin: &Binary<'a>, cli: &Cli) -> Result<Vec<FuncBytes<'a>>, String>
     }
     let mut out = Vec::new();
     for name in &cli.functions {
-        match bin.funcs.iter().find(|f| &f.name == name) {
+        match bin.funcs.iter().find(|f| &f.name == name || f.demangled.as_ref() == Some(name)) {
             Some(f) => out.push(copy(f)),
             None => return Err(format!("no function named {name:?} (try --list)")),
         }
@@ -312,7 +345,8 @@ fn select<'a>(bin: &Binary<'a>, cli: &Cli) -> Result<Vec<FuncBytes<'a>>, String>
             (found, Some(size)) => {
                 let bytes = bin.code_at(addr, size).ok_or(format!("{addr:#x} is not in a code section"))?;
                 let name = found.map_or(format!("sub_{addr:x}"), |f| f.name.clone());
-                FuncBytes { name, addr, bytes }
+                let demangled = found.and_then(|f| f.demangled.clone());
+                FuncBytes { name, demangled, addr, bytes }
             }
             (None, None) => return Err(format!("no function starts at {addr:#x}; pass --size to lift it anyway")),
         };
@@ -327,29 +361,4 @@ fn failure_kind(e: &str) -> String {
         Some(rest) => format!("unsupported {}", rest.split(' ').next().unwrap_or(rest)),
         None => e.split(" at ").next().unwrap_or(e).replace(|c: char| c.is_ascii_digit(), "").to_string(),
     }
-}
-
-/// A unique Rust identifier for a symbol name.
-fn rust_ident(name: &str, addr: u64, used: &mut HashSet<String>) -> String {
-    let mut s: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
-    if s.is_empty() || s.starts_with(|c: char| c.is_ascii_digit()) || is_keyword(&s) {
-        s.insert_str(0, "f_");
-    }
-    if !used.insert(s.clone()) {
-        s = format!("{s}_{addr:x}");
-        used.insert(s.clone());
-    }
-    s
-}
-
-fn is_keyword(s: &str) -> bool {
-    matches!(
-        s,
-        "as" | "break" | "const" | "continue" | "crate" | "else" | "enum" | "extern" | "false" | "fn" | "for"
-            | "if" | "impl" | "in" | "let" | "loop" | "match" | "mod" | "move" | "mut" | "pub" | "ref"
-            | "return" | "self" | "Self" | "static" | "struct" | "super" | "trait" | "true" | "type"
-            | "unsafe" | "use" | "where" | "while" | "async" | "await" | "dyn" | "abstract" | "become"
-            | "box" | "do" | "final" | "macro" | "override" | "priv" | "typeof" | "unsized" | "virtual"
-            | "yield" | "try" | "gen" | "_"
-    )
 }

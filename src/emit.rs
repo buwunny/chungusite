@@ -24,6 +24,7 @@ use crate::borrow::{analyze, Class, ParamBorrow, RSP};
 use crate::cfg::Cfg;
 use crate::structure::{print, structure, Node, Source};
 use crate::ir::*;
+use crate::sources::bucket;
 use crate::verify::for_each_operand;
 use std::fmt::Write;
 
@@ -37,8 +38,12 @@ pub enum Mode {
 pub struct EmitStats {
     /// Loads and stores emitted as bounds-checked slice accesses.
     pub checked: usize,
-    /// Loads and stores emitted as raw pointer accesses inside `unsafe`.
+    /// Loads, stores and copies emitted as raw pointer accesses inside `unsafe`,
+    /// plus FFI and indirect calls. Zero means the body has no raw pointer.
     pub raw: usize,
+    /// Raw loads, stores and copies by where the pointer comes from
+    /// (`sources::SOURCES`: frame, global, argument, other).
+    pub raw_by: [usize; 4],
     /// Instructions or terminators the emitter can't express yet (`todo!()`).
     pub todo: usize,
     /// Functions whose control flow is irreducible, emitted as a
@@ -109,6 +114,8 @@ struct Emitter<'a> {
     hoisted: Vec<bool>,
     /// Rust expression for a constant address that points into the binary's data.
     global_of: &'a dyn Fn(u64) -> Option<String>,
+    /// Where each value points (`sources.rs`), to count raw accesses by source.
+    src: Vec<u8>,
     stats: EmitStats,
 }
 
@@ -187,6 +194,7 @@ pub fn emit_function_in(f: &Function, name: &str, mode: Mode, env: &Env, out: &m
         entry_param,
         hoisted: hoisted(f, &cfg),
         global_of: env.global_of,
+        src: crate::sources::sources(f),
         stats: EmitStats::default(),
     };
 
@@ -688,6 +696,7 @@ impl Emitter<'_> {
                     n(len)
                 );
                 self.stats.raw += 1;
+                self.stats.raw_by[bucket(self.src[dst.index()] | self.src[src.index()])] += 1;
                 return Stmt::Effect(s);
             }
             other => {
@@ -797,6 +806,7 @@ impl Emitter<'_> {
             return format!("{t}::from_le_bytes({s}[{p}.wrapping_sub({root}_base) as usize..][..{len}].try_into().unwrap())");
         }
         self.stats.raw += 1;
+        self.stats.raw_by[bucket(self.src[ptr.index()])] += 1;
         format!("unsafe {{ ({p} as *const {t}).read_unaligned() }}")
     }
 
@@ -809,6 +819,7 @@ impl Emitter<'_> {
             return format!("{s}[{p}.wrapping_sub({root}_base) as usize..][..{len}].copy_from_slice(&{v}.to_le_bytes())");
         }
         self.stats.raw += 1;
+        self.stats.raw_by[bucket(self.src[ptr.index()])] += 1;
         format!("unsafe {{ ({p} as *mut {t}).write_unaligned({v}) }}")
     }
 }

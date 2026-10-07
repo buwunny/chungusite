@@ -14,5 +14,6 @@ pub mod names;
 pub mod opt;
 pub mod program;
 pub mod refine;
+pub mod sources;
 pub mod structure;
 pub mod verify;

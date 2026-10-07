@@ -13,6 +13,7 @@ use chungusite::{
     load::{Binary, FuncBytes},
     names::rust_ident,
     program::{Input, Program},
+    sources::SOURCES,
 };
 use clap::{Parser, ValueEnum};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -190,6 +191,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     let mut failures: BTreeMap<String, usize> = BTreeMap::new();
     let mut statics = BTreeSet::new();
     let (mut ok, mut total) = (0, EmitStats::default());
+    let (mut no_raw, mut safe_fns, mut emitted_fns) = (0, 0, 0);
     for (fb, &i) in funcs.iter().zip(&index) {
         let pf = &program.funcs[i];
         let header = format!("{} @ {:#x}, {} bytes", fb.pretty(), fb.addr, fb.bytes.len());
@@ -225,6 +227,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             }
             (Ok(ir), Emit::Rust) => {
                 let (body, s) = emitted[i].as_ref().expect("emitted");
+                emitted_fns += 1;
                 let _ = write!(out, "\n// {header}");
                 if s.checked + s.raw > 0 {
                     let _ = write!(out, "; {} of {} memory accesses bounds-checked", s.checked, s.checked + s.raw);
@@ -233,6 +236,11 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 out.push_str(body);
                 total.checked += s.checked;
                 total.raw += s.raw;
+                for k in 0..4 {
+                    total.raw_by[k] += s.raw_by[k];
+                }
+                no_raw += (s.raw == 0) as usize;
+                safe_fns += body.starts_with("pub fn") as usize;
                 total.todo += s.todo;
                 total.state_machines += s.state_machines;
                 if let Some(g) = &globals {
@@ -268,7 +276,13 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
 
     eprintln!("chungusite: lifted {ok} of {} functions ({mode_name} mode)", funcs.len());
     if total.checked + total.raw > 0 {
-        eprintln!("  memory accesses: {} bounds-checked, {} raw", total.checked, total.raw);
+        let mem_raw: usize = total.raw_by.iter().sum();
+        eprintln!("  memory accesses: {} bounds-checked, {} raw", total.checked, mem_raw);
+        let by: Vec<String> = SOURCES.iter().zip(total.raw_by).map(|(n, c)| format!("{n} {c}")).collect();
+        eprintln!("  raw accesses by source: {}", by.join(", "));
+    }
+    if emitted_fns > 0 {
+        eprintln!("  {no_raw} of {emitted_fns} functions have no raw pointer; {safe_fns} are safe `fn`s");
     }
     if !statics.is_empty() {
         let bytes: u64 = statics.iter().map(|i| i.len).sum();

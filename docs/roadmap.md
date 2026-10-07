@@ -1,6 +1,6 @@
 # What's left for a working decompiler
 
-The pipeline runs end to end today: `chungusite <binary>` reads an ELF, Mach-O or PE file, lifts each function, cleans the SSA, and emits Rust that compiles in both modes ([cli.md](cli.md)). What limits it is coverage. On chungusite's own debug build (11,600 functions), 10,600 lift (up from 1,920 before the lifter learned calls, the stack, conditional moves and memory operands), and the output for all of them type-checks. Calls are real calls with recovered signatures, and stack slots are local variables (steps 2 and 3), which removed about half of all raw memory accesses: 101,454 remain in fast mode, and in safe mode 10,666 of 101,454 accesses come out bounds-checked. Lifting, signature inference and emission run in parallel (`-j`); the whole binary takes about 1 s on 4 cores.
+The pipeline runs end to end today: `chungusite <binary>` reads an ELF, Mach-O or PE file, lifts each function, cleans the SSA, and emits Rust that compiles in both modes ([cli.md](cli.md)). What limits it is coverage. On chungusite's own debug build (11,600 functions), 10,600 lift (up from 1,920 before the lifter learned calls, the stack, conditional moves and memory operands), and the output for all of them type-checks. Calls are real calls with recovered signatures, and stack slots are local variables (steps 2 and 3), which removed about half of all raw memory accesses. Safe mode now bounds-checks 46% of what remains on that binary and leaves 65% of functions without a raw pointer (step 7). Lifting, signature inference and emission run in parallel (`-j`); the whole binary takes about 1 s on 4 cores.
 
 The ML refinement layer (`src/refine`, behind the `ml` feature; see docs/ml-runtime.md) is left out of this list on purpose. It plugs in at step 5 and is optional: everything below works without it. The CLI does not call it yet; wiring it in is a `--refine` flag that runs after safe mode, once the models are trained.
 
@@ -24,14 +24,14 @@ Whole-program signature recovery ([calls.md](calls.md)): arguments, stack argume
 
 - Indirect calls (function pointers, vtables) guess their arguments from the call site. Recovering vtables (step 6) would give them targets.
 - Floating-point and vector arguments and returns (xmm registers) aren't tracked yet, which matters once SSE lifts (step 1).
-- In safe mode, functions that other decompiled functions call take integers, because callers have addresses, not slices. Passing slices across calls needs the call summaries of step 7.
+- ~~In safe mode, functions that other decompiled functions call take integers.~~ Done in step 7: callers lend slices, and a caller that can't calls the callee's raw twin.
 - Function discovery still comes from symbols (step 8).
 
 ## 3. Stack frames (done)
 
 `frame::promote` turns stack slots whose address doesn't escape into SSA values and stack arguments into parameters ([calls.md](calls.md)). On the sample binary, 2,893 of 10,665 functions still need a `frame` array for slots whose address escapes. Still open:
 
-- Borrow escaped slots (`&mut frame[..]`) so safe mode can bounds-check them; today frame accesses are raw.
+- ~~Borrow escaped slots (`&mut frame[..]`) so safe mode can bounds-check them.~~ Done in step 7: a safe frame is a byte array, indexed and lent to callees.
 - Split the frame into one local per object instead of one array.
 
 ## 4. Control-flow structuring
@@ -57,9 +57,14 @@ Done for the common case ([cli.md](cli.md#globals)): constant addresses into dat
 - Thread-locals (`fs:`-relative accesses) are still unsupported in the lifter.
 - Mach-O chained fixups and PE base relocations aren't read, so pointer slots in those formats keep their file bytes.
 
-## 7. Remaining safe-mode stages
+## 7. Safe mode across calls (done)
 
-Stages 5 to 7 in [ownership.md](ownership.md): call summaries and moves (`malloc`/`free` into `Box`), loans and lifetimes, and the final pass that runs rustc on the output and downgrades whatever fails to borrow-check back to raw pointers.
+Stages 5 to 7 in [ownership.md](ownership.md) are in: the frame, read-only globals and `malloc`'d allocations are roots like arguments, and pointers stored in the frame or the heap are followed; call summaries let callers lend slices to callees (`split_at_mut` for two at once), and a caller that can't calls the callee's raw twin; `malloc`/`free` become `Box<[u8]>` and a drop, `memcpy`/`memset` slice operations; conflicting loans and uses after free are found with Polonius-style rules on `datafrog` and downgraded; and `--check` compiles the output with rustc and emits whatever it rejects in fast mode. On chungusite's own debug build, 46% of memory accesses are bounds-checked (from 14%), and 65% of functions have no raw pointer (from 27%); the table is in ownership.md. Still open:
+
+- Splitting the frame into one local per object (step 3), so that one escaping object doesn't make the whole frame raw. Frames are the largest remaining source of raw accesses.
+- Passing a `Box` to a callee that frees it (by value), and returning one.
+- Returning references (`&'a [u8]`) instead of addresses, which needs the `subset` facts the loan rules already support.
+- Measuring the inferred signatures against DWARF on a Rust corpus.
 
 ## 8. Binary handling
 

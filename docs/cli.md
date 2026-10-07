@@ -5,6 +5,7 @@ cargo install --path .            # or: cargo run --release -- <args>
 
 chungusite ./prog                          # every function, fast mode, to stdout
 chungusite ./prog --mode safe -o prog.rs   # safe mode, to a file
+chungusite ./prog --mode safe --check      # ... and compile it with rustc, fast mode for what fails
 chungusite ./prog -f parse -f main         # only these symbols (mangled or demangled)
 chungusite ./prog --addr 0x401136          # the function starting there
 chungusite ./prog --addr 0x401136 --size 0x40   # no symbol there: lift exactly these bytes
@@ -26,9 +27,9 @@ Functions are lifted, cleaned and emitted in parallel with `rayon`, one `Lifter`
 | `rust` (default) | Rust source, one `pub fn` per function |
 | `ir` | cleaned SSA IR, which is what the emitter sees |
 | `raw-ir` | IR straight from the lifter, before `opt::clean` |
-| `borrows` | safe mode's verdict for each argument (`&T`, `Option<&mut T>`, raw...) |
+| `borrows` | safe mode's verdict for each argument (`&T`, `Option<&mut T>`, raw and why) and for the frame, globals and allocations |
 
-A summary goes to stderr: how many functions lifted, how many memory accesses are bounds-checked versus raw, and the failures grouped by cause, most common first. That table is the to-do list for the lifter. The exit code is 0 if every selected function lifted, 1 if some did not, and 2 for usage or file errors.
+A summary goes to stderr: how many functions lifted, how many memory accesses are bounds-checked versus raw (and what the raw ones go through: the frame, a global, an argument, or another pointer), how many functions have no raw pointer, and the failures grouped by cause, most common first. That table is the to-do list for the lifter. The exit code is 0 if every selected function lifted, 1 if some did not, and 2 for usage or file errors.
 
 A function that fails to lift still appears in the output as a stub whose body is `todo!("not lifted: <reason>")`, so the file always compiles. `--skip-failed` leaves the stubs out.
 
@@ -46,7 +47,7 @@ pub unsafe fn get_count(mut rdi: u64) -> u64 {
 }
 ```
 
-**Safe mode** asks `borrow::analyze` about each argument. An argument it classifies as `&T` or `&mut T` arrives as a byte slice (`&[u8]` or `&mut [u8]`), wrapped in `Option` when the code null-checks it. Any access whose pointer derives from exactly one such argument becomes a bounds-checked slice access. So a wrong size guess panics instead of reading out of bounds. Every other access stays raw, and the function is `unsafe` only if one does:
+**Safe mode** asks the borrow analysis ([ownership.md](ownership.md)) which objects each pointer points into, across the whole program. An argument it classifies as `&T` or `&mut T` arrives as a byte slice (`&[u8]` or `&mut [u8]`), wrapped in `Option` when the code null-checks it; the stack frame becomes a byte array, a read-only global its static's bytes, and a `malloc`'d buffer a `Box<[u8]>`. Any access whose pointer derives from exactly one such object becomes a bounds-checked slice access. So a wrong size guess panics instead of reading out of bounds. Calls lend slices to callees that take them; a caller that can't calls the callee's *raw twin*, `name_raw`, the same function in fast mode. Every other access stays raw, and the function is `unsafe` only if one does:
 
 ```rust
 pub fn maybe_count(rdi_ref: Option<&[u8]>) -> u64 {
@@ -56,7 +57,9 @@ pub fn maybe_count(rdi_ref: Option<&[u8]>) -> u64 {
     let v7: u64 = u64::from_le_bytes(rdi_ref.unwrap()[v6.wrapping_sub(rdi_base) as usize..][..8].try_into().unwrap());
 ```
 
-Each function header says how many of its accesses are checked. Byte slices are a stopgap until struct recovery can name the pointee type and turn these into `&S` with real fields.
+Each function header says how many of its accesses are checked.
+
+`--check` compiles the safe-mode output with rustc (in parallel batches; about two minutes for 18,000 functions on 4 cores) and emits every function rustc rejects in fast mode instead, which always compiles, then checks again. Byte slices are a stopgap until struct recovery can name the pointee type and turn these into `&S` with real fields.
 
 Control flow is structured ([`src/structure.rs`](../src/structure.rs)): branches become `if`/`else`, loops become `loop` with `break`, `continue` and early `return`, and block parameters become mutable variables assigned on each edge. A loop's exits are emitted after it, so leaving it is a `break`:
 

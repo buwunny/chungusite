@@ -444,12 +444,15 @@ uint64_t heap_pair(uint64_t a, uint64_t b) {
     return r;
 }
 
-// A local array filled and copied with memset and memcpy, then summed.
-// @diff local_copy: u64(buf:32, u8)
-uint64_t local_copy(const uint8_t *src, uint8_t c) {
+// A local array filled and copied with memset and memcpy, then summed. The
+// lengths are arguments, so these stay calls.
+// @diff local_copy: u64(buf:32, u8, u64:0..49, u64:0..33)
+uint64_t local_copy(const uint8_t *src, uint8_t c, uint64_t n, uint64_t m) {
     uint8_t t[48];
-    memset(t, c, sizeof t);
-    memcpy(t + 8, src, 32);
+    memset(t, c, n);
+    memset(t + n, 0, 48 - n);
+    if (m > 40 - (n > 40 ? 40 : n)) m = 0;
+    memcpy(t + 8, src, m);
     uint64_t s = 0;
     for (int i = 0; i < 48; i++) s = s * 31 + t[i];
     return s;

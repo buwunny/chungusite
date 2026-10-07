@@ -5,7 +5,7 @@
 //!     chungusite ./prog --list                  # what's in there, and what lifts
 //!     chungusite --hex "8b 47 08 03 47 10 c3"   # raw bytes, no file
 use chungusite::{
-    borrow::{analyze, Analysis, Class, Root},
+    borrow::{analyze, Analysis, Class, FactKind, Root},
     check,
     dump::dump,
     emit::{EmitStats, Mode},
@@ -164,6 +164,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     let idents: Vec<String> = funcs.iter().map(|f| rust_ident(f.pretty(), f.addr, &mut used)).collect();
     // Function pointers in data are named by their identifier in the output.
     let by_addr: HashMap<u64, &str> = funcs.iter().zip(&idents).map(|(f, i)| (f.addr, i.as_str())).collect();
+    let used_idents = used.clone();
     let globals = bin.filter(|_| rust).map(|b| Globals::new(b, used, &by_addr));
     let global_of = |addr: u64| globals.as_ref().and_then(|g| g.expr(addr));
 
@@ -202,6 +203,8 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
 
     // The statics the emitted functions point into.
     let mut statics = BTreeSet::new();
+    // in the order they are emitted
+    let mut static_order: Vec<Item> = Vec::new();
     let mut statics_src = String::new();
     let mut statics_stub = String::new();
     if let Some(g) = &globals {
@@ -222,6 +225,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 for item in &todo {
                     g.emit_static(item, &mut statics_src, &mut more);
                 }
+                static_order.extend(todo.iter().copied());
                 more.sort();
                 more.dedup();
                 todo = more.drain(..).filter(|i| statics.insert(*i)).collect();
@@ -260,6 +264,23 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             emitted = program.emit_all_with(mode, &opts);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    // Function pointers in the statics point to raw twins where safe mode made
+    // them: code calling through a pointer passes integers.
+    let pointer_idents = if rust && mode == Mode::Safe && !static_order.is_empty() {
+        program.pointer_idents(&Options { fast: &fast, ..opts })
+    } else {
+        Vec::new()
+    };
+    if let (false, Some(b)) = (pointer_idents.is_empty(), bin) {
+        let by_addr: HashMap<u64, &str> = funcs.iter().zip(&index).map(|(f, &i)| (f.addr, pointer_idents[i].as_str())).collect();
+        let g = Globals::new(b, used_idents, &by_addr);
+        statics_src = String::from("\n// Data the functions above point into, from the binary's data sections.\n");
+        statics_src.push_str(PRELUDE);
+        let mut more = Vec::new();
+        for item in &static_order {
+            g.emit_static(item, &mut statics_src, &mut more);
+        }
     }
 
     let mut out = String::new();
@@ -353,6 +374,11 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         eprintln!("  {} statics ({bytes} bytes) from the binary's data sections", statics.len());
     }
     let downgraded = fast.iter().filter(|&&x| x).count();
+    let twins: usize = emitted.iter().flatten().map(|(_, s)| s.twins).sum();
+    let twin_raw: usize = emitted.iter().flatten().map(|(_, s)| s.twin_raw).sum();
+    if twins > 0 {
+        eprintln!("  {twins} raw twins (`f_raw`, fast mode) for callers that can't lend a slice; {twin_raw} raw memory accesses in them");
+    }
     if cli.check && mode == Mode::Safe {
         eprintln!("  --check: {downgraded} functions didn't compile in safe mode and are emitted in fast mode");
         if !check_errors.is_empty() {
@@ -403,6 +429,11 @@ fn borrows(func: &Function, a: &Analysis, out: &mut String) {
         );
     }
     for (r, root) in a.roots.iter().enumerate() {
+        // only objects something reads, writes or lends (not call targets)
+        let used = a.facts.iter().any(|x| x.root as usize == r && matches!(x.kind, FactKind::Read | FactKind::Write | FactKind::Borrow { .. }));
+        if !used {
+            continue;
+        }
         let name = match root {
             Root::Param(_) => continue,
             Root::Frame => "frame".to_string(),

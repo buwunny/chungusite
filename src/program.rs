@@ -384,40 +384,58 @@ impl Program {
         Program { funcs, externs, extern_of, got_addr: syms.got_addr }
     }
 
-    /// The callee of each call site in function `i`, for the emitter. In safe
-    /// mode, with `safe`, also how the callee takes each argument.
-    fn call_info(&self, i: usize, site: Site, safe: Option<&Summaries>) -> Option<CallInfo> {
+    /// The callee of each call site in function `i`, for the emitter. With
+    /// `safe`, in safe mode: how the callee takes each argument, or its raw twin
+    /// if this call can't lend it a slice. With `safe` and `fast`, for code
+    /// emitted in fast mode inside a safe program (a twin, or a function that
+    /// `--check` sent back): callees that take slices are called through their
+    /// twins.
+    fn call_info(&self, i: usize, site: Site, safe: Option<&Summaries>, fast: bool) -> Option<CallInfo> {
         let f = &self.funcs[i];
         let k = f.sites.iter().position(|&s| s == site)?;
-        let summary = safe.and_then(|s| s.callee(self, i, k));
-        let name = match &f.targets[k] {
-            Target::Func(j) => Some(self.funcs[*j].name.as_str()),
-            Target::Import(n) => Some(n.as_str()),
-            Target::Indirect => None,
-        };
-        let builtin = name.and_then(crate::libc::builtin);
-        let with = |c: CallInfo| match &summary {
-            Some(sum) => CallInfo { args: sum.args.clone(), alloc: sum.alloc, free: sum.args.first() == Some(&Pass::Free), builtin, ..c },
-            None => c,
-        };
         let ext = |name: &str| {
             let e = &self.externs[*self.extern_of.get(name)?];
-            let c = CallInfo { path: Some(format!("ffi::{}", e.ident)), ret: e.sig.ret, ret2: e.sig.ret2, foreign: true, ..CallInfo::default() };
-            Some(with(c))
+            Some(CallInfo { path: Some(format!("ffi::{}", e.ident)), ret: e.sig.ret, ret2: e.sig.ret2, foreign: true, ..CallInfo::default() })
         };
-        match &f.targets[k] {
+        let plain = match &f.targets[k] {
             Target::Func(j) => {
                 let g = &self.funcs[*j];
                 if g.selected && g.ir.is_ok() {
-                    let c = CallInfo { path: Some(g.ident.clone()), ret: g.sig.ret, ret2: g.sig.ret2, foreign: false, ..CallInfo::default() };
-                    Some(with(c))
+                    Some(CallInfo { path: Some(g.ident.clone()), ret: g.sig.ret, ret2: g.sig.ret2, foreign: false, ..CallInfo::default() })
                 } else {
                     ext(&g.name)
                 }
             }
             Target::Import(n) => ext(n),
             Target::Indirect => None,
+        };
+        let Some(s) = safe else { return plain };
+        let plain = plain?;
+        // a call to a raw twin: integers, and as unsafe as an FFI call
+        let twin = |j: usize| CallInfo { path: Some(s.twin_ident[j].clone()), raw: true, ..plain.clone() };
+        if let Target::Func(j) = f.targets[k] {
+            if s.twin[j] && (fast || s.raw_sites.contains(&(i, site))) {
+                return Some(twin(j));
+            }
         }
+        if fast {
+            return Some(plain);
+        }
+        let name = match &f.targets[k] {
+            Target::Func(j) => Some(self.funcs[*j].name.as_str()),
+            Target::Import(n) => Some(n.as_str()),
+            Target::Indirect => None,
+        };
+        Some(match s.callee(self, i, k) {
+            Some(sum) => CallInfo {
+                args: sum.args.clone(),
+                alloc: sum.alloc,
+                free: sum.args.first() == Some(&Pass::Free),
+                builtin: name.and_then(crate::libc::builtin),
+                ..plain
+            },
+            None => plain,
+        })
     }
 
     /// Emit every selected function that lifted, in parallel: `(source, stats)`,
@@ -428,7 +446,8 @@ impl Program {
     }
 
     /// `emit_all`, with safe mode's view of the binary's globals and the
-    /// functions that `--check` sent back to fast mode.
+    /// functions that `--check` sent back to fast mode. In safe mode a function
+    /// with a raw twin has the twin's source right after its own.
     pub fn emit_all_with(&self, mode: Mode, opts: &Options) -> Vec<Option<(String, EmitStats)>> {
         let safe = (mode == Mode::Safe).then(|| self.summaries(opts));
         let mut out: Vec<Option<(String, EmitStats)>> = self
@@ -438,21 +457,28 @@ impl Program {
             .map(|(i, f)| {
                 let ir = f.ir.as_ref().ok().filter(|_| f.selected)?;
                 let fast = mode == Mode::Fast || opts.fast.get(i).copied().unwrap_or(false);
-                let mode = if fast { Mode::Fast } else { Mode::Safe };
-                let safe = safe.as_ref().filter(|_| !fast);
-                let call = |s: Site| self.call_info(i, s, safe);
-                let analysis = safe.and_then(|s| s.analyses[i].as_ref());
-                let env = Env {
-                    sig: Some(f.sig),
-                    call: &call,
-                    demote: false,
-                    structure: true,
-                    global_of: opts.global_of,
-                    global_slice: opts.global_slice,
-                    analysis,
+                let emit = |ident: &str, fast: bool, src: &mut String| {
+                    let call = |site: Site| self.call_info(i, site, safe.as_ref(), fast);
+                    let analysis = safe.as_ref().filter(|_| !fast).and_then(|s| s.analyses[i].as_ref());
+                    let env = Env {
+                        sig: Some(f.sig),
+                        call: &call,
+                        demote: false,
+                        structure: true,
+                        global_of: opts.global_of,
+                        global_slice: opts.global_slice,
+                        analysis,
+                    };
+                    emit_function_in(ir, ident, if fast { Mode::Fast } else { Mode::Safe }, &env, src)
                 };
                 let mut src = String::new();
-                let stats = emit_function_in(ir, &f.ident, mode, &env, &mut src);
+                let mut stats = emit(&f.ident, fast, &mut src);
+                if let Some(s) = safe.as_ref().filter(|s| s.twin[i]) {
+                    src.push_str(&format!("\n/// `{}` taking integers, for callers that can't lend it a slice.\n", f.ident));
+                    let t = emit(&s.twin_ident[i], true, &mut src);
+                    stats.twins += 1;
+                    stats.twin_raw += t.raw_by.iter().sum::<usize>();
+                }
                 Some((src, stats))
             })
             .collect();
@@ -487,22 +513,33 @@ impl Program {
         self.summaries(opts).analyses
     }
 
+    /// The identifier each function is called by from data (function pointers in
+    /// statics): its raw twin, if safe mode gives it one, since code that calls
+    /// through a pointer passes integers.
+    pub fn pointer_idents(&self, opts: &Options) -> Vec<String> {
+        let s = self.summaries(opts);
+        (0..self.funcs.len()).map(|i| if s.twin[i] { s.twin_ident[i].clone() } else { self.funcs[i].ident.clone() }).collect()
+    }
+
     /// Safe mode's whole-program pass (docs/ownership.md, stage 5): the borrow
     /// analysis of every function, with each call seeing its callee's summary,
     /// iterated until no summary changes.
     ///
     /// Summaries start optimistic (a callee ignores every argument) and only get
-    /// worse, so this terminates. A callee takes an argument as a slice only if
-    /// every caller can pass one: a caller that can't (the pointer comes from
+    /// worse, so this terminates. A callee takes an argument as a slice if its
+    /// own code allows it. A call that can't lend one (the pointer comes from
     /// several objects, or from one that isn't safe, or two arguments would
-    /// borrow the same bytes mutably) *demotes* that argument to an integer, and
-    /// the callee is analysed again. Functions whose address is taken can be
-    /// called from anywhere, so all their arguments are integers.
+    /// borrow the same bytes mutably) calls the callee's *raw twin* instead: the
+    /// same function emitted in fast mode, taking integers. So one caller that
+    /// can't lend a slice doesn't take the slice away from the others. Twins are
+    /// also made for functions that data points to (called through pointers,
+    /// with integers) and for the slice-taking callees of every twin and of every
+    /// function emitted in fast mode.
     fn summaries<'o>(&self, opts: &Options<'o>) -> Summaries<'o> {
         let n = self.funcs.len();
-        let safe_fn: Vec<bool> = (0..n)
-            .map(|i| self.funcs[i].selected && self.funcs[i].ir.is_ok() && !opts.fast.get(i).copied().unwrap_or(false))
-            .collect();
+        let fast = |i: usize| opts.fast.get(i).copied().unwrap_or(false);
+        let emitted = |i: usize| self.funcs[i].selected && self.funcs[i].ir.is_ok();
+        let safe_fn: Vec<bool> = (0..n).map(|i| emitted(i) && !fast(i)).collect();
         let by_addr: HashMap<u64, usize> = self.funcs.iter().enumerate().map(|(i, f)| (f.addr, i)).collect();
         let mut taken = vec![false; n];
         for f in &self.funcs {
@@ -519,12 +556,8 @@ impl Program {
                 taken[j] = true;
             }
         }
-        let mut demoted: Vec<Vec<bool>> = self
-            .funcs
-            .iter()
-            .enumerate()
-            .map(|(i, f)| vec![taken[i]; f.ir.as_ref().map_or(0, |ir| ir.blocks[ir.entry].params.len as usize)])
-            .collect();
+        let mut demoted: Vec<Vec<bool>> =
+            self.funcs.iter().map(|f| vec![false; f.ir.as_ref().map_or(0, |ir| ir.blocks[ir.entry].params.len as usize)]).collect();
         let mut callers: Vec<Vec<usize>> = vec![Vec::new(); n];
         for (i, f) in self.funcs.iter().enumerate() {
             for t in &f.targets {
@@ -535,6 +568,18 @@ impl Program {
                 }
             }
         }
+        let mut used: std::collections::HashSet<String> = self.funcs.iter().map(|f| f.ident.clone()).collect();
+        let twin_ident = self
+            .funcs
+            .iter()
+            .map(|f| {
+                let mut t = format!("{}_raw", f.ident);
+                while !used.insert(t.clone()) {
+                    t.push('_');
+                }
+                t
+            })
+            .collect();
         let mut s = Summaries {
             analyses: (0..n).map(|_| None).collect(),
             summary: (0..n)
@@ -542,6 +587,9 @@ impl Program {
                 .collect(),
             safe_fn,
             global_slice: opts.global_slice,
+            raw_sites: std::collections::HashSet::new(),
+            twin: vec![false; n],
+            twin_ident,
         };
         let mut dirty: Vec<bool> = s.safe_fn.clone();
         for round in 0.. {
@@ -561,6 +609,9 @@ impl Program {
                 .map(|i| {
                     let ir = self.funcs[i].ir.as_ref().unwrap();
                     let callee = |site: Site| {
+                        if s.raw_sites.contains(&(i, site)) {
+                            return None;
+                        }
                         let k = self.funcs[i].sites.iter().position(|&x| x == site)?;
                         s.callee(self, i, k)
                     };
@@ -573,18 +624,10 @@ impl Program {
             for (i, a) in fresh {
                 let f = &self.funcs[i];
                 let ir = f.ir.as_ref().unwrap();
-                // callees that must take an argument as an integer
-                for &(site, k) in &a.unprovable {
-                    let Some(at) = f.sites.iter().position(|&x| x == site) else { continue };
-                    let Target::Func(j) = f.targets[at] else { continue };
-                    if !s.safe_fn[j] {
-                        continue;
-                    }
-                    let callee_ir = self.funcs[j].ir.as_ref().unwrap();
-                    if let Some(e) = entry_index(callee_ir, k as usize) {
-                        if !std::mem::replace(&mut demoted[j][e], true) {
-                            dirty[j] = true;
-                        }
+                // calls that can't lend a slice go to the callee's raw twin
+                for &(site, _) in &a.unprovable {
+                    if s.raw_sites.insert((i, site)) {
+                        dirty[i] = true;
                     }
                 }
                 let new = summarize(ir, f.sig, &a);
@@ -595,6 +638,35 @@ impl Program {
                     }
                 }
                 s.analyses[i] = Some(a);
+            }
+        }
+
+        // Raw twins, and the slice-taking callees of every twin.
+        let lends = |s: &Summaries, j: usize| s.summary[j].as_ref().is_some_and(|c| c.args.iter().any(|p| matches!(p, Pass::Borrow { .. })));
+        let mut work: Vec<usize> = (0..n).filter(|&j| taken[j] && s.safe_fn[j] && lends(&s, j)).collect();
+        for &(i, site) in &s.raw_sites {
+            if let Some(k) = self.funcs[i].sites.iter().position(|&x| x == site) {
+                if let Target::Func(j) = self.funcs[i].targets[k] {
+                    work.push(j);
+                }
+            }
+        }
+        // what fast-mode code calls
+        work.extend((0..n).filter(|&i| emitted(i) && fast(i)));
+        while let Some(j) = work.pop() {
+            if s.safe_fn[j] && lends(&s, j) {
+                if s.twin[j] {
+                    continue;
+                }
+                s.twin[j] = true;
+            }
+            // a twin (or a fast function) calls its callees in fast mode too
+            for t in &self.funcs[j].targets {
+                if let Target::Func(h) = *t {
+                    if s.safe_fn[h] && lends(&s, h) && !s.twin[h] {
+                        work.push(h);
+                    }
+                }
             }
         }
         s
@@ -661,6 +733,12 @@ struct Summaries<'a> {
     /// Emitted in safe mode.
     safe_fn: Vec<bool>,
     global_slice: &'a (dyn Fn(u64) -> Option<String> + Sync),
+    /// Calls (caller, site) that can't lend the callee a slice: they call its
+    /// raw twin.
+    raw_sites: std::collections::HashSet<(usize, Site)>,
+    /// Functions emitted a second time in fast mode, as `twin_ident`.
+    twin: Vec<bool>,
+    twin_ident: Vec<String>,
 }
 
 impl Summaries<'_> {

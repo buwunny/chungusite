@@ -126,6 +126,7 @@ dependencies = [
  "iced-x86",
  "object",
  "ort",
+ "rayon",
  "tokenizers",
 ]
 

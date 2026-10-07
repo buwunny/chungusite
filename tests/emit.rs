@@ -2,7 +2,7 @@
 //! These tests shell out to `rustc`, the same one cargo uses.
 mod common;
 use chungusite::{
-    emit::{emit_function, Mode},
+    emit::{emit_function, emit_function_with, Mode},
     ir::*,
     lift::Lifter,
     opt::clean,
@@ -55,6 +55,9 @@ fn sum_loop_runs_the_same_in_both_modes() {
     assert!(safe.starts_with("pub fn sum(rdi_ref: &mut [u8], mut rsi: u64, mut rcx: u64) -> u64 {"), "{safe}");
     assert!(!safe.contains("unsafe"), "{safe}");
     assert!(fast.starts_with("pub unsafe fn sum(mut rdi: u64, mut rsi: u64, mut rcx: u64) -> u64 {"), "{fast}");
+    // The loop is structured: exit with `break`, return after it.
+    assert!(fast.contains("    loop {\n") && fast.contains("            break;\n") && !fast.contains("match bb"), "{fast}");
+    assert!(fast.ends_with("    }\n    return v19 as u64;\n}\n"), "{fast}");
 
     let main = r#"
 mod fast { include!("fast.rs"); }
@@ -215,4 +218,101 @@ fn cli_decompiles_an_elf() {
 
     let missing = Command::new(bin).arg(&elf).args(["-f", "nope"]).output().unwrap();
     assert_eq!(missing.status.code(), Some(2));
+}
+
+/// Structured output must compute the same thing as the state machine, which is a
+/// direct transcription of the CFG. Random register-only programs (so any input is
+/// valid), both forms run on the same random inputs. Loops get fuel so a program
+/// that doesn't terminate is skipped instead of hanging the test; the state
+/// machine counts every block, so it gets far more than the structured form.
+#[test]
+fn structured_control_flow_matches_the_state_machine() {
+    let gprs = [rax, rcx, rdx, rbx, rsi, rdi, r8, r9];
+    let gpr32 = [eax, ecx, edx, ebx, esi, edi, r8d, r9d];
+    let mut rng = Rng(0x5EED_0FC0_FFEE);
+    let mut lib = String::new();
+    let mut calls = String::new();
+    let (mut structured, mut machines) = (0, 0);
+    for p in 0..300 {
+        let n = 3 + rng.below(20) as usize;
+        let mut a = CodeAssembler::new(64).unwrap();
+        let mut labels: Vec<CodeLabel> = (0..n).map(|_| a.create_label()).collect();
+        for i in 0..n {
+            a.set_label(&mut labels[i]).unwrap();
+            let (r, s) = (gprs[rng.below(8) as usize], gprs[rng.below(8) as usize]);
+            let to = labels[rng.below(n as u64) as usize];
+            match rng.below(13) {
+                0 => a.mov(r, s).unwrap(),
+                1 => a.mov(r, rng.below(100)).unwrap(),
+                2 | 3 => a.sub(r, 1).unwrap(),
+                4 => a.add(r, s).unwrap(),
+                5 => a.xor(gpr32[rng.below(8) as usize], gpr32[rng.below(8) as usize]).unwrap(),
+                6 => a.lea(r, qword_ptr(s + r * 2 + 3)).unwrap(),
+                7 => { a.cmp(r, s).unwrap(); a.jl(to).unwrap() }
+                8 => { a.test(r, r).unwrap(); a.jne(to).unwrap() }
+                9 => { a.cmp(r, 7).unwrap(); a.jae(to).unwrap() }
+                10 => a.jmp(to).unwrap(),
+                11 => { a.test(r, s).unwrap(); a.je(to).unwrap() }
+                _ => a.ret().unwrap(),
+            }
+        }
+        a.ret().unwrap();
+        let code = a.assemble(common::BASE).unwrap();
+        let mut f = Function::with_capacity(64, 8);
+        if Lifter::new().lift(&code, common::BASE, &mut f).is_err() {
+            continue;
+        }
+        clean(&mut f);
+        let (mut st, mut sm) = (String::new(), String::new());
+        let stats = emit_function_with(&f, &format!("st{p}"), Mode::Fast, true, &|_| None, &mut st);
+        emit_function_with(&f, &format!("sm{p}"), Mode::Fast, false, &|_| None, &mut sm);
+        if stats.state_machines > 0 {
+            machines += 1;
+        } else if st.contains("loop {") || st.contains("if ") {
+            structured += 1;
+        }
+        let fuel = |src: String, n: u32| src.replace("loop {", &format!("loop {{ fuel!({n});"));
+        lib.push_str(&format!("// {code:02x?}\n{}{}", fuel(st, 1_000), fuel(sm, 1_000_000)));
+        let arity = sm_arity(&lib, p);
+        let args = (0..arity).map(|k| format!("x[{k}]")).collect::<Vec<_>>().join(", ");
+        calls.push_str(&format!(
+            "    for x in &inputs {{ FUEL.set(0); let a = catch(|| unsafe {{ st{p}({args}) }}); \
+             if a.is_none() {{ continue; }} FUEL.set(0); let b = catch(|| unsafe {{ sm{p}({args}) }}); \
+             assert_eq!(a, b, \"program {p} on {{x:?}}\"); compared += 1; }}\n"
+        ));
+    }
+    assert!(structured > 100, "only {structured} programs with control flow were structured");
+    assert!(machines > 0, "no irreducible program exercised the fallback");
+
+    let main = format!(
+        r#"{PRELUDE}
+use std::cell::Cell;
+thread_local! {{ static FUEL: Cell<u32> = Cell::new(0); }}
+macro_rules! fuel {{ ($n:expr) => {{ FUEL.set(FUEL.get() + 1); if FUEL.get() > $n {{ panic!("out of fuel"); }} }} }}
+fn catch(f: impl FnOnce() -> u64 + std::panic::UnwindSafe) -> Option<u64> {{ std::panic::catch_unwind(f).ok() }}
+{lib}
+fn main() {{
+    std::panic::set_hook(Box::new(|_| {{}}));
+    let mut s = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {{ s ^= s >> 12; s ^= s << 25; s ^= s >> 27; s.wrapping_mul(0x2545_F491_4F6C_DD1D) % 20 }};
+    let inputs: Vec<[u64; 16]> = (0..16).map(|_| std::array::from_fn(|_| next())).collect();
+    let mut compared = 0;
+{calls}    assert!(compared > 1500, "only {{compared}} runs terminated");
+    println!("{{compared}}");
+}}
+"#
+    );
+    let dir = scratch("structured");
+    rustc(&dir, "main.rs", &main, &["-O", "-o", dir.join("run").to_str().unwrap()]);
+    let out = Command::new(dir.join("run")).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    eprintln!("{structured} structured, {machines} state machines, {} runs compared", String::from_utf8_lossy(&out.stdout).trim());
+}
+
+/// Number of parameters of `sm{p}` in `src`.
+fn sm_arity(src: &str, p: usize) -> usize {
+    let head = format!("fn sm{p}(");
+    let start = src.find(&head).unwrap() + head.len();
+    let params = &src[start..start + src[start..].find(')').unwrap()];
+    if params.trim().is_empty() { 0 } else { params.split(", ").count() }
 }

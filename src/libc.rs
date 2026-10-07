@@ -115,3 +115,47 @@ pub fn lookup(name: &str) -> Option<Sig> {
         .find(|e| e.0 == name)
         .map(|&(_, args, ret, variadic)| Sig { args, ret, variadic, ..Default::default() })
 }
+
+/// Safe mode's summary of an allocator or deallocator, by name: `malloc` and
+/// friends return a new allocation (a `Box` when the caller uses it like one),
+/// `free` and friends consume their first argument. Other functions have none.
+pub fn summary(name: &str) -> Option<crate::borrow::Callee> {
+    use crate::borrow::{Callee, Pass};
+    let name = name.split('@').next().unwrap_or(name);
+    let alloc = |size: (u8, Option<u8>), args: usize| Some(Callee { args: vec![Pass::Ignore; args], alloc: Some(size), ret_from: 0 });
+    match name {
+        "malloc" | "_Znwm" | "_Znam" => alloc((0, None), 1),
+        "calloc" => alloc((0, Some(1)), 2),
+        "__rust_alloc" | "__rust_alloc_zeroed" => alloc((0, None), 2),
+        "free" | "_ZdlPv" | "_ZdaPv" | "_ZdlPvm" | "_ZdaPvm" | "__rust_dealloc" => {
+            let mut args = vec![Pass::Ignore; 3];
+            args[0] = Pass::Free;
+            Some(Callee { args, alloc: None, ret_from: 0 })
+        }
+        "memcpy" | "memmove" => Some(Callee {
+            args: vec![Pass::Access { write: true }, Pass::Access { write: false }, Pass::Ignore],
+            alloc: None,
+            ret_from: 1,
+        }),
+        "memset" => Some(Callee { args: vec![Pass::Access { write: true }, Pass::Ignore, Pass::Ignore], alloc: None, ret_from: 1 }),
+        _ => None,
+    }
+}
+
+/// C library functions safe mode writes as slice operations when their pointer
+/// arguments have safe roots.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Builtin {
+    /// `memcpy(dst, src, n)` / `memmove`: `copy_from_slice` or `copy_within`.
+    Copy,
+    /// `memset(dst, c, n)`: `fill`.
+    Fill,
+}
+
+pub fn builtin(name: &str) -> Option<Builtin> {
+    match name.split('@').next().unwrap_or(name) {
+        "memcpy" | "memmove" => Some(Builtin::Copy),
+        "memset" => Some(Builtin::Fill),
+        _ => None,
+    }
+}

@@ -20,7 +20,7 @@
 //! The input must be clean SSA (`opt::clean`), which is what the borrow analysis
 //! expects too.
 use crate::abi::{Sig, Site, STACK_ARG_BASE, SYSV_ARGS};
-use crate::borrow::{analyze, Class, ParamBorrow, RSP};
+use crate::borrow::{analyze_with, Analysis, Class, Ctx, Off, ParamBorrow, Pass, Root, RSP};
 use crate::cfg::Cfg;
 use crate::structure::{print, structure, Node, Source};
 use crate::ir::*;
@@ -64,7 +64,7 @@ enum ArgKind {
 }
 
 /// What a call site calls, as `program.rs` resolved it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CallInfo {
     /// The Rust path to call: a decompiled function's name, or `ffi::name` for an
     /// extern. `None` calls the callee value as a C function pointer.
@@ -75,6 +75,15 @@ pub struct CallInfo {
     pub ret2: bool,
     /// Calling it is an FFI call (`unsafe` in any mode).
     pub foreign: bool,
+    /// Safe mode: how the callee takes each argument (`Pass::Borrow`: a slice).
+    /// Missing arguments are integers.
+    pub args: Vec<Pass>,
+    /// Safe mode: it allocates `args[a]` (times `args[b]`) bytes, like `malloc`.
+    pub alloc: Option<(u8, Option<u8>)>,
+    /// Safe mode: it frees its first argument, like `free`.
+    pub free: bool,
+    /// Safe mode: it can be written as slice operations (`memcpy`, `memset`).
+    pub builtin: Option<crate::libc::Builtin>,
 }
 
 /// The whole-program context a function is emitted in (`program.rs`).
@@ -92,6 +101,22 @@ pub struct Env<'a> {
     /// Rust expression for a constant address that points into the binary's data
     /// (the address of a `static`), or `None` to keep the raw address.
     pub global_of: &'a dyn Fn(u64) -> Option<String>,
+    /// Safe mode: the read-only `Bytes` static containing an address, which
+    /// reads can index as a slice; `None` keeps reads through it raw.
+    pub global_slice: &'a dyn Fn(u64) -> Option<String>,
+    /// Safe mode: the borrow analysis, if the caller ran it with call summaries
+    /// (`program.rs`); otherwise it runs here, knowing nothing about calls.
+    pub analysis: Option<&'a Analysis>,
+}
+
+/// Where safe-mode code indexes a root's bytes.
+struct Place {
+    /// The slice to read: `rdi_ref`, `frame.0`, `heap12`, `NAME.b`.
+    read: String,
+    /// The slice to write, if it can be written.
+    write: Option<String>,
+    /// The root's address, as a `u64`.
+    base: String,
 }
 
 struct Emitter<'a> {
@@ -105,7 +130,9 @@ struct Emitter<'a> {
     /// Try structured control flow before the state machine.
     structure: bool,
     /// Borrow analysis (safe mode only).
-    borrow: Option<crate::borrow::Analysis>,
+    borrow: Option<&'a Analysis>,
+    /// How each root of the analysis is indexed, if it is safe.
+    places: Vec<Option<Place>>,
     args: Vec<ArgKind>,
     /// Entry parameter index of each value, if it is one.
     entry_param: Vec<Option<usize>>,
@@ -159,7 +186,8 @@ pub fn emit_function_with(
 ) -> EmitStats {
     let _ = name_of;
     let call = |_: Site| None;
-    emit_function_in(f, name, mode, &Env { sig: None, call: &call, demote: false, structure, global_of }, out)
+    let env = Env { sig: None, call: &call, demote: false, structure, global_of, global_slice: &|_| None, analysis: None };
+    emit_function_in(f, name, mode, &env, out)
 }
 
 /// Emit `f` as a Rust function named `name`, with its signature and callees from
@@ -172,11 +200,20 @@ pub fn emit_function_in(f: &Function, name: &str, mode: Mode, env: &Env, out: &m
         entry_param[p.index()] = Some(k);
     }
 
-    let borrow = (mode == Mode::Safe).then(|| analyze(f));
+    let owned;
+    let borrow = match (mode, env.analysis) {
+        (Mode::Fast, _) => None,
+        (Mode::Safe, Some(a)) => Some(a),
+        (Mode::Safe, None) => {
+            let global_ok = |c: u64| (env.global_slice)(c).is_some();
+            owned = analyze_with(f, &Ctx { callee: &|_| None, demoted: &|_| false, global_ok: &global_ok });
+            Some(&owned)
+        }
+    };
     let args = entry_params
         .iter()
         .enumerate()
-        .map(|(k, _)| match &borrow {
+        .map(|(k, _)| match borrow {
             Some(a) if !env.demote => arg_kind(&a.params[k]),
             _ => ArgKind::Int,
         })
@@ -190,6 +227,7 @@ pub fn emit_function_in(f: &Function, name: &str, mode: Mode, env: &Env, out: &m
         skip: callee_only(f, &cfg, env.call),
         structure: env.structure,
         borrow,
+        places: Vec::new(),
         args,
         entry_param,
         hoisted: hoisted(f, &cfg),
@@ -198,6 +236,7 @@ pub fn emit_function_in(f: &Function, name: &str, mode: Mode, env: &Env, out: &m
         stats: EmitStats::default(),
     };
 
+    e.places = e.places(env.global_slice);
     let mut body = String::new();
     e.body(&cfg, &mut body);
     e.signature(name, out);
@@ -301,6 +340,11 @@ fn callee_only(f: &Function, cfg: &Cfg, call: &dyn Fn(Site) -> Option<CallInfo>)
         }
     }
     skip
+}
+
+/// Every value a terminator uses.
+pub fn term_operands(f: &Function, t: Terminator, cb: impl FnMut(ValueId)) {
+    term_uses(f, t, cb)
 }
 
 fn term_uses(f: &Function, t: Terminator, mut cb: impl FnMut(ValueId)) {
@@ -442,10 +486,28 @@ impl Emitter<'_> {
         // The stack frame (`frame.rs`): u128s, so it is 16-byte aligned like a real one.
         if let Some((_, l)) = f.locals.iter().next() {
             let n = (l.size as usize).div_ceil(16);
-            if n * 16 <= 4096 {
+            if self.frame_safe() {
+                // bytes, so that safe code can index them; aligned like a real frame
+                if n * 16 <= 4096 {
+                    let _ = writeln!(out, "    #[repr(C, align(16))]\n    struct Frame([u8; {}]);", n * 16);
+                    let _ = writeln!(out, "    let mut frame = Frame([0; {}]);", n * 16);
+                } else {
+                    let _ = writeln!(out, "    struct Frame(Vec<u8>);\n    let mut frame = Frame(vec![0; {}]);", n * 16);
+                }
+                let _ = writeln!(out, "    let frame_base: u64 = frame.0.as_ptr() as u64;");
+            } else if n * 16 <= 4096 {
                 let _ = writeln!(out, "    let mut frame = [0u128; {n}];");
             } else {
                 let _ = writeln!(out, "    let mut frame = vec![0u128; {n}];");
+            }
+        }
+        // Allocations that are `Box`es.
+        if let Some(a) = self.borrow {
+            for (r, root) in a.roots.iter().enumerate() {
+                if let (Root::Alloc(id), Some(Some(_))) = (root, self.places.get(r)) {
+                    let h = format!("heap{}", id.index());
+                    let _ = writeln!(out, "    let mut {h}: Box<[u8]> = Box::default();\n    let mut {h}_base: u64 = 0;");
+                }
             }
         }
         // Up-front declarations for block params and cross-block values.
@@ -623,7 +685,43 @@ impl Emitter<'_> {
                 let v = fields.get(&f.value_pool);
                 format!("({} as u64, {} as u64)", n(v[0]), n(v[1]))
             }
+            AddrOfLocal(_) if self.frame_safe() => "frame_base".to_string(),
             AddrOfLocal(_) => "frame.as_mut_ptr() as u64".to_string(),
+            Call { args, .. } if self.boxed_alloc(id).is_some() => {
+                // `malloc` of an allocation that is used, then freed or dropped, like a Box
+                let h = self.boxed_alloc(id).unwrap();
+                let (a, b) = (self.call)(Site::Call(id)).and_then(|c| c.alloc).unwrap_or((0, None));
+                let args = args.get(&f.value_pool);
+                let mut len = format!("({} as usize)", n(args[a as usize]));
+                if let Some(b) = b {
+                    len = format!("{len}.wrapping_mul({} as usize)", n(args[b as usize]));
+                }
+                format!("{{ {h} = vec![0u8; {len}].into_boxed_slice(); {h}_base = {h}.as_ptr() as u64; {h}_base }}")
+            }
+            Call { args, .. } if self.builtin(id).is_some() => {
+                let (b, ps) = self.builtin(id).unwrap();
+                let a = args.get(&f.value_pool);
+                let off = |k: usize| format!("{}.wrapping_sub({}) as usize", n(a[k]), ps[k].base);
+                let len = format!("{} as usize", n(a[2]));
+                let dst = ps[0].write.clone().unwrap();
+                let e = match b {
+                    crate::libc::Builtin::Fill => format!("{dst}[{}..][..{len}].fill({} as u8)", off(0), n(a[1])),
+                    crate::libc::Builtin::Copy if ps[0].read == ps[1].read => {
+                        format!("let __s = {}; {dst}.copy_within(__s..__s + ({len}), {})", off(1), off(0))
+                    }
+                    crate::libc::Builtin::Copy => {
+                        format!("{dst}[{}..][..{len}].copy_from_slice(&{}[{}..][..{len}])", off(0), ps[1].read, off(1))
+                    }
+                };
+                if !self.used[id.index()] {
+                    return Stmt::Effect(format!("{{ {e}; }}"));
+                }
+                format!("{{ {e}; {} }}", n(a[0]))
+            }
+            Call { args, .. } if self.boxed_free(id).is_some() => {
+                let _ = args;
+                return Stmt::Effect(format!("{} = Box::default()", self.boxed_free(id).unwrap()));
+            }
             Call { callee, args } => {
                 let (call, ret, ret2) = self.call_expr(Site::Call(id), callee, args);
                 if ret2 {
@@ -725,7 +823,11 @@ impl Emitter<'_> {
         let a: Vec<String> = args.iter().map(|&v| format!("{} as u64", self.name(v))).collect();
         let a = a.join(", ");
         match (self.call)(site) {
-            Some(CallInfo { path: Some(p), ret, ret2, foreign }) => {
+            Some(CallInfo { path: Some(p), ret, ret2, foreign: false, args: pass, .. }) if pass.iter().any(|x| matches!(x, Pass::Borrow { .. })) => {
+                let (lets, a) = self.call_args(args, &pass);
+                (format!("unsafe {{ {lets}{p}({}) }}", a.join(", ")), ret, ret2)
+            }
+            Some(CallInfo { path: Some(p), ret, ret2, foreign, .. }) => {
                 if foreign {
                     self.stats.raw += 1;
                 }
@@ -775,35 +877,62 @@ impl Emitter<'_> {
         }
     }
 
-    /// The safe-mode slice an access through `ptr` can use: the argument's name,
-    /// if `ptr` derives from exactly one slice argument.
-    fn slice_root(&self, ptr: ValueId, write: bool) -> Option<(String, ArgKind)> {
-        let a = self.borrow.as_ref()?;
-        let o = a.origin[ptr.index()];
-        if o.roots.count_ones() != 1 {
-            return None;
-        }
-        let k = o.roots.trailing_zeros() as usize;
-        let kind = self.args[k];
-        match kind {
-            ArgKind::Slice { mutbl, .. } if mutbl || !write => {
-                let p = self.f.blocks[self.f.entry].params.get(&self.f.value_pool)[k];
-                Some((self.name(p), kind))
-            }
-            _ => None,
+    /// How safe-mode code reaches each safe root of the borrow analysis.
+    fn places(&self, global_slice: &dyn Fn(u64) -> Option<String>) -> Vec<Option<Place>> {
+        let Some(a) = self.borrow else { return Vec::new() };
+        let params = self.f.blocks[self.f.entry].params.get(&self.f.value_pool);
+        a.roots
+            .iter()
+            .enumerate()
+            .map(|(r, &root)| {
+                if !a.safe[r] {
+                    return None;
+                }
+                Some(match root {
+                    Root::Param(k) => {
+                        let ArgKind::Slice { mutbl, nullable } = self.args[k as usize] else { return None };
+                        let n = self.name(params[k as usize]);
+                        let read = match (nullable, mutbl) {
+                            (false, _) => format!("{n}_ref"),
+                            (true, false) => format!("{n}_ref.unwrap()"),
+                            (true, true) => format!("{n}_ref.as_deref().unwrap()"),
+                        };
+                        let write = match nullable {
+                            false => format!("{n}_ref"),
+                            true => format!("{n}_ref.as_deref_mut().unwrap()"),
+                        };
+                        Place { read, write: mutbl.then_some(write), base: format!("{n}_base") }
+                    }
+                    Root::Frame => Place { read: "frame.0".into(), write: Some("frame.0".into()), base: "frame_base".into() },
+                    Root::Global(c) => {
+                        let g = global_slice(c)?;
+                        Place { read: format!("{g}.b"), write: None, base: format!("(core::ptr::addr_of!({g}) as u64)") }
+                    }
+                    Root::Alloc(id) => {
+                        let h = format!("heap{}", id.index());
+                        Place { read: h.clone(), write: Some(h.clone()), base: format!("{h}_base") }
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// The place an access through `ptr` can bounds-check against, if `ptr`
+    /// derives from exactly one safe root (that can be written, for a store).
+    fn slice_root(&self, ptr: ValueId, write: bool) -> Option<(String, String)> {
+        let r = self.borrow?.safe_root(ptr)?;
+        let p = self.places.get(r as usize)?.as_ref()?;
+        match write {
+            false => Some((p.read.clone(), p.base.clone())),
+            true => Some((p.write.clone()?, p.base.clone())),
         }
     }
 
     fn load(&mut self, ptr: ValueId, ty: TyId) -> String {
         let (t, len, p) = (rty(ty), bytes(ty), self.name(ptr));
-        if let Some((root, ArgKind::Slice { nullable, mutbl })) = self.slice_root(ptr, false) {
+        if let Some((s, base)) = self.slice_root(ptr, false) {
             self.stats.checked += 1;
-            let s = match (nullable, mutbl) {
-                (false, _) => format!("{root}_ref"),
-                (true, false) => format!("{root}_ref.unwrap()"),
-                (true, true) => format!("{root}_ref.as_deref().unwrap()"),
-            };
-            return format!("{t}::from_le_bytes({s}[{p}.wrapping_sub({root}_base) as usize..][..{len}].try_into().unwrap())");
+            return format!("{t}::from_le_bytes({s}[{p}.wrapping_sub({base}) as usize..][..{len}].try_into().unwrap())");
         }
         self.stats.raw += 1;
         self.stats.raw_by[bucket(self.src[ptr.index()])] += 1;
@@ -813,14 +942,135 @@ impl Emitter<'_> {
     fn store(&mut self, ptr: ValueId, val: ValueId) -> String {
         let vt = self.ty(val);
         let (t, len, p, v) = (rty(vt), bytes(vt), self.name(ptr), self.name(val));
-        if let Some((root, ArgKind::Slice { nullable, .. })) = self.slice_root(ptr, true) {
+        if let Some((s, base)) = self.slice_root(ptr, true) {
             self.stats.checked += 1;
-            let s = if nullable { format!("{root}_ref.as_deref_mut().unwrap()") } else { format!("{root}_ref") };
-            return format!("{s}[{p}.wrapping_sub({root}_base) as usize..][..{len}].copy_from_slice(&{v}.to_le_bytes())");
+            return format!("{s}[{p}.wrapping_sub({base}) as usize..][..{len}].copy_from_slice(&{v}.to_le_bytes())");
         }
         self.stats.raw += 1;
         self.stats.raw_by[bucket(self.src[ptr.index()])] += 1;
         format!("unsafe {{ ({p} as *mut {t}).write_unaligned({v}) }}")
+    }
+
+    /// The frame is a safe root: an array of bytes that accesses index.
+    fn frame_safe(&self) -> bool {
+        self.borrow
+            .and_then(|a| a.roots.iter().position(|&r| r == Root::Frame).map(|r| self.places.get(r).is_some_and(|p| p.is_some())))
+            .unwrap_or(false)
+    }
+
+    /// A call to `memcpy` or `memset` whose pointers all have safe roots: what it
+    /// does, and the places of its arguments (`dst`, `src`).
+    fn builtin(&self, call: ValueId) -> Option<(crate::libc::Builtin, Vec<&Place>)> {
+        let a = self.borrow?;
+        let b = (self.call)(Site::Call(call))?.builtin?;
+        if a.raw_calls.contains(&Site::Call(call)) {
+            return None;
+        }
+        let InstKind::Call { args, .. } = self.f.insts[call].kind else { return None };
+        let args = args.get(&self.f.value_pool);
+        let ptrs = if b == crate::libc::Builtin::Copy { 2 } else { 1 };
+        if args.len() < 3 {
+            return None;
+        }
+        let mut ps = Vec::new();
+        for &p in &args[..ptrs] {
+            ps.push(self.places.get(a.safe_root(p)? as usize)?.as_ref()?);
+        }
+        ps[0].write.as_ref()?;
+        Some((b, ps))
+    }
+
+    /// The `Box` this `free` call drops, if its argument is one.
+    fn boxed_free(&self, call: ValueId) -> Option<String> {
+        if !(self.call)(Site::Call(call)).is_some_and(|c| c.free) {
+            return None;
+        }
+        let InstKind::Call { args, .. } = self.f.insts[call].kind else { return None };
+        let &p = args.get(&self.f.value_pool).first()?;
+        let a = self.borrow?;
+        let r = a.safe_root(p)?;
+        match a.roots[r as usize] {
+            Root::Alloc(_) => self.places.get(r as usize)?.as_ref().map(|p| p.read.clone()),
+            _ => None,
+        }
+    }
+
+    /// The safe root of the allocation this call makes, if it is a `Box`.
+    fn boxed_alloc(&self, call: ValueId) -> Option<String> {
+        let a = self.borrow?;
+        let r = a.roots.iter().position(|&x| x == Root::Alloc(call))?;
+        self.places.get(r)?.as_ref().map(|p| p.read.clone())
+    }
+
+    /// Safe-mode arguments for a call to a decompiled function: slices for the
+    /// arguments it borrows, reborrowed from the root each one points into. Two
+    /// borrows of one root, one of them mutable, start at different known offsets
+    /// (the borrow analysis downgrades the others); they are split apart with
+    /// `split_at_mut`. Returns the statements that do the splitting, and the
+    /// argument expressions.
+    fn call_args(&mut self, args: &[ValueId], pass: &[Pass]) -> (String, Vec<String>) {
+        let mut out: Vec<String> = args.iter().map(|&v| format!("{} as u64", self.name(v))).collect();
+        let mut lets = String::new();
+        let Some(a) = self.borrow else { return (lets, out) };
+        // (root, argument) for every borrowed argument that points into a root
+        let mut groups: Vec<(u8, Vec<usize>)> = Vec::new();
+        for (k, &v) in args.iter().enumerate() {
+            let Some(&Pass::Borrow { nullable, .. }) = pass.get(k) else { continue };
+            match self.borrow.and_then(|a| a.safe_root(v)) {
+                Some(r) if self.places.get(r as usize).is_some_and(|p| p.is_some()) => {
+                    match groups.iter_mut().find(|g| g.0 == r) {
+                        Some(g) => g.1.push(k),
+                        None => groups.push((r, vec![k])),
+                    }
+                }
+                _ if nullable && self.borrow.is_some_and(|a| a.origin[v.index()].is_none()) => out[k] = "None".into(),
+                _ => {
+                    self.stats.todo += 1;
+                    out[k] = "todo!(\"a slice the borrow analysis couldn't prove\")".into();
+                }
+            }
+        }
+        for (r, mut ks) in groups {
+            let place = self.places[r as usize].as_ref().unwrap();
+            let mutbl = |k: usize| matches!(pass[k], Pass::Borrow { mutbl: true, .. });
+            let nullable = |k: usize| matches!(pass[k], Pass::Borrow { nullable: true, .. });
+            let off = |k: usize| self.name(args[k]);
+            let mut exprs: Vec<(usize, String)> = Vec::new();
+            if ks.len() == 1 || !ks.iter().any(|&k| mutbl(k)) {
+                for &k in &ks {
+                    let v = off(k);
+                    let e = match (mutbl(k), &place.write) {
+                        (true, Some(w)) => format!("&mut {w}[{v}.wrapping_sub({}) as usize..]", place.base),
+                        (true, None) => "todo!(\"a mutable borrow of a read-only root\")".to_string(),
+                        (false, _) => format!("&{}[{v}.wrapping_sub({}) as usize..]", place.read, place.base),
+                    };
+                    exprs.push((k, e));
+                }
+            } else {
+                // distinct known offsets, in order
+                let at = |k: usize| match a.origin[args[k].index()].off {
+                    Off::Known(x) => x,
+                    Off::Unknown => i64::MAX,
+                };
+                ks.sort_by_key(|&k| at(k));
+                let w = place.write.clone().unwrap_or_default();
+                let _ = write!(lets, "let __s = &mut {w}[{}.wrapping_sub({}) as usize..]; ", off(ks[0]), place.base);
+                for i in 0..ks.len() {
+                    let name = format!("__s{r}_{i}");
+                    if i + 1 < ks.len() {
+                        let _ = write!(lets, "let ({name}, __s) = __s.split_at_mut({}.wrapping_sub({}) as usize); ", off(ks[i + 1]), off(ks[i]));
+                    } else {
+                        let _ = write!(lets, "let {name} = __s; ");
+                    }
+                    let k = ks[i];
+                    exprs.push((k, if mutbl(k) { format!("&mut *{name}") } else { format!("&*{name}") }));
+                }
+            }
+            for (k, e) in exprs {
+                out[k] = if nullable(k) { format!("if {} == 0 {{ None }} else {{ Some({e}) }}", off(k)) } else { e };
+            }
+        }
+        (lets, out)
     }
 }
 

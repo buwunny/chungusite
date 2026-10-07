@@ -122,6 +122,34 @@ impl<'b, 'a> Globals<'b, 'a> {
         })
     }
 
+    /// The static holding `addr`, if safe code can read it as a slice: a
+    /// read-only item emitted as `Bytes<N>` (no pointer slots in it).
+    pub fn slice(&self, addr: u64) -> Option<String> {
+        let item = self.item_at(addr)?;
+        let sec = &self.bin.data[item.section];
+        let words = self.bin.pointers.range(item.start..item.start + item.len).next().is_some();
+        (!sec.writable && !words).then(|| self.ident(&item))
+    }
+
+    /// Is `item` emitted as `Words` (it holds pointer slots), not `Bytes`?
+    fn words(&self, item: &Item) -> bool {
+        let end = item.start + item.len;
+        let mut slots = self.bin.pointers.range(item.start..end).peekable();
+        slots.peek().is_some() && item.start.is_multiple_of(8) && slots.all(|(&a, _)| a.is_multiple_of(8) && a + 8 <= end)
+    }
+
+    /// `item`'s static with the right name and type but zero contents, which
+    /// rustc checks much faster than the real initializer (`--check`).
+    pub fn emit_static_stub(&self, item: &Item, out: &mut String) {
+        let m = if self.bin.data[item.section].writable { "mut " } else { "" };
+        let name = self.ident(item);
+        let n = item.len;
+        let _ = match self.words(item) {
+            true => writeln!(out, "pub static {m}{name}: Words<{k}> = Words {{ w: [Word {{ b: [0; 8] }}; {k}] }};", k = n.div_ceil(8)),
+            false => writeln!(out, "pub static {m}{name}: Bytes<{n}> = Bytes {{ b: [0; {n}] }};"),
+        };
+    }
+
     /// A raw pointer to `item`'s static.
     fn addr_of(&self, item: &Item) -> String {
         let name = self.ident(item);
@@ -176,8 +204,7 @@ impl<'b, 'a> Globals<'b, 'a> {
         let m = if sec.writable { "mut " } else { "" };
         let end = item.start + n;
         let slots: Vec<(u64, u64)> = self.bin.pointers.range(item.start..end).map(|(&a, &t)| (a, t)).collect();
-        let words = !slots.is_empty() && item.start.is_multiple_of(8) && slots.iter().all(|&(a, _)| a.is_multiple_of(8) && a + 8 <= end);
-        if !words {
+        if !self.words(item) {
             let init = match bytes {
                 Some(b) if b.iter().any(|&c| c != 0) => byte_string(b),
                 _ => format!("[0; {n}]"),

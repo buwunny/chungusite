@@ -53,7 +53,32 @@ pub fn maybe_count(rdi_ref: Option<&[u8]>) -> u64 {
 
 Each function header says how many of its accesses are checked. Byte slices are a stopgap until struct recovery can name the pointee type and turn these into `&S` with real fields.
 
-Control flow is emitted as-is. A single-block function is straight-line code. Anything with branches becomes a `loop { match bb { ... } }` state machine with block parameters as mutable variables, which is correct for any CFG but not pretty.
+Control flow is structured ([`src/structure.rs`](../src/structure.rs)): branches become `if`/`else`, loops become `loop` with `break`, `continue` and early `return`, and block parameters become mutable variables assigned on each edge. A loop's exits are emitted after it, so leaving it is a `break`:
+
+```rust
+pub unsafe fn find(mut rdi: u64, mut rsi: u64, mut rdx: u64) -> u64 {
+    let mut v2: u64 = 0;
+    ...
+    v2 = v1;
+    loop {
+        let v4: bool = v2 >= rsi; // 0x5
+        if v4 {
+            break;
+        }
+        let v7: u64 = rdi.wrapping_add(v2.wrapping_mul(8)); // 0x7
+        let v8: u64 = unsafe { (v7 as *const u64).read_unaligned() }; // 0x7
+        let v10: bool = v8 == rdx; // 0xe
+        if v10 {
+            break;
+        }
+        ...
+        v2 = v13;
+    }
+    return v2 as u64;
+}
+```
+
+Where the nesting needs it (two paths into the same `else`, as in `if a || b`), a labeled block (`'b7: { .. break 'b7; .. }`) stands in. A function whose CFG is irreducible (a cycle with two entries) has no such nesting and stays a `loop { match bb { ... } }` state machine; the summary on stderr counts those.
 
 Every statement ends with the address of the instruction it came from.
 
@@ -63,4 +88,5 @@ Every statement ends with the address of the instruction it came from.
 
 - the `sum` loop from `tests/common`, in both modes, linked into a program that runs it and checks the results, including that safe mode panics on a too-short slice;
 - 400 random programs built from supported instructions, in both modes, which must all type-check;
+- 300 random register-only programs emitted both structured and as the state machine, run on the same random inputs, which must return the same values (programs that don't terminate run out of fuel and are skipped);
 - the real binary on a small ELF built in the test: `--list`, both modes, `-f`, `--emit ir` and the exit codes.

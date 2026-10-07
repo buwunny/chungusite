@@ -116,6 +116,16 @@ fn main() -> ExitCode {
     }
 }
 
+/// The input file, mapped rather than read: only the pages the decompiler
+/// touches (headers, symbols, the code it lifts, the data it emits) are loaded.
+fn map(path: &std::path::Path) -> std::io::Result<memmap2::Mmap> {
+    let file = std::fs::File::open(path)?;
+    // Safety: the map is read-only and lives until the end of `run`. If another
+    // process truncates the file meanwhile, reads fault; that is the usual
+    // trade-off of mapping input files, and the same as most binary tools make.
+    unsafe { memmap2::Mmap::map(&file) }
+}
+
 fn run(cli: &Cli) -> Result<ExitCode, String> {
     if let Some(n) = cli.jobs {
         rayon::ThreadPoolBuilder::new().num_threads(n).build_global().map_err(|e| e.to_string())?;
@@ -128,13 +138,13 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     let (all, funcs, source, bin): (Vec<FuncBytes>, Vec<FuncBytes>, String, Option<&Binary>) = match (&cli.hex, &cli.input) {
         (Some(h), _) => {
             hex_bytes = parse_hex(h)?;
-            data = Vec::new();
+            data = None;
             let f = || FuncBytes { name: "func".into(), demangled: None, addr: 0x1000, bytes: &hex_bytes };
             (vec![f()], vec![f()], "hex input".into(), None)
         }
         (None, Some(path)) => {
-            data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-            bin = Binary::parse(&data).map_err(|e| format!("{}: {e}", path.display()))?;
+            data = Some(map(path).map_err(|e| format!("{}: {e}", path.display()))?);
+            bin = Binary::parse(data.as_deref().unwrap()).map_err(|e| format!("{}: {e}", path.display()))?;
             let all = bin.funcs.iter().map(copy).collect();
             (all, select(&bin, cli)?, path.display().to_string(), Some(&bin))
         }
@@ -152,11 +162,6 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     // so they (and the output) don't depend on scheduling.
     let mut used = HashSet::new();
     let idents: Vec<String> = funcs.iter().map(|f| rust_ident(f.pretty(), f.addr, &mut used)).collect();
-    // Function pointers in data are named by their identifier in the output.
-    let by_addr: HashMap<u64, &str> = funcs.iter().zip(&idents).map(|(f, i)| (f.addr, i.as_str())).collect();
-    let globals = bin.filter(|_| rust).map(|b| Globals::new(b, used, &by_addr));
-    let global_of = |addr: u64| globals.as_ref().and_then(|g| g.expr(addr));
-
     // Lift everything, recover signatures, and emit, in parallel (`program.rs`).
     // A selected function is one of `all` (by address) or bytes of its own (--size).
     let mut inputs: Vec<Input> = all
@@ -177,8 +182,19 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             }
         }
     }
-    let file = bin.map(|_| &data[..]);
+    let file = data.as_deref();
     let program = Program::build(inputs, file, cli.emit == Emit::RawIr);
+    // Function pointers in data are named by their identifier in the output; a
+    // function --skip-failed leaves out keeps its slot's bytes from the file.
+    let by_addr: HashMap<u64, &str> = funcs
+        .iter()
+        .zip(&idents)
+        .zip(&index)
+        .filter(|(_, &i)| !cli.skip_failed || program.funcs[i].ir.is_ok())
+        .map(|((f, id), _)| (f.addr, id.as_str()))
+        .collect();
+    let globals = bin.filter(|_| rust).map(|b| Globals::new(b, used, &by_addr));
+    let global_of = |addr: u64| globals.as_ref().and_then(|g| g.expr(addr));
     let emitted = if rust { program.emit_all(mode, &global_of) } else { Vec::new() };
 
     let mut out = String::new();

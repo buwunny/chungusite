@@ -43,6 +43,10 @@ Variables are SSA values (`vN`), not registers. `rax` holds unrelated things at 
 - A run of punctuation is a single piece, so `);` is never `)` followed by `;`.
 - `TokenCache::from_tokenizer_file` switches off any truncation or padding saved in `tokenizer.json`, because a saved limit would otherwise be applied to each piece. The fixture's tokenizer has one: left truncation at 192 tokens.
 
+## Where it plugs in
+
+Type and name predictions go through `types::TypeModel` ([types.md](types.md#proposals-debug-info-and-models)). A model implements `propose`, which turns `to_ids(func.ir, ..)` and `Refiner::classify` into a `Proposal`: a C type and a name per argument, and a return type. It is passed to `Program::build_with` as `TypeOptions { model: Some(&m), .. }`. Its proposals are checked against the code like DWARF's: an integer type must cover the bits the code uses, and a struct must have a field wherever the code reads or writes. Debug info, when present, is asked first. `tests/types.rs` uses a fixed stand-in model to test accepting and rejecting.
+
 ## Tests
 
 - `tests/refine_exact.rs` (with `--features ml`) checks that cached ids equal `tokenizer.encode(full_text)` for 1,500 random lifted programs. Run the same check whenever you change the serializer or swap tokenizers.

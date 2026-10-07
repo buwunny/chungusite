@@ -1,8 +1,8 @@
 # What's left for a working decompiler
 
-The pipeline runs end to end today: `chungusite <binary>` reads an ELF, Mach-O or PE file, lifts each function, cleans the SSA, and emits Rust that compiles in both modes ([cli.md](cli.md)). What limits it is coverage. On chungusite's own debug build (11,600 functions), 10,600 lift (up from 1,920 before the lifter learned calls, the stack, conditional moves and memory operands), and the output for all of them type-checks. Calls are real calls with recovered signatures, and stack slots are local variables (steps 2 and 3), which removed about half of all raw memory accesses: 101,454 remain in fast mode, and in safe mode 10,666 of 101,454 accesses come out bounds-checked. Lifting, signature inference and emission run in parallel (`-j`); the whole binary takes about 1 s on 4 cores.
+The pipeline runs end to end today: `chungusite <binary>` reads an ELF, Mach-O or PE file, lifts each function, cleans the SSA, and emits Rust that compiles in both modes ([cli.md](cli.md)). What limits it is coverage. On chungusite's own debug build (11,600 functions), 10,600 lift (up from 1,920 before the lifter learned calls, the stack, conditional moves and memory operands), and the output for all of them type-checks. Calls are real calls with recovered signatures, and stack slots are local variables (steps 2 and 3), which removed about half of all raw memory accesses: 101,454 remain in fast mode, and in safe mode 10,666 of 101,454 accesses come out bounds-checked. Lifting, signature inference and emission run in parallel (`-j`); the whole binary takes about 1 s on 4 cores. Arguments and return values have real types (step 5): integers as narrow as the code uses them, and pointers to recovered structs and arrays, from DWARF when the binary has it.
 
-The ML refinement layer (`src/refine`, behind the `ml` feature; see docs/ml-runtime.md) is left out of this list on purpose. It plugs in at step 5 and is optional: everything below works without it. The CLI does not call it yet; wiring it in is a `--refine` flag that runs after safe mode, once the models are trained.
+The ML refinement layer (`src/refine`, behind the `ml` feature; see docs/ml-runtime.md) is left out of this list on purpose. It plugs in at step 5, as a `types::TypeModel` whose proposals the code accepts or rejects ([types.md](types.md#proposals-debug-info-and-models)), and is optional: everything below works without it. The CLI does not call it yet; wiring it in is a `--refine` flag that passes the model to `Program::build_with`, once the models are trained.
 
 `chungusite <binary> --list` prints failures grouped by cause, which is the lifter's to-do list. The order below follows that table.
 
@@ -41,12 +41,18 @@ Done: `src/structure.rs` turns every reducible CFG into `if`/`else`, `loop` with
 - `while cond { .. }`: the condition is computed in statements before the `if`, so loops print as `loop { let c = ..; if !c { break; } .. }`. Inlining single-use pure values into their use would fix this and shorten most code.
 - Irreducible regions are handled per function, not per region: one bad cycle turns the whole function back into a state machine.
 
-## 5. Types
+## 5. Types (done, see [types.md](types.md))
 
-- Structs from the per-argument field facts (`ParamBorrow::fields`, `indexed`). This turns safe mode's `&[u8]` plus byte offsets into `&S` with named fields, and indexed access into `&[T]`.
-- Value widths and signedness from how values are used (signed compares, `SAR`, `MOVSX`), instead of `u64` everywhere.
-- Pointers versus integers, so pointer values stop being `u64`.
-- This is where the ML type and naming model plugs in: it proposes, and the facts above accept or reject.
+`src/types.rs` gathers facts from the code (demanded bits, zero-extended returns, signedness votes from signed compares, `SAR`, `IDIV` and `MOVSX`, and accesses through each argument) and infers:
+
+- narrow argument and return types (`fn clamp(edi: i32, esi: i32, edx: i32) -> i32`), and the signedness of every value;
+- structs from the per-argument accesses: safe mode's `&[u8]` plus byte offsets becomes `&S` with fields (`r.count`), indexed access becomes `&[T]`, and fast mode takes `*mut S`.
+
+Debug info (`src/dwarf.rs`) and the ML type and naming model plug in as a `TypeModel`: they propose C types and names, and the facts accept or reject each proposal. With DWARF, structs and arguments get their source names. On chungusite's own debug build, 7,227 of the 7,460 arguments that safe mode took as byte slices are now `&S`, `&T` or `&[T]`. Still open:
+
+- Pointers versus integers *inside* function bodies: only arguments get pointer types, local pointers stay `u64`.
+- Pointers loaded from memory (`p->next->count`) and arrays of structs (`items[i].x`).
+- Interprocedural narrowing: callers passing their argument types down, callees passing demanded bits up.
 
 ## 6. Globals and data
 

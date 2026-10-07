@@ -11,6 +11,7 @@ chungusite ./prog --addr 0x401136 --size 0x40   # no symbol there: lift exactly 
 chungusite ./prog --list                   # which functions lift, and why the others don't
 chungusite --hex "48 8b 47 08 c3"          # raw bytes, loaded at 0x1000, no file needed
 chungusite ./prog -j 1                     # one worker thread (default: one per CPU)
+chungusite ./prog --no-debug-info          # ignore DWARF: types only from the code
 ```
 
 Input is any x86_64 ELF, Mach-O or PE file (`object` crate). Functions come from the symbol table. A stripped binary (no function in the static symbol table) works the same way: functions are discovered instead (`src/discover.rs`), see [Stripped binaries](#stripped-binaries). `--addr` with `--size` lifts bytes that nothing finds.
@@ -27,6 +28,7 @@ Functions are lifted, cleaned and emitted in parallel with `rayon`, one `Lifter`
 | `ir` | cleaned SSA IR, which is what the emitter sees |
 | `raw-ir` | IR straight from the lifter, before `opt::clean` |
 | `borrows` | safe mode's verdict for each argument (`&T`, `Option<&mut T>`, raw...) |
+| `types` | each argument's and the return value's recovered type, and which debug-info proposals were rejected and why ([types.md](types.md)) |
 
 A summary goes to stderr: how many functions lifted, how many memory accesses are bounds-checked versus raw, and the failures grouped by cause, most common first. That table is the to-do list for the lifter. The exit code is 0 if every selected function lifted, 1 if some did not, and 2 for usage or file errors.
 
@@ -34,29 +36,40 @@ A function that fails to lift still appears in the output as a stub whose body i
 
 ## What the Rust looks like
 
-The emitter is [`src/emit.rs`](../src/emit.rs). Every IR value is a Rust integer (`u8`..`u64`, or `bool` for comparisons), and pointers are `u64` addresses. That way the output type-checks however the binary mixes pointers and integers. Signatures are recovered for the whole program at once ([calls.md](calls.md)): arguments are named after the registers they arrive in, in System V order (`rdi, rsi, rdx, rcx, r8, r9`, then `arg6`, `arg7`, ... from the stack), and a function returns `u64`, `(u64, u64)` (rax:rdx) or nothing. Calls to other decompiled functions use their names, and everything else they call is declared in a `mod ffi` at the top of the file. Stack slots become `let` bindings; a function that takes the address of one keeps a `frame` array.
+The emitter is [`src/emit.rs`](../src/emit.rs). Every IR value is a Rust integer (`u8`..`i64`, or `bool` for comparisons), signed where the code treats it as signed, and pointers inside a function are `u64` addresses. That way the output type-checks however the binary mixes pointers and integers. Signatures are recovered for the whole program at once ([calls.md](calls.md)): arguments are named after the registers they arrive in, in System V order (`rdi, rsi, rdx, rcx, r8, r9`, then `arg6`, `arg7`, ... from the stack), and a function returns `u64`, `(u64, u64)` (rax:rdx) or nothing. Type recovery ([types.md](types.md)) narrows that: an argument the code only uses the low 32 bits of is an `i32` or `u32` named after its register part (`edi`), a return value that is always zero-extended from 32 bits is an `i32`, and a pointer argument is a pointer to the struct, scalar or array its accesses describe. With DWARF, arguments and structs get their source names and types (`fn area(r: &rect) -> i32`). Calls to other decompiled functions use their names, and everything else they call is declared in a `mod ffi` at the top of the file. Stack slots become `let` bindings; a function that takes the address of one keeps a `frame` array.
 
-**Fast mode** is an `unsafe fn` with every load and store as an unaligned raw access:
+**Fast mode** is an `unsafe fn` with every load and store as a raw access. A struct pointer argument is a `*mut S`, and the accesses it describes read fields; any other access is an unaligned read or write at the address. For `mov rax, [rdi+8]; ret`:
 
 ```rust
-pub unsafe fn get_count(mut rdi: u64) -> u64 {
-    let v1: u64 = rdi.wrapping_add(0x8); // 0x1129
-    let v2: u64 = unsafe { (v1 as *const u64).read_unaligned() }; // 0x1129
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+pub struct S_get_count_rdi {
+    _pad0: [u8; 8],
+    pub f8: u64,
+}
+
+pub unsafe fn get_count(rdi_ref: *mut S_get_count_rdi) -> u64 {
+    let v2: u64 = unsafe { (*rdi_ref).f8 }; // 0x1129
     return v2 as u64;
 }
 ```
 
-**Safe mode** asks `borrow::analyze` about each argument. An argument it classifies as `&T` or `&mut T` arrives as a byte slice (`&[u8]` or `&mut [u8]`), wrapped in `Option` when the code null-checks it. Any access whose pointer derives from exactly one such argument becomes a bounds-checked slice access. So a wrong size guess panics instead of reading out of bounds. Every other access stays raw, and the function is `unsafe` only if one does:
+Struct definitions come first in the file, one per distinct layout. They are packed, with explicit padding, so their layout is the C one but any address can be borrowed as one.
+
+**Safe mode** asks `borrow::analyze` about each argument. An argument it classifies as `&T` or `&mut T` becomes a reference to its recovered type (`&S`, `&T`, `&[T]`), wrapped in `Option` when the code null-checks it, if that type describes every access through it; otherwise it arrives as a byte slice (`&[u8]` or `&mut [u8]`). Accesses through it become field reads and writes, or bounds-checked indexing, so a wrong size guess panics instead of reading out of bounds. Every other access stays raw, and the function is `unsafe` only if one does:
 
 ```rust
-pub fn maybe_count(rdi_ref: Option<&[u8]>) -> u64 {
-    let rdi_base: u64 = rdi_ref.as_deref().map_or(0, |s| s.as_ptr() as u64);
+pub fn maybe_count(mut rdi_ref: Option<&mut S_maybe_count_rdi>, mut rsi: u64) -> u64 {
+    let rdi_base: u64 = rdi_ref.as_deref().map_or(0, |s| s as *const S_maybe_count_rdi as u64);
     let mut rdi: u64 = rdi_base;
     ...
-    let v7: u64 = u64::from_le_bytes(rdi_ref.unwrap()[v6.wrapping_sub(rdi_base) as usize..][..8].try_into().unwrap());
+    rdi_ref.as_deref_mut().unwrap().f8 = rsi; // 0x1005
+    let v8: u64 = rdi_ref.as_deref().unwrap().f16; // 0x1009
+    return v8 as u64;
+}
 ```
 
-Each function header says how many of its accesses are checked. Byte slices are a stopgap until struct recovery can name the pointee type and turn these into `&S` with real fields.
+Each function header says how many of its accesses are checked.
 
 Control flow is structured ([`src/structure.rs`](../src/structure.rs)): branches become `if`/`else`, loops become `loop` with `break`, `continue` and early `return`, and block parameters become mutable variables assigned on each edge. A loop's exits are emitted after it, so leaving it is a `break`:
 
@@ -126,5 +139,7 @@ On chungusite's own debug build, `strip` keeps none of its 20,025 function symbo
 - the real binary on a small ELF built in the test: `--list`, both modes, `-f`, `--emit ir` and the exit codes.
 
 `tests/discover.rs` links `tests/differential/corpus.c` with each C compiler found, with and without unwind tables and as a non-PIE, strips a copy, and checks that `--list` on the stripped copy finds the same function starts as the symbol table (and the same sizes, except the crt functions), names `main`, and that the stripped copy's output type-checks in both modes.
+
+`tests/types.rs` checks type recovery ([types.md](types.md)): narrow and signed arguments and returns, structs and slices inferred from accesses in both modes, callers adapting to a callee's narrow types, a stand-in `TypeModel` whose proposals are accepted or rejected, DWARF from C compiled with `-g`, and 120 random typed programs that must type-check in both modes. `tests/differential.rs` runs its corpus at `-O2 -g` too, so types from debug info are checked against the original's behaviour.
 
 `tests/globals.rs` decompiles a cdylib that reads a `static`, writes a `static mut` (both through the GOT) and has a mangled function, then links the output into a program that checks the values. It also checks that `-j 1` and `-j 4` print the same thing.

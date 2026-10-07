@@ -79,7 +79,7 @@ Return                             -> the return value borrows from this argumen
 
 **Pointers need dereference evidence.** Compilers use `lea` and `add` for integer arithmetic, so being offset or returned doesn't make a value a pointer. Only a dereference of something derived from it does.
 
-The accesses also give the pointee's shape. Constant offsets become struct fields: `fields: [(0, written), (8, read)]`. An access at an unknown offset (`indexed`) is evidence for a slice or array. The ML type model (design/ml-refinement.md) proposes types, and these facts gate its proposals.
+The accesses also give the pointee's shape. Constant offsets become struct fields: `fields: [(0, written), (8, read)]`. An access at an unknown offset (`indexed`) is evidence for a slice or array. Type recovery ([types.md](types.md)) turns these into `&S` with fields, `&T` or `&[T]`; debug info and the ML type model propose types, and these facts gate their proposals.
 
 Run on the null-check sample (`chungusite --hex "48 85 ff 74 09 48 89 77 08 48 8b 47 10 c3 31 c0 c3" --emit borrows`):
 

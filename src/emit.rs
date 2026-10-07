@@ -1,16 +1,22 @@
 //! IR -> Rust source. One emitter for both modes (docs/ir.md).
 //!
-//! Every IR value becomes a Rust integer (`u8`..`u64`, or `bool` for comparisons).
+//! Every IR value becomes a Rust integer (`u8`..`i64`, or `bool` for comparisons).
 //! Pointers are `u64` addresses, so the output always type-checks no matter how a
 //! register is used, and each memory access becomes an explicit read or write.
+//! With `Env::types` (`types.rs`), values are signed where the code treats them
+//! as signed, and arguments and return values take their recovered types: narrow
+//! integers, and pointers to recovered structs, scalars and arrays.
 //!
-//! * **fast**: every load and store is a raw, unaligned access inside `unsafe { }`,
-//!   and the function is an `unsafe fn` taking every argument as `u64`.
+//! * **fast**: every load and store is a raw access inside `unsafe { }`: a field
+//!   of a `*mut S` argument when the struct describes it, otherwise an unaligned
+//!   access at the address. The function is an `unsafe fn`.
 //! * **safe**: arguments that `borrow::analyze` classifies as `&T` / `&mut T`
-//!   arrive as byte slices (`&[u8]`, `&mut [u8]`, or `Option<..>` when nullable).
-//!   An access whose pointer derives from exactly one such argument becomes a
-//!   bounds-checked slice read or write; everything else falls back to the
-//!   fast-mode raw access. The function is only `unsafe` if a raw access remains.
+//!   arrive as `&S`, `&T` or `&[T]` when their recovered type describes every
+//!   access through them, and as byte slices (`&[u8]`, `&mut [u8]`) otherwise,
+//!   in `Option<..>` when nullable. An access whose pointer derives from exactly
+//!   one such argument becomes a field access or a bounds-checked slice read or
+//!   write; everything else falls back to the fast-mode raw access. The function
+//!   is only `unsafe` if a raw access remains.
 //!
 //! Control flow is structured (`structure.rs`): `if`/`else`, `loop` with `break`
 //! and `continue`, and early `return`, with block parameters as mutable variables.

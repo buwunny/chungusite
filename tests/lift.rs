@@ -64,34 +64,35 @@ fn ir(build: impl FnOnce(&mut CodeAssembler)) -> String {
 }
 
 #[test]
-fn call_passes_argument_registers_and_clobbers_the_rest() {
+fn call_passes_registers_and_leaves_placeholders_for_the_rest() {
     let out = ir(|a| {
         a.mov(rdi, rsi).unwrap();
         a.call(0x2000).unwrap();
-        a.add(rax, rdx).unwrap(); // rdx is the high half of the result
+        a.add(rax, rdx).unwrap(); // rdx: the high half of a 16-byte result, or preserved
+        a.add(rax, rcx).unwrap(); // rcx: clobbered, unless the callee preserves it
         a.ret().unwrap();
     });
-    // live-ins rcx, rdx, rsi, r8, r9; the arguments are rdi (= rsi), rsi, rdx, rcx, r8, r9
+    // The call lists rdi (= rsi), rsi, rdx, rcx, r8, r9, rsp, rax, r10, r11; every
+    // caller-saved register afterwards is a `callout` that `abi::apply` resolves
+    // once the callee's signature is known.
     let expected = "\
-bb0(v4, v3, v0, v5, v6):
+bb0(v8, v4, v3, v7, v0, v5, v6, v9, v10):
   v1 = const 0x2000
   v2 = inttoptr v1
-  v7 = call v2(v0, v0, v3, v4, v5, v6)
-  v8 = const 0x0
-  v9 = callhi v7
-  v10 = Add v7, v9
-  ret v10
+  v11 = call v2(v0, v0, v3, v4, v5, v6, v7, v8, v9, v10)
+  v12 = callout v11 r1
+  v13 = callout v11 r2
+  v14 = callout v11 r6
+  v15 = callout v11 r7
+  v16 = callout v11 r8
+  v17 = callout v11 r9
+  v18 = callout v11 r10
+  v19 = callout v11 r11
+  v20 = Add v11, v13
+  v21 = Add v20, v12
+  ret v21
 ";
     assert_eq!(out, expected);
-
-    // rcx is clobbered by the call, so reading it is an error rather than a guess
-    let mut a = CodeAssembler::new(64).unwrap();
-    a.call(0x2000).unwrap();
-    a.mov(rax, rcx).unwrap();
-    a.ret().unwrap();
-    let code = a.assemble(0x1000).unwrap();
-    let err = Lifter::new().lift(&code, 0x1000, &mut Function::with_capacity(16, 2)).unwrap_err();
-    assert_eq!(err, LiftError::ClobberedRead { ip: 0x1005, reg: iced_x86::Register::RCX });
 }
 
 #[test]

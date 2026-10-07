@@ -13,7 +13,9 @@ Anything else returns `LiftError::Unsupported` so the caller can decide what to 
 
 ## Calls
 
-A call is `rax = callee(rdi, rsi, rdx, rcx, r8, r9)`. All six argument registers are passed because which ones the callee reads isn't known yet; argument recovery (roadmap step 2) trims them. Afterwards `rdx` is `CallHi(call)`, the high half of a 16-byte `rax:rdx` result (which Rust uses for fat pointers and pairs), and the other caller-saved registers (`rcx`, `rsi`, `rdi`, `r8`-`r11`) are clobbered, as are the flags. Reading a clobbered register later in the same block is `LiftError::ClobberedRead`. A successor block that reads one gets zero: the ABI leaves the value undefined, and the usual way to get there is falling through past a call that never returns, such as a panic.
+A call is `rax = callee(rdi, rsi, rdx, rcx, r8, r9, rsp, rax, r10, r11)`: every register the callee might read, because which ones it does read isn't known yet. Afterwards each caller-saved register (`rcx`, `rdx`, `rsi`, `rdi`, `r8`-`r11`) is a `CallOut { call, reg }` placeholder, and the flags are clobbered. Whether a `CallOut` is the high half of a 16-byte result (rdx), the register's value from before the call (the callee preserves it) or undefined depends on the callee, so `abi::apply` resolves it once signatures are known ([calls.md](calls.md)). A tail call (`jmp` out of the function) lists the same ten registers.
+
+With `Lifter::track_exits` set, every return also records the caller-saved registers in an `Exit` instruction, which is how signature inference sees what a function leaves in them. `abi::apply` removes the `Exit`s.
 
 The argument lists go into `value_pool` in `finalize`, after every block's instruction list, because a block's instructions must stay one contiguous run of the pool.
 

@@ -23,12 +23,9 @@
 //!
 //! The full table is written to `$CARGO_TARGET_TMPDIR/differential/report.txt`.
 use chungusite::{
-    emit::{emit_function, Mode},
-    ir::Function,
-    lift::{LiftError, Lifter},
+    emit::Mode,
     load::Binary,
-    opt::clean,
-    verify::verify,
+    program::{Input, Program},
 };
 use rayon::prelude::*;
 use std::collections::BTreeMap;
@@ -166,33 +163,42 @@ struct Decompiled {
 
 const SYSV: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
 
-fn decompile(obj: &[u8], cases: &[Case]) -> Vec<Decompiled> {
+/// Decompile the object file the way the CLI does: every function, so calls see
+/// their callees' signatures, with the corpus cases selected for emission. Also
+/// returns each mode's prelude (the `extern "C"` block for callees that aren't
+/// emitted).
+fn decompile(obj: &[u8], cases: &[Case]) -> (Vec<Decompiled>, [String; 2]) {
     let bin = Binary::parse(obj).expect("compiler output should parse");
-    let mut lifter = Lifter::new();
-    let mut f = Function::with_capacity(256, 16);
-    cases
+    let inputs = bin
+        .funcs
+        .iter()
+        .map(|fb| {
+            let selected = cases.iter().any(|c| c.name == fb.name);
+            Input { name: fb.name.clone(), ident: fb.name.clone(), addr: fb.addr, bytes: fb.bytes, selected }
+        })
+        .collect();
+    let program = Program::build(inputs, Some(obj), false);
+    let [fast, safe] = [Mode::Fast, Mode::Safe].map(|m| program.emit_all(m));
+    let decompiled = cases
         .iter()
         .map(|case| {
-            let result = (|| {
-                let fb = bin.funcs.iter().find(|fb| fb.name == case.name).ok_or("no such symbol in the object file")?;
-                lifter.lift(fb.bytes, fb.addr, &mut f).map_err(|e| match e {
-                    LiftError::Unsupported { mnemonic, .. } => format!("unsupported {mnemonic:?}"),
-                    // the variant name, e.g. FlagsNotInBlock
-                    e => format!("{e:?}").split([' ', '{']).next().unwrap().to_string(),
-                })?;
-                // An IR that fails verification is a lifter bug, not a gap: fail loudly.
-                verify(&f).unwrap_or_else(|e| panic!("{}: lifted IR failed verification: {e:?}", case.name));
-                clean(&mut f);
-                verify(&f).unwrap_or_else(|e| panic!("{}: cleaned IR failed verification: {e:?}", case.name));
-                let mut fast = String::new();
-                let mut safe = String::new();
-                emit_function(&f, &case.name, Mode::Fast, &|_| None, &mut fast);
-                emit_function(&f, &case.name, Mode::Safe, &|_| None, &mut safe);
-                Ok::<_, String>([fast, safe])
-            })();
-            Decompiled { case: case.clone(), result: result.map_err(|e| e.to_string()) }
+            let result = match program.funcs.iter().position(|f| f.name == case.name) {
+                None => Err("no such symbol in the object file".to_string()),
+                Some(i) => match &program.funcs[i].ir {
+                    // An IR that fails verification is a lifter bug, not a gap: fail loudly.
+                    Err(e) if e.contains("failed verification") => panic!("{}: {e}", case.name),
+                    Err(e) => Err(match e.strip_prefix("unsupported instruction ") {
+                        Some(rest) => format!("unsupported {}", rest.split(' ').next().unwrap_or(rest)),
+                        None => e.split(" at ").next().unwrap_or(e).to_string(),
+                    }),
+                    Ok(_) => Ok([fast[i].as_ref().unwrap().0.clone(), safe[i].as_ref().unwrap().0.clone()]),
+                },
+            };
+            Decompiled { case: case.clone(), result }
         })
-        .collect()
+        .collect();
+    let prelude = program.prelude();
+    (decompiled, [prelude.clone(), prelude])
 }
 
 // ---------------------------------------------------------------------------
@@ -203,13 +209,20 @@ fn decompile(obj: &[u8], cases: &[Case]) -> Vec<Decompiled> {
 /// can't call it (a slice for an argument that the C code takes as an integer).
 fn call_args(src: &str, case: &Case) -> Result<String, String> {
     let sig = src.lines().find(|l| l.starts_with("pub ")).ok_or("no signature in emitted code")?;
-    let params = &sig[sig.find('(').unwrap() + 1..sig.rfind(") -> ").ok_or("unexpected signature")?];
+    let close = sig.rfind(") -> ").or_else(|| sig.rfind(") {")).ok_or("unexpected signature")?;
+    let params = &sig[sig.find('(').unwrap() + 1..close];
     let mut out = Vec::new();
     for p in params.split(", ").filter(|p| !p.is_empty()) {
         let p = p.strip_prefix("mut ").unwrap_or(p);
         let (name, ty) = p.split_once(": ").ok_or_else(|| format!("unexpected parameter `{p}`"))?;
         let reg = name.strip_suffix("_ref").unwrap_or(name);
-        let idx = SYSV.iter().position(|&r| r == reg).filter(|&i| i < case.args.len());
+        // rdi..r9, then arg6, arg7, ... on the stack; `_rdx` is an argument the
+        // decompiled function takes but doesn't use
+        let idx = SYSV
+            .iter()
+            .position(|&r| r == reg)
+            .or_else(|| reg.strip_prefix("arg").and_then(|n| n.parse().ok()))
+            .filter(|&i| i < case.args.len());
         out.push(match (ty, idx) {
             ("u64", Some(i)) => format!("a.reg({i})"),
             ("u64", None) if reg == "rsp" => "a.stack()".to_string(),
@@ -243,8 +256,10 @@ fn arg_spec(a: &Arg) -> String {
 }
 
 /// Source of the runner: `run <case> <fast|safe>` checks one function in one mode.
-fn runner_source(funcs: &[&Decompiled]) -> (String, String, String) {
+fn runner_source(funcs: &[&Decompiled], prelude: &[String; 2]) -> (String, String, String) {
     let (mut fast, mut safe) = (String::from(ALLOW), String::from(ALLOW));
+    fast.push_str(&prelude[0]);
+    safe.push_str(&prelude[1]);
     let mut externs = String::new();
     let mut arms = String::new();
     for d in funcs {
@@ -287,6 +302,10 @@ fn runner_source(funcs: &[&Decompiled]) -> (String, String, String) {
         };
         let spec: Vec<String> = c.args.iter().map(arg_spec).collect();
         let call = |m: &str, src: &str| match call_args(src, c) {
+            // a function that returns nothing (void) is called for its effects
+            Ok(args) if !src.lines().find(|l| l.starts_with("pub ")).unwrap_or("").contains(") -> ") => {
+                format!("Ok(|a: &mut Args| unsafe {{ {m}::{}({args}); 0 }})", c.name)
+            }
             Ok(args) => format!("Ok(|a: &mut Args| unsafe {{ {m}::{}({args}) }})", c.name),
             Err(e) => format!("Err({e:?})"),
         };
@@ -537,9 +556,9 @@ fn check_variant(v: &Variant, cases: &[Case], corpus: &Path, root: &Path) -> Vec
     let out = Command::new(&v.cc).args([v.opt, "-c", "-o"]).arg(&obj).arg(corpus).output().unwrap();
     assert!(out.status.success(), "{} {} failed on corpus.c:\n{}", v.cc, v.opt, String::from_utf8_lossy(&out.stderr));
 
-    let decompiled = decompile(&std::fs::read(&obj).unwrap(), cases);
+    let (decompiled, prelude) = decompile(&std::fs::read(&obj).unwrap(), cases);
     let lifted: Vec<&Decompiled> = decompiled.iter().filter(|d| d.result.is_ok()).collect();
-    let (main, fast, safe) = runner_source(&lifted);
+    let (main, fast, safe) = runner_source(&lifted, &prelude);
     std::fs::write(dir.join("fast.rs"), fast).unwrap();
     std::fs::write(dir.join("safe.rs"), safe).unwrap();
     std::fs::write(dir.join("main.rs"), main).unwrap();

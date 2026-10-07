@@ -18,6 +18,7 @@
 //!
 //! The input must be clean SSA (`opt::clean`), which is what the borrow analysis
 //! expects too.
+use crate::abi::{Sig, Site, STACK_ARG_BASE, SYSV_ARGS};
 use crate::borrow::{analyze, Class, ParamBorrow, RSP};
 use crate::cfg::Cfg;
 use crate::ir::*;
@@ -44,8 +45,6 @@ const REG: [&str; 16] = [
     "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
 ];
 
-/// System V argument registers, in order: rdi, rsi, rdx, rcx, r8, r9.
-const SYSV_ARGS: [u8; 6] = [7, 6, 2, 1, 8, 9];
 
 /// How a safe-mode argument arrives.
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -54,8 +53,40 @@ enum ArgKind {
     Slice { mutbl: bool, nullable: bool },
 }
 
+/// What a call site calls, as `program.rs` resolved it.
+#[derive(Clone, Debug)]
+pub struct CallInfo {
+    /// The Rust path to call: a decompiled function's name, or `ffi::name` for an
+    /// extern. `None` calls the callee value as a C function pointer.
+    pub path: Option<String>,
+    /// The callee returns a value in rax.
+    pub ret: bool,
+    /// ... and another in rdx: the call is a `(u64, u64)`.
+    pub ret2: bool,
+    /// Calling it is an FFI call (`unsafe` in any mode).
+    pub foreign: bool,
+}
+
+/// The whole-program context a function is emitted in (`program.rs`).
+pub struct Env<'a> {
+    /// The function's signature after `abi::apply`; `None` for IR straight from
+    /// the lifter, where every register read on entry is an argument.
+    pub sig: Option<Sig>,
+    /// Each call site's callee.
+    pub call: &'a dyn Fn(Site) -> Option<CallInfo>,
+    /// Safe mode only: take every argument as an integer, because decompiled
+    /// callers pass addresses, not slices.
+    pub demote: bool,
+}
+
 struct Emitter<'a> {
     f: &'a Function,
+    sig: Option<Sig>,
+    call: &'a dyn Fn(Site) -> Option<CallInfo>,
+    /// Values something uses (a void call's value usually isn't).
+    used: Vec<bool>,
+    /// Values only computed to call a callee that is called by name instead.
+    skip: Vec<bool>,
     /// Borrow analysis (safe mode only).
     borrow: Option<crate::borrow::Analysis>,
     args: Vec<ArgKind>,
@@ -64,7 +95,6 @@ struct Emitter<'a> {
     /// Values that need a variable declared up front (block params, and values
     /// used outside the block that defines them).
     hoisted: Vec<bool>,
-    tail_name: &'a dyn Fn(u64) -> Option<String>,
     stats: EmitStats,
 }
 
@@ -77,6 +107,18 @@ pub fn emit_function(
     name_of: &dyn Fn(u64) -> Option<String>,
     out: &mut String,
 ) -> EmitStats {
+    let call = |site: Site| {
+        // no signatures: a call through the target's address, named in a comment
+        let _ = site;
+        None
+    };
+    let _ = name_of;
+    emit_function_in(f, name, mode, &Env { sig: None, call: &call, demote: false }, out)
+}
+
+/// Emit `f` as a Rust function named `name`, with its signature and callees from
+/// `env`.
+pub fn emit_function_in(f: &Function, name: &str, mode: Mode, env: &Env, out: &mut String) -> EmitStats {
     let cfg = Cfg::new(f);
     let entry_params = f.blocks[f.entry].params.get(&f.value_pool);
     let mut entry_param = vec![None; f.insts.len()];
@@ -89,18 +131,21 @@ pub fn emit_function(
         .iter()
         .enumerate()
         .map(|(k, _)| match &borrow {
-            Some(a) => arg_kind(&a.params[k]),
-            None => ArgKind::Int,
+            Some(a) if !env.demote => arg_kind(&a.params[k]),
+            _ => ArgKind::Int,
         })
         .collect();
 
     let mut e = Emitter {
         f,
+        sig: env.sig,
+        call: env.call,
+        used: used(f, &cfg),
+        skip: callee_only(f, &cfg, env.call),
         borrow,
         args,
         entry_param,
         hoisted: hoisted(f, &cfg),
-        tail_name: name_of,
         stats: EmitStats::default(),
     };
 
@@ -155,6 +200,59 @@ fn hoisted(f: &Function, cfg: &Cfg) -> Vec<bool> {
     hoist
 }
 
+/// Values used by some reachable instruction or terminator.
+fn used(f: &Function, cfg: &Cfg) -> Vec<bool> {
+    let mut u = vec![false; f.insts.len()];
+    for &b in &cfg.rpo {
+        let blk = &f.blocks[b];
+        for &id in blk.insts.get(&f.value_pool) {
+            for_each_operand(f.insts[id].kind, f, |v| u[v.index()] = true);
+        }
+        term_uses(f, blk.term, |v| u[v.index()] = true);
+    }
+    u
+}
+
+/// Values whose only use is naming the callee of calls emitted by name (the
+/// callee's address and its `IntToPtr`).
+fn callee_only(f: &Function, cfg: &Cfg, call: &dyn Fn(Site) -> Option<CallInfo>) -> Vec<bool> {
+    let mut uses = vec![0u32; f.insts.len()];
+    for &b in &cfg.rpo {
+        let blk = &f.blocks[b];
+        for &id in blk.insts.get(&f.value_pool) {
+            for_each_operand(f.insts[id].kind, f, |v| uses[v.index()] += 1);
+        }
+        term_uses(f, blk.term, |v| uses[v.index()] += 1);
+    }
+    let mut work = Vec::new();
+    let named = |s: Site| call(s).is_some_and(|c| c.path.is_some());
+    for &b in &cfg.rpo {
+        let blk = &f.blocks[b];
+        for &id in blk.insts.get(&f.value_pool) {
+            if let InstKind::Call { callee, .. } = f.insts[id].kind {
+                if named(Site::Call(id)) {
+                    work.push(callee);
+                }
+            }
+        }
+        if let Terminator::TailCall { callee, .. } = blk.term {
+            if named(Site::Tail(b)) {
+                work.push(callee);
+            }
+        }
+    }
+    let mut skip = vec![false; f.insts.len()];
+    while let Some(v) = work.pop() {
+        uses[v.index()] -= 1;
+        let k = f.insts[v].kind;
+        if uses[v.index()] == 0 && matches!(k, InstKind::Const(_) | InstKind::IntToPtr(_) | InstKind::PtrToInt(_)) {
+            skip[v.index()] = true;
+            for_each_operand(k, f, |o| work.push(o));
+        }
+    }
+    skip
+}
+
 fn term_uses(f: &Function, t: Terminator, mut cb: impl FnMut(ValueId)) {
     let list = |l: ListRef, cb: &mut dyn FnMut(ValueId)| l.get(&f.value_pool).iter().for_each(|&v| cb(v));
     match t {
@@ -179,6 +277,7 @@ fn rty(ty: TyId) -> &'static str {
         TyId::B4 => "u32",
         TyId::BOOL => "bool",
         TyId::UNIT => "()",
+        TyId::PAIR => "(u64, u64)",
         _ => "u64", // B8, PTR, and anything richer the IR grows later
     }
 }
@@ -204,6 +303,7 @@ fn signed(ty: TyId) -> &'static str {
 impl Emitter<'_> {
     fn name(&self, v: ValueId) -> String {
         match (self.entry_param[v.index()], self.f.insts[v].kind) {
+            (Some(_), InstKind::BlockParam(r)) if r >= STACK_ARG_BASE => format!("arg{}", 6 + (r - STACK_ARG_BASE) as usize),
             (Some(_), InstKind::BlockParam(r)) => REG[r as usize & 15].to_string(),
             _ => format!("v{}", v.index()),
         }
@@ -227,12 +327,40 @@ impl Emitter<'_> {
         order
     }
 
+    /// Entry parameter indices in signature order, with `None` for an argument the
+    /// function takes but never uses.
+    fn arg_order(&self) -> Vec<(Option<usize>, String)> {
+        let params = self.f.blocks[self.f.entry].params.get(&self.f.value_pool);
+        let Some(sig) = self.sig else {
+            return self.sig_order().into_iter().map(|k| (Some(k), String::new())).collect();
+        };
+        let find = |reg: u8| params.iter().position(|&p| matches!(self.f.insts[p].kind, InstKind::BlockParam(r) if r == reg));
+        let mut order = Vec::new();
+        for (k, &reg) in SYSV_ARGS[..sig.args as usize].iter().enumerate() {
+            order.push((find(reg), format!("_{}", REG[SYSV_ARGS[k] as usize])));
+        }
+        for j in 0..sig.stack_args {
+            order.push((find(STACK_ARG_BASE + j), format!("_arg{}", 6 + j as usize)));
+        }
+        // anything else on entry (there shouldn't be anything after `abi::apply`)
+        for k in 0..params.len() {
+            if !order.iter().any(|&(x, _)| x == Some(k)) {
+                order.push((Some(k), String::new()));
+            }
+        }
+        order
+    }
+
     fn signature(&self, name: &str, out: &mut String) {
         let params = self.f.blocks[self.f.entry].params.get(&self.f.value_pool);
         let unsafety = if self.stats.raw > 0 { "unsafe " } else { "" };
         let mut sig = Vec::new();
         let mut prologue = String::new();
-        for k in self.sig_order() {
+        for (k, unused) in self.arg_order() {
+            let Some(k) = k else {
+                sig.push(format!("{unused}: u64"));
+                continue;
+            };
             let n = self.name(params[k]);
             match self.args[k] {
                 ArgKind::Int => sig.push(format!("mut {n}: u64")),
@@ -250,18 +378,36 @@ impl Emitter<'_> {
                 }
             }
         }
-        let _ = writeln!(out, "pub {unsafety}fn {name}({}) -> u64 {{", sig.join(", "));
+        let ret = match self.sig {
+            Some(s) if s.ret2 => " -> (u64, u64)",
+            Some(s) if !s.ret => "",
+            _ => " -> u64",
+        };
+        let _ = writeln!(out, "pub {unsafety}fn {name}({}){ret} {{", sig.join(", "));
         out.push_str(&prologue);
     }
 
     fn body(&mut self, cfg: &Cfg, out: &mut String) {
         let f = self.f;
+        // The stack frame (`frame.rs`): u128s, so it is 16-byte aligned like a real one.
+        if let Some((_, l)) = f.locals.iter().next() {
+            let n = (l.size as usize).div_ceil(16);
+            if n * 16 <= 4096 {
+                let _ = writeln!(out, "    let mut frame = [0u128; {n}];");
+            } else {
+                let _ = writeln!(out, "    let mut frame = vec![0u128; {n}];");
+            }
+        }
         // Up-front declarations for block params and cross-block values.
         for &b in &cfg.rpo {
             let blk = &f.blocks[b];
             for &v in blk.params.get(&f.value_pool).iter().chain(blk.insts.get(&f.value_pool)) {
-                if self.hoisted[v.index()] {
-                    let zero = if self.ty(v) == TyId::BOOL { "false" } else { "0" };
+                if self.hoisted[v.index()] && !self.skip[v.index()] {
+                    let zero = match self.ty(v) {
+                        TyId::BOOL => "false",
+                        TyId::PAIR => "(0, 0)",
+                        _ => "0",
+                    };
                     let _ = writeln!(out, "    let mut {}: {} = {zero};", self.name(v), rty(self.ty(v)));
                 }
             }
@@ -285,6 +431,9 @@ impl Emitter<'_> {
         let f = self.f;
         let blk = &f.blocks[b];
         for &id in blk.insts.get(&f.value_pool) {
+            if self.skip[id.index()] {
+                continue;
+            }
             let at = f.origin.get(id.index()).copied().unwrap_or(0);
             match self.inst(id) {
                 Stmt::Value(e) if self.hoisted[id.index()] => {
@@ -295,6 +444,16 @@ impl Emitter<'_> {
                 }
                 Stmt::Effect(e) => {
                     let _ = writeln!(out, "{ind}{e}; // {at:#x}");
+                }
+                Stmt::Pair(e) => {
+                    // rax:rdx; the rdx half is a `CallOut` reading `vN_pair.1`
+                    let n = self.name(id);
+                    let _ = writeln!(out, "{ind}let {n}_pair: (u64, u64) = {e}; // {at:#x}");
+                    if self.hoisted[id.index()] {
+                        let _ = writeln!(out, "{ind}{n} = {n}_pair.0;");
+                    } else {
+                        let _ = writeln!(out, "{ind}let {n}: u64 = {n}_pair.0;");
+                    }
                 }
             }
         }
@@ -312,25 +471,28 @@ impl Emitter<'_> {
                 self.edge(e, &a[nt..], &inner, out);
                 let _ = writeln!(out, "{ind}}}");
             }
+            Terminator::Return(Some(v)) if self.ty(v) == TyId::PAIR => {
+                let _ = writeln!(out, "{ind}return {};", self.name(v));
+            }
             Terminator::Return(Some(v)) => {
                 let _ = writeln!(out, "{ind}return {} as u64;", self.name(v));
+            }
+            Terminator::Return(None) if self.sig.is_some_and(|s| !s.ret) => {
+                let _ = writeln!(out, "{ind}return;");
             }
             Terminator::Return(None) => {
                 let _ = writeln!(out, "{ind}return 0;");
             }
-            Terminator::TailCall { callee, .. } => {
-                self.stats.todo += 1;
-                let target = match f.insts[callee].kind {
-                    InstKind::IntToPtr(a) => match f.insts[a].kind {
-                        InstKind::Const(c) => {
-                            let addr = f.consts[c.index()] as u64;
-                            (self.tail_name)(addr).unwrap_or_else(|| format!("{addr:#x}"))
-                        }
-                        _ => self.name(callee),
-                    },
-                    _ => self.name(callee),
+            Terminator::TailCall { callee, args } => {
+                let (call, ret, ret2) = self.call_expr(Site::Tail(b), callee, args);
+                let me2 = self.sig.is_some_and(|s| s.ret2);
+                let line = match (self.sig.is_none_or(|s| s.ret), ret) {
+                    (true, true) if ret2 && !me2 => format!("return {call}.0;"),
+                    (true, true) => format!("return {call};"),
+                    (true, false) => format!("{call};\n{ind}return 0;"),
+                    (false, _) => format!("{call};\n{ind}return;"),
                 };
-                let _ = writeln!(out, "{ind}todo!(\"tail call to {target}: argument recovery not implemented\");");
+                let _ = writeln!(out, "{ind}{line}");
             }
             Terminator::Switch { .. } => {
                 self.stats.todo += 1;
@@ -380,6 +542,26 @@ impl Emitter<'_> {
                         format!("{:#x}_{t}", v & mask)
                     }
                 }
+            }
+            Undef if ty == TyId::BOOL => "false".to_string(),
+            CallOut { call, reg: crate::abi::RDX } if matches!(f.insts[call].kind, Call { .. }) && self.ret2(call) => {
+                format!("{}_pair.1", n(call))
+            }
+            Undef | CallOut { .. } => format!("0_{t}"),
+            Aggregate { ty: TyId::PAIR, fields } => {
+                let v = fields.get(&f.value_pool);
+                format!("({} as u64, {} as u64)", n(v[0]), n(v[1]))
+            }
+            AddrOfLocal(_) => "frame.as_mut_ptr() as u64".to_string(),
+            Call { callee, args } => {
+                let (call, ret, ret2) = self.call_expr(Site::Call(id), callee, args);
+                if ret2 {
+                    return Stmt::Pair(call);
+                }
+                if !ret || !self.used[id.index()] {
+                    return Stmt::Effect(call);
+                }
+                call
             }
             Param(i) => format!("todo!(\"param {i}\")"),
             BlockParam(_) => n(id),
@@ -451,6 +633,39 @@ impl Emitter<'_> {
             }
         };
         Stmt::Value(e)
+    }
+
+    /// Does the call `call` return rax:rdx?
+    fn ret2(&self, call: ValueId) -> bool {
+        (self.call)(Site::Call(call)).is_some_and(|c| c.ret2)
+    }
+
+    /// A call to the callee at `site`, and whether it returns a value (`ret`), and
+    /// two (`ret2`, as a `(u64, u64)`).
+    fn call_expr(&mut self, site: Site, callee: ValueId, args: ListRef) -> (String, bool, bool) {
+        let args = args.get(&self.f.value_pool);
+        // Straight from the lifter, a call lists all six argument registers and rsp.
+        let args = if self.sig.is_none() { &args[..args.len().min(6)] } else { args };
+        let a: Vec<String> = args.iter().map(|&v| format!("{} as u64", self.name(v))).collect();
+        let a = a.join(", ");
+        match (self.call)(site) {
+            Some(CallInfo { path: Some(p), ret, ret2, foreign }) => {
+                if foreign {
+                    self.stats.raw += 1;
+                }
+                if ret2 && foreign {
+                    // an extern returns `ffi::Pair`, which is FFI-safe; a tuple isn't
+                    return (format!("unsafe {{ let p = {p}({a}); (p.0, p.1) }}"), ret, ret2);
+                }
+                (format!("unsafe {{ {p}({a}) }}"), ret, ret2)
+            }
+            _ => {
+                self.stats.raw += 1;
+                let tys = vec!["u64"; args.len()].join(", ");
+                let callee = self.name(callee);
+                (format!("unsafe {{ core::mem::transmute::<u64, unsafe extern \"C\" fn({tys}) -> u64>({callee})({a}) }}"), true, false)
+            }
+        }
     }
 
     fn bin(&self, op: BinOp, lhs: ValueId, rhs: ValueId) -> String {
@@ -536,4 +751,6 @@ enum Stmt {
     Value(String),
     /// Side effect only.
     Effect(String),
+    /// A call returning rax:rdx: `let vN_pair = expr; let vN = vN_pair.0;`
+    Pair(String),
 }

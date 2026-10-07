@@ -12,6 +12,7 @@ object = { version = "0.40.0", default-features = false, features = ["read_core"
 # ML refinement (names/types). load-dynamic: libonnxruntime is loaded at runtime from
 # ORT_DYLIB_PATH, so the build downloads nothing. ort is pinned: its 2.0 RCs change API.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-24"], optional = true }
+rayon = "1.12.0"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 
 [features]
@@ -20,7 +21,6 @@ ml = ["dep:ort", "dep:tokenizers"]
 [dev-dependencies]
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "code_asm"] }
 object = { version = "0.40.0", default-features = false, features = ["write_core", "elf", "std"] }
-rayon = "1.12"
 
 [[example]]
 name = "refine"

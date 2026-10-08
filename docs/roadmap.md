@@ -8,12 +8,11 @@ The ML refinement layer (`src/refine`, behind the `ml` feature; see docs/ml-runt
 
 ## 1. Lifter coverage (the blocker for real code)
 
-`CALL`, `PUSH`/`POP`, the 8/16-bit `MOV` forms, `CMOVcc`/`SETcc`, memory operands, `MOVZX`/`MOVSX`, shifts, `IMUL`, one-operand `MUL` and `DIV` at every width, `INC`/`DEC`/`NEG`/`NOT`, SSE2 vectors and floats, jump tables (`Terminator::Switch`), `ADC`/`SBB`, the bit instructions, rotates, double shifts, the atomics, `rep movs`/`rep stos`, flags read in another block and thread-locals are lifted now ([lift.md](lift.md)). On chungusite's own debug build (29,735 functions), 29,721 lift (99.95%). What still fails (14 functions), by the first unsupported instruction in each function:
+`CALL`, `PUSH`/`POP`, the 8/16-bit `MOV` forms, `CMOVcc`/`SETcc`, memory operands, `MOVZX`/`MOVSX`, shifts, `IMUL`, one-operand `MUL` and `DIV` at every width, `INC`/`DEC`/`NEG`/`NOT`, SSE2 vectors and floats, jump tables (`Terminator::Switch`), `ADC`/`SBB`, the bit instructions, rotates, double shifts, the atomics, `rep movs`/`rep stos`, flags read in another block and thread-locals are lifted now ([lift.md](lift.md)). On chungusite's own debug build (29,735 functions), 29,724 lift (99.96%). What still fails (11 functions), by the first unsupported instruction in each function:
 
 | Cause | Functions | What's needed |
 |---|---|---|
 | AVX2 (`ymm` moves in `memchr` and `core::arch` wrappers) | 8 | 32-byte registers: four halves instead of two |
-| Flags read after a call through the GOT that doesn't return (`handle_alloc_error`), so the code after it is never reached | 3 | noreturn detection for calls through a pointer (step 8) |
 | A conditional branch into another function (a `.cold` part) | 1 | a tail call on one side of a branch |
 | `CPUID`, `XGETBV` | 2 | an opaque intrinsic |
 
@@ -69,7 +68,8 @@ Stages 5 to 7 in [ownership.md](ownership.md) are in: the frame, read-only globa
 
 ## 8. Binary handling
 
-- ~~Stripped binaries: discover functions from the entry point, call targets and `.eh_frame`, instead of requiring `--addr`/`--size`.~~ Done ([cli.md](cli.md#stripped-binaries)): on chungusite's stripped debug build all 20,025 function starts are found. Still open: noreturn calls (`__stack_chk_fail`, `abort`) for binaries without unwind tables, and Mach-O `LC_FUNCTION_STARTS`.
+- ~~Stripped binaries: discover functions from the entry point, call targets and `.eh_frame`, instead of requiring `--addr`/`--size`.~~ Done ([cli.md](cli.md#stripped-binaries)): on chungusite's stripped debug build all 20,025 function starts are found.
+- ~~Noreturn calls for binaries without unwind tables, and Mach-O `LC_FUNCTION_STARTS`.~~ Done ([cli.md](cli.md#stripped-binaries)). A call doesn't return if it goes to a C library import like `abort` or `__stack_chk_fail`, to one of Rust's panic and allocation-failure functions (by name), or to a function every path through which ends in such a call, `ud2` or `hlt`, directly, through the PLT or through a GOT slot the loader fills. Discovery stops a function there, and the lifter ends the block. On a small C program built without unwind tables with gcc and clang at -O0 to -Os, a function that ends in a call to the program's own `die()` no longer swallows the function after it or the padding; and the 3 functions of chungusite's debug build that failed because Rust calls `handle_alloc_error`, `unwrap_failed` and `slice_error_fail` through the GOT now lift (29,724 of 29,735). The analysis adds about 0.4 s to that binary (4.3 s). Side effects, both of the signature heuristics rather than of the control flow, which is now right: 266 functions that return `()` now get a spurious `u64` result, because their panic path no longer reaches the return with rax undefined (the rule is "rax is defined on every path to a return", [calls.md](calls.md)); and 123 functions gain arguments, mostly where a panic call passes a register the caller never set (`assert_failed`'s unused `Option<Arguments>` payload in r8), which also keeps 68 debug-info prototypes from being used (7,107 instead of 7,175). Still open: landing pads in a Rust binary whose `.eh_frame` was removed are only reachable through the unwind tables, so discovery turns them into functions of their own (8,248 extra starts, up from 7,301, against 29,728 of 29,735 real starts found).
 - ~~Demangle C++ and Rust symbol names.~~ Done.
 - ~~Lift functions in parallel with `rayon`, one `Lifter` and `Function` per thread, as ir.md plans.~~ Done (`-j`).
 

@@ -243,8 +243,9 @@ impl Lifter {
     }
 
     /// `lift_with_data`, where `noreturn(ip, target)` says whether the call at
-    /// `ip` (to `target`, if it is direct) never returns (`abort`,
-    /// `__stack_chk_fail`): such a call ends its block.
+    /// `ip` never returns (`abort`, `__stack_chk_fail`): such a call ends its
+    /// block. `target` is the callee of a direct call, or the slot of
+    /// `call [rip+slot]` (a GOT entry).
     pub fn lift_full(
         &mut self,
         code: &[u8],
@@ -508,7 +509,11 @@ impl Lifter {
             FlowControl::Next => self.lift_data(f, &i).map(|_| false),
             FlowControl::Call | FlowControl::IndirectCall => {
                 self.call(f, &i)?;
-                let target = (i.op0_kind() == OpKind::NearBranch64).then(|| i.near_branch_target());
+                let target = match i.op0_kind() {
+                    OpKind::NearBranch64 => Some(i.near_branch_target()),
+                    OpKind::Memory if i.is_ip_rel_memory_operand() => Some(i.ip_rel_memory_address()),
+                    _ => None,
+                };
                 if noreturn(self.ip, target) {
                     self.end_block(f, Terminator::Unreachable);
                     return Ok(true);

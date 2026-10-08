@@ -1,7 +1,9 @@
 //! Whole-program recovery (`program.rs`, `abi.rs`, `frame.rs`): signatures from
 //! callers and callees together, real calls, and stack slots as values.
 use chungusite::emit::Mode;
-use chungusite::program::{Input, Program};
+use chungusite::ir::Function;
+use chungusite::program::{BuildOptions, Input, Program};
+use chungusite::types::{Proposal, TypeModel, Var};
 use iced_x86::code_asm::*;
 
 type Asm<'a> = (&'a str, &'a dyn Fn(&mut CodeAssembler));
@@ -9,6 +11,10 @@ type Asm<'a> = (&'a str, &'a dyn Fn(&mut CodeAssembler));
 /// Assemble each `(name, code)` at its own address (0x1000, 0x2000, ...), with
 /// `call`s between them by address, and recover the program.
 fn program(funcs: &[Asm]) -> (Program, Vec<Vec<u8>>) {
+    program_with(funcs, BuildOptions::default())
+}
+
+fn program_with(funcs: &[Asm], opts: BuildOptions) -> (Program, Vec<Vec<u8>>) {
     let code: Vec<Vec<u8>> = funcs
         .iter()
         .enumerate()
@@ -24,7 +30,7 @@ fn program(funcs: &[Asm]) -> (Program, Vec<Vec<u8>>) {
         .enumerate()
         .map(|(i, ((name, _), bytes))| Input { name: name.to_string(), ident: name.to_string(), addr: addr(i), bytes, selected: true })
         .collect();
-    let p = Program::build(inputs, None, false);
+    let p = Program::build_with(inputs, None, false, opts);
     (p, code)
 }
 
@@ -362,4 +368,33 @@ fn memcpy_between_safe_roots_is_a_slice_copy() {
     let src = emitted(&p, Mode::Safe);
     assert!(src[1].contains(".copy_from_slice(&rdi_ref["), "{}", src[1]);
     assert!(src[1].starts_with("pub fn user(rdi_ref: &[u8])"), "{}", src[1]);
+}
+
+/// Answers every argument with `arg` and the return value with `ret`.
+struct Fixed {
+    arg: &'static str,
+    ret: &'static str,
+}
+
+impl TypeModel for Fixed {
+    fn propose(&self, _: &Function, vars: &[Var]) -> Vec<Option<Proposal>> {
+        let p = |label: &str| Some(Proposal { label: label.into(), score: 1.0 });
+        vars.iter().map(|v| p(if matches!(v, Var::Ret { .. }) { self.ret } else { self.arg })).collect()
+    }
+}
+
+#[test]
+fn a_type_models_proposals_pass_the_gate_or_change_nothing() {
+    // f(x) = (u32)x + 1: an argument read at 32 bits, a 32-bit result
+    let f: Asm = ("f", &|a| {
+        a.mov(eax, edi).unwrap();
+        a.add(eax, 1).unwrap();
+        a.ret().unwrap();
+    });
+    // `int` fits the argument; a `char` result says less than the code shows.
+    let m = Fixed { arg: "int", ret: "char" };
+    let (p, _) = program_with(&[f], BuildOptions { dwarf: true, model: Some(&m) });
+    assert_eq!((p.type_stats.accepted, p.type_stats.rejected), (1, 1));
+    let src = emitted(&p, Mode::Fast);
+    assert!(src[0].contains("fn f(rdi: i32) -> u32 {"), "{}", src[0]);
 }

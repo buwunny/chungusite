@@ -65,6 +65,13 @@ pub fn serialize(f: &Function, e: &mut impl Emit) {
     }
 }
 
+/// The question for a type classifier, after the function text: `var v7`. The
+/// function text ends with a newline, so the model input is `<function>\nvar v7`.
+pub fn var_marker(v: ValueId, e: &mut impl Emit) {
+    e.lit("var");
+    val(e, true, v);
+}
+
 fn inst(f: &Function, id: ValueId, e: &mut impl Emit) {
     let k = f.insts[id].kind;
     if let InstKind::Store { ptr, val: v, .. } = k {

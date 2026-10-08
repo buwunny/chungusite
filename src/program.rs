@@ -783,10 +783,12 @@ impl Program {
                 .map(|i| {
                     let ir = self.funcs[i].ir.as_ref().unwrap();
                     let callee = |site: Site| {
-                        if s.raw_sites.contains(&(i, site)) {
-                            return None;
-                        }
                         let k = self.funcs[i].sites.iter().position(|&x| x == site)?;
+                        if s.raw_sites.contains(&(i, site)) {
+                            // the raw twin: what it borrows, it still only accesses
+                            let c = s.callee(self, i, k)?;
+                            return Some(Callee { args: c.args, raw: true, ..Callee::default() });
+                        }
                         s.callee(self, i, k)
                     };
                     let dem = |k: usize| demoted[i].get(k).copied().unwrap_or(false);
@@ -971,7 +973,7 @@ fn summarize(f: &Function, sig: Sig, a: &Analysis) -> Callee {
                 }
                 match p.class {
                     Class::Shared | Class::Mut if p.reg != crate::borrow::RSP => {
-                        Pass::Borrow { mutbl: p.class == Class::Mut, nullable: p.nullable }
+                        Pass::Borrow { mutbl: p.class == Class::Mut, nullable: p.nullable, len: p.extent }
                     }
                     Class::NotPointer if !a.escaped.get(e).copied().unwrap_or(true) => Pass::Ignore,
                     _ => Pass::Escape,

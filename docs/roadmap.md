@@ -2,7 +2,7 @@
 
 The pipeline runs end to end today: `chungusite <binary>` reads an ELF, Mach-O or PE file, lifts each function, cleans the SSA, and emits Rust that compiles in both modes ([cli.md](cli.md)). What limits it is coverage. On chungusite's own debug build (20,025 functions), 19,637 lift (up from 18,131 before jump tables, 16-byte SSE copies and one-operand `MUL`, and 1,920 before the lifter learned calls, the stack, conditional moves and memory operands), and the output for all of them type-checks, with or without `--skip-failed`. Calls are real calls with recovered signatures, and stack slots are local variables (steps 2 and 3), which removed about half of all raw memory accesses: 101,454 remain in fast mode. Safe mode bounds-checks a third of all accesses and leaves 63% of functions without a raw pointer (step 7; measured on the larger build that includes safe mode itself: 83,554 of 251,662 accesses, 15,833 of 25,156 functions). Lifting, signature inference and emission run in parallel (`-j`); the whole binary, 4.2 MB of lifted machine code, takes about 2.3 s on 4 cores. The input file is memory-mapped, and a function with an instruction the lifter doesn't know fails in the lifter's first pass, before any IR is built.
 
-The ML refinement layer (`src/refine`, behind the `ml` feature; see docs/ml-runtime.md) is left out of this list on purpose. It plugs in at step 5 through `types::TypeModel` and is optional: everything below works without it. The CLI does not call it yet; wiring it in is a `--refine` flag that runs after safe mode, once the models are trained.
+The ML refinement layer (`src/refine`, behind the `ml` feature; see docs/ml-runtime.md) is left out of this list on purpose. It plugs in at step 5 through `types::TypeModel` and is optional: everything below works without it. `--refine <dir>` (built with `--features ml`) runs a trained type classifier on every function without a prototype; what is left is training the models.
 
 `chungusite <binary> --list` prints failures grouped by cause, which is the lifter's to-do list. The order below follows that table.
 
@@ -47,7 +47,7 @@ Done: `src/structure.rs` turns every CFG into `if`/`else`, `while`, `loop` with 
 - ~~Pointer values inside bodies are still `u64` addresses; only arguments and fields are typed pointers.~~ Done: struct pointers loaded or carried through the body are `*mut S` (`(*v7).next`, `v7.is_null()`).
 - ~~Interprocedural pointee types: a callee's `*mut S` should type the caller's value it is passed.~~ Done.
 - ~~Indexed arguments in safe mode as `&[T]` instead of `&[u8]`.~~ Done, for arguments no decompiled function calls; callers still lend byte slices.
-- Wiring a trained model into the CLI through `TypeModel` (`--refine`).
+- ~~Wiring a trained model into the CLI through `TypeModel` (`--refine`).~~ Done ([ml-runtime.md](ml-runtime.md#--refine)). Training a real model is still open.
 
 ## 6. Globals and data
 

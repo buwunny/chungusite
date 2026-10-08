@@ -1013,9 +1013,20 @@ pub fn recover(
         let s = &g.shape[c as usize];
         s.fields.iter().all(|(&o, x)| leaf(table, t, o, x.bytes as u32).is_some()) && s.elem.is_none_or(|w| table.size_of(t) == w as u32)
     }));
+    // The model's answers don't depend on the table, so they are asked for in parallel.
+    let answers: Vec<Option<Vec<Option<Proposal>>>> = match model {
+        Some(m) => (inputs.par_iter().zip(&facts).zip(&dfns))
+            .map(|((x, fa), d)| match (d, x, fa) {
+                (None, Some(x), Some(fa)) => Some(m.propose(x.f, &model_vars(x, fa))),
+                _ => None,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
     for (i, d) in dfns.iter().enumerate() {
         if let (None, Some(x), Some(fa)) = (d, &inputs[i], &facts[i]) {
-            sigs[i] = Some((inferred_sig(x, fa, model, &known, table, &mut stats), HashMap::new()));
+            let a = answers.get(i).and_then(Option::as_deref);
+            sigs[i] = Some((inferred_sig(x, fa, a, &known, table, &mut stats), HashMap::new()));
         }
     }
     // the emitter types pointer values in bodies `*mut S`
@@ -1364,11 +1375,11 @@ fn sig_regs(sig: Sig) -> Vec<u8> {
 
 /// The signature of a function without a usable prototype: from the facts, the
 /// pointee types `known` (inferred, or from a prototype that shares the class),
-/// and the model.
+/// and the model's `answers` to `model_vars`.
 fn inferred_sig(
     x: &Input,
     fa: &Facts,
-    model: Option<&dyn TypeModel>,
+    answers: Option<&[Option<Proposal>]>,
     known: &HashMap<u32, TyId>,
     table: &mut TyTable,
     stats: &mut TypeStats,
@@ -1384,8 +1395,8 @@ fn inferred_sig(
     if x.sig.rax() && !x.sig.ret2 {
         ret = fa.ret.as_ref().and_then(|r| infer_ret(r, fa, known, table));
     }
-    if let Some(m) = model {
-        ask(m, x, fa, known, &regs, &mut args, &mut ret, table, stats);
+    if let Some(a) = answers {
+        ask(a, x, fa, known, &mut args, &mut ret, table, stats);
     }
     if x.sig.fret {
         ret = Some(TyId::F64);
@@ -1426,26 +1437,33 @@ fn infer_ret(r: &RetFacts, fa: &Facts, pointee_of: &HashMap<u32, TyId>, table: &
     (r.bytes != 8 || signed).then(|| table.int(r.bytes as usize, signed))
 }
 
+/// What the model is asked about a function without a prototype: each argument,
+/// then the return value.
+fn model_vars(x: &Input, fa: &Facts) -> Vec<Var> {
+    let param = |reg: u8| fa.params.iter().find(|p| p.reg == reg);
+    let mut vars: Vec<Var> =
+        sig_regs(x.sig).iter().enumerate().map(|(j, &r)| Var::Arg { j, value: param(r).map(|p| p.value) }).collect();
+    let want_ret = x.sig.rax() && !x.sig.ret2;
+    if let (true, Some(r)) = (want_ret, &fa.ret) {
+        vars.push(Var::Ret { value: r.value });
+    }
+    vars
+}
+
+/// Uses the model's answers to `model_vars` that the facts allow.
 #[allow(clippy::too_many_arguments)]
 fn ask(
-    m: &dyn TypeModel,
+    answers: &[Option<Proposal>],
     x: &Input,
     fa: &Facts,
     pointee_of: &HashMap<u32, TyId>,
-    regs: &[u8],
     args: &mut [ArgTy],
     ret: &mut Option<TyId>,
     table: &mut TyTable,
     stats: &mut TypeStats,
 ) {
     let param = |reg: u8| fa.params.iter().find(|p| p.reg == reg);
-    let mut vars: Vec<Var> = regs.iter().enumerate().map(|(j, &r)| Var::Arg { j, value: param(r).map(|p| p.value) }).collect();
-    let want_ret = x.sig.rax() && !x.sig.ret2;
-    if let (true, Some(r)) = (want_ret, &fa.ret) {
-        vars.push(Var::Ret { value: r.value });
-    }
-    let answers = m.propose(x.f, &vars);
-    for (var, ans) in vars.iter().zip(answers) {
+    for (var, ans) in model_vars(x, fa).iter().zip(answers) {
         let Some(p) = ans else { continue };
         let facts = match *var {
             Var::Arg { value: Some(v), .. } => {

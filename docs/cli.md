@@ -40,9 +40,7 @@ The emitter is [`src/emit.rs`](../src/emit.rs). Every IR value is a Rust integer
 
 ```rust
 pub unsafe fn get_count(mut rdi: u64) -> u64 {
-    let v1: u64 = rdi.wrapping_add(0x8); // 0x1129
-    let v2: u64 = unsafe { (v1 as *const u64).read_unaligned() }; // 0x1129
-    return v2 as u64;
+    return unsafe { (rdi.wrapping_add(8) as *const u64).read_unaligned() };
 }
 ```
 
@@ -53,37 +51,35 @@ pub fn maybe_count(rdi_ref: Option<&[u8]>) -> u64 {
     let rdi_base: u64 = rdi_ref.as_deref().map_or(0, |s| s.as_ptr() as u64);
     let mut rdi: u64 = rdi_base;
     ...
-    let v7: u64 = u64::from_le_bytes(rdi_ref.unwrap()[v6.wrapping_sub(rdi_base) as usize..][..8].try_into().unwrap());
+    return u64::from_le_bytes(rdi_ref.unwrap()[rdi.wrapping_add(8).wrapping_sub(rdi_base) as usize..][..8].try_into().unwrap());
 ```
 
 Each function header says how many of its accesses are checked. Byte slices are a stopgap until struct recovery can name the pointee type and turn these into `&S` with real fields.
 
-Control flow is structured ([`src/structure.rs`](../src/structure.rs)): branches become `if`/`else`, loops become `loop` with `break`, `continue` and early `return`, and block parameters become mutable variables assigned on each edge. A loop's exits are emitted after it, so leaving it is a `break`:
+Control flow is structured ([`src/structure.rs`](../src/structure.rs)): branches become `if`/`else`, loops become `while` or `loop` with `break`, `continue` and early `return`, and block parameters become mutable variables assigned on each edge. A loop's exits are emitted after it, so leaving it is a `break`. A value used once, in the block that computes it, is written into its use instead of getting a `let` (a load only when nothing between the two writes memory or calls), and constants are literals, so a loop whose test comes first reads as a `while`:
 
 ```rust
 pub unsafe fn find(mut rdi: u64, mut rsi: u64, mut rdx: u64) -> u64 {
-    let mut v2: u64 = 0;
-    ...
-    v2 = v1;
-    loop {
-        let v4: bool = v2 >= rsi; // 0x5
-        if v4 {
-            break;
+    let mut v6: u64 = 0;
+    let mut v36: u64 = 0;
+    if rsi == 0 {
+        v36 = rsi;
+    } else {
+        v6 = 0_u64;
+        while (unsafe { (rdi.wrapping_add(v6.wrapping_mul(8)) as *const u64).read_unaligned() }) != rdx {
+            let v13: u64 = v6.wrapping_add(1); // 0x17
+            if rsi == v13 {
+                return rsi;
+            }
+            v6 = v13;
         }
-        let v7: u64 = rdi.wrapping_add(v2.wrapping_mul(8)); // 0x7
-        let v8: u64 = unsafe { (v7 as *const u64).read_unaligned() }; // 0x7
-        let v10: bool = v8 == rdx; // 0xe
-        if v10 {
-            break;
-        }
-        ...
-        v2 = v13;
+        v36 = v6;
     }
-    return v2 as u64;
+    return v36;
 }
 ```
 
-Where the nesting needs it (two paths into the same `else`, as in `if a || b`), a labeled block (`'b7: { .. break 'b7; .. }`) stands in. A function whose CFG is irreducible (a cycle with two entries) has no such nesting and stays a `loop { match bb { ... } }` state machine; the summary on stderr counts those.
+A block that only tests a condition joins its predecessor's test, so `a || b` and `a && b` stay one `if`. Where the nesting still needs it (two paths with code of their own into the same block), a labeled block (`'b7: { .. break 'b7; .. }`) stands in. An irreducible cycle (one with two entries) has no nesting: just its blocks become a `loop { match bb { ... } }`, and edges into it set `bb`; the rest of the function is structured around it. The summary on stderr counts the functions that have one.
 
 Every statement ends with the address of the instruction it came from.
 
@@ -122,7 +118,7 @@ On chungusite's own debug build, `strip` keeps none of its 20,025 function symbo
 
 - the `sum` loop from `tests/common`, in both modes, linked into a program that runs it and checks the results, including that safe mode panics on a too-short slice;
 - 400 random programs built from supported instructions, in both modes, which must all type-check;
-- 300 random register-only programs emitted both structured and as the state machine, run on the same random inputs, which must return the same values (programs that don't terminate run out of fuel and are skipped);
+- 300 random register-only programs emitted both structured and as the whole-function state machine, run on the same random inputs, which must return the same values (programs that don't terminate run out of fuel and are skipped); the irreducible ones exercise the per-region `match bb`;
 - the real binary on a small ELF built in the test: `--list`, both modes, `-f`, `--emit ir` and the exit codes.
 
 `tests/discover.rs` links `tests/differential/corpus.c` with each C compiler found, with and without unwind tables and as a non-PIE, strips a copy, and checks that `--list` on the stripped copy finds the same function starts as the symbol table (and the same sizes, except the crt functions), names `main`, and that the stripped copy's output type-checks in both modes.

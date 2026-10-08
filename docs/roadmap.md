@@ -38,11 +38,11 @@ Whole-program signature recovery ([calls.md](calls.md)): arguments, stack argume
 
 ## 4. Control-flow structuring
 
-Done: `src/structure.rs` turns every reducible CFG into `if`/`else`, `loop` with `break`/`continue`, and early `return` (Ramsey's dominator-tree construction, then a cleanup pass); irreducible CFGs keep the state machine. On chungusite's own debug build all 1,962 lifted functions come out structured. Left for readability:
+Done: `src/structure.rs` turns every CFG into `if`/`else`, `while`, `loop` with `break`/`continue`, and early `return` (Ramsey's dominator-tree construction, then a cleanup pass). Blocks that only test a condition fold into `a || b` / `a && b`, single-use values are inlined into their use, and an irreducible cycle becomes a `loop { match bb }` over just its own blocks. On chungusite's own debug build that took the fast-mode output from 985k to 439k lines and its `let`s from 582k to 74k; the 177 functions with irreducible flow went from 9,930 `match` arms to 716. Left for readability:
 
-- Short-circuit conditions: `if a || b` currently needs a labeled block, because two paths reach the same `else`.
-- `while cond { .. }`: the condition is computed in statements before the `if`, so loops print as `loop { let c = ..; if !c { break; } .. }`. Inlining single-use pure values into their use would fix this and shorten most code.
-- Irreducible regions are handled per function, not per region: one bad cycle turns the whole function back into a state machine.
+- Values used only in a folded condition block (`if a || p[i] == 0`) are still computed into a variable first, because inlining is decided per block.
+- Labeled blocks remain where two paths with their own code meet (3,524 in functions that were structured before, from 3,687).
+- Copies on edges into a block with one predecessor (`(v20, v16) = (v71, v27);`) could reuse the predecessor's variables.
 
 ## 5. Types
 

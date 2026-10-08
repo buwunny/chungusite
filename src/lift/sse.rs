@@ -107,6 +107,13 @@ impl Lifter {
     pub(super) fn sse(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
         use Mnemonic::*;
         let m = i.mnemonic();
+        // `movsd` and `cmpsd` are also string instructions (without a rep prefix
+        // here), whose operands are [rsi] / [rdi]
+        if (0..i.op_count()).any(|k| matches!(i.op_kind(k), OpKind::MemorySegRSI | OpKind::MemorySegESI | OpKind::MemorySegSI
+            | OpKind::MemoryESRDI | OpKind::MemoryESEDI | OpKind::MemoryESDI))
+        {
+            return Err(self.unsupported());
+        }
         if let Some((op, w)) = lane_int(m) {
             return self.lanes(f, i, |l, f, a, b| l.emit(f, InstKind::Bin { op: BinOp::Lane(op, w), lhs: a, rhs: b }, TyId::B8));
         }

@@ -515,6 +515,9 @@ fn is_index(roots: &[Root], o: &[Origin], result: ValueId, v: ValueId) -> bool {
     o[result.index()].roots & ptr != 0 && o[v.index()].roots & ptr == 0
 }
 
+/// Each value's origin only grows (joined with what it was): `transfer` isn't
+/// monotone where a load needs a single root, and without the join a loop can
+/// shift an offset forever.
 fn origins(f: &Function, cfg: &Cfg, roots: &[Root], starts: &HashMap<ValueId, u8>, callees: &Callees) -> Vec<Origin> {
     let mut o = vec![Origin::NONE; f.insts.len()];
     let mut mem: Mem = HashMap::new();
@@ -528,6 +531,7 @@ fn origins(f: &Function, cfg: &Cfg, roots: &[Root], starts: &HashMap<ValueId, u8
                 for &pred in cfg.preds(b) {
                     incoming(f, pred, b, k, |a| new = new.join(o[a.index()]));
                 }
+                let new = o[p.index()].join(new);
                 if new != o[p.index()] {
                     o[p.index()] = new;
                     changed = true;
@@ -556,7 +560,7 @@ fn origins(f: &Function, cfg: &Cfg, roots: &[Root], starts: &HashMap<ValueId, u8
                     }
                     _ => {}
                 }
-                let new = transfer(f, id, &o, starts, roots, &mem, callees);
+                let new = o[id.index()].join(transfer(f, id, &o, starts, roots, &mem, callees));
                 if new != o[id.index()] {
                     o[id.index()] = new;
                     changed = true;

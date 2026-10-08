@@ -2119,6 +2119,17 @@ impl Emitter<'_> {
                 }
             }
         }
+        // The other arguments may read the roots lent here (`f(&mut s[..],
+        // s[8])`), so they are evaluated first.
+        if !groups.is_empty() {
+            let lent: Vec<usize> = groups.iter().flat_map(|g| g.1.iter().copied()).collect();
+            for k in 0..out.len() {
+                if !lent.contains(&k) && !out[k].chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    let _ = write!(lets, "let __a{k} = {}; ", out[k]);
+                    out[k] = format!("__a{k}");
+                }
+            }
+        }
         for (r, mut ks) in groups {
             let place = self.places[r as usize].as_ref().unwrap();
             let mutbl = |k: usize| matches!(pass[k], Pass::Borrow { mutbl: true, .. });

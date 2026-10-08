@@ -2,7 +2,7 @@
 
 The pipeline runs end to end today: `chungusite <binary>` reads an ELF, Mach-O or PE file, lifts each function, cleans the SSA, and emits Rust that compiles in both modes ([cli.md](cli.md)). What limits it is coverage. On chungusite's own debug build (11,600 functions), 10,600 lift (up from 1,920 before the lifter learned calls, the stack, conditional moves and memory operands), and the output for all of them type-checks. Calls are real calls with recovered signatures, and stack slots are local variables (steps 2 and 3), which removed about half of all raw memory accesses: 101,454 remain in fast mode, and in safe mode 10,666 of 101,454 accesses come out bounds-checked. Lifting, signature inference and emission run in parallel (`-j`); the whole binary takes about 1 s on 4 cores.
 
-The ML refinement layer (`src/refine`, behind the `ml` feature; see docs/ml-runtime.md) is left out of this list on purpose. It plugs in at step 5 and is optional: everything below works without it. The CLI does not call it yet; wiring it in is a `--refine` flag that runs after safe mode, once the models are trained.
+The ML refinement layer (`src/refine`, behind the `ml` feature; see docs/ml-runtime.md) is left out of this list on purpose. It plugs in at step 5 through `types::TypeModel` and is optional: everything below works without it. The CLI does not call it yet; wiring it in is a `--refine` flag that runs after safe mode, once the models are trained.
 
 `chungusite <binary> --list` prints failures grouped by cause, which is the lifter's to-do list. The order below follows that table.
 
@@ -41,18 +41,20 @@ Done: `src/structure.rs` turns every reducible CFG into `if`/`else`, `loop` with
 - `while cond { .. }`: the condition is computed in statements before the `if`, so loops print as `loop { let c = ..; if !c { break; } .. }`. Inlining single-use pure values into their use would fix this and shorten most code.
 - Irreducible regions are handled per function, not per region: one bad cycle turns the whole function back into a state machine.
 
-## 5. Types
+## 5. Types (done, first pass)
 
-- Structs from the per-argument field facts (`ParamBorrow::fields`, `indexed`). This turns safe mode's `&[u8]` plus byte offsets into `&S` with named fields, and indexed access into `&[T]`.
-- Value widths and signedness from how values are used (signed compares, `SAR`, `MOVSX`), instead of `u64` everywhere.
-- Pointers versus integers, so pointer values stop being `u64`.
-- This is where the ML type and naming model plugs in: it proposes, and the facts above accept or reject.
+[types.md](types.md): integer widths and signedness from how values are used, prototypes, parameter names and structs from DWARF when present, structs inferred from field accesses otherwise (with recursive pointers like `next: *mut S2`), `&S`/`&mut S` struct arguments in safe mode, and a `TypeModel` hook whose proposals are checked against the facts before they are used. On chungusite's debug build 19,922 of 43,024 arguments get a type (15,872 without debug info), with 5,362 prototypes from DWARF and 957 inferred structs. Still open:
+
+- Pointer values inside bodies are still `u64` addresses; only arguments and fields are typed pointers.
+- Interprocedural pointee types: a callee's `*mut S` should type the caller's value it is passed.
+- Indexed arguments in safe mode as `&[T]` instead of `&[u8]`.
+- Wiring a trained model into the CLI through `TypeModel` (`--refine`).
 
 ## 6. Globals and data
 
 Done for the common case ([cli.md](cli.md#globals)): constant addresses into data sections become `static`s named from data symbols, and loader-filled pointer slots (GOT, vtables) point at the right static or function. Still to do:
 
-- Typed statics: today every static is `Bytes<N>` or `Words<N>`. Once types (step 5) know an access is a `u32` table or a `&str`, emit `[u32; N]` or a string.
+- Typed statics: today every static is `Bytes<N>` or `Words<N>`. Once types (step 5) also cover globals and know an access is a `u32` table or a `&str`, emit `[u32; N]` or a string.
 - Thread-locals (`fs:`-relative accesses) are still unsupported in the lifter.
 - Mach-O chained fixups and PE base relocations aren't read, so pointer slots in those formats keep their file bytes.
 

@@ -19,7 +19,7 @@ use crate::ir::*;
 use crate::lift::Lifter;
 use crate::opt::clean;
 use crate::verify::verify;
-use object::{Object, ObjectKind, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationTarget, SectionKind};
+use object::{Object, ObjectKind, ObjectSection, ObjectSymbol, RelocationTarget, SectionKind};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -125,39 +125,9 @@ impl Symbols {
             }
             return s;
         }
-        // GOT slots filled by the dynamic loader, by symbol.
-        let dynsyms = file.dynamic_symbol_table();
-        for (at, r) in file.dynamic_relocations().into_iter().flatten() {
-            let RelocationTarget::Symbol(i) = r.target() else { continue };
-            let Some(sym) = dynsyms.as_ref().and_then(|t| t.symbol_by_index(i).ok()) else { continue };
-            if let Ok(n) = sym.name() {
-                if !n.is_empty() {
-                    s.got.insert(at, n.to_string());
-                }
-            }
-        }
-        // PLT stubs: `[endbr64;] jmp [rip+slot]`, one per entry.
-        for sec in file.sections() {
-            let name = sec.name().unwrap_or("");
-            if !matches!(name, ".plt" | ".plt.sec" | ".plt.got") {
-                continue;
-            }
-            let Ok(code) = sec.data() else { continue };
-            let mut dec = iced_x86::Decoder::with_ip(64, code, sec.address(), iced_x86::DecoderOptions::NONE);
-            let mut entry = None;
-            for i in &mut dec {
-                if i.mnemonic() == iced_x86::Mnemonic::Endbr64 {
-                    entry = Some(i.ip());
-                    continue;
-                }
-                if i.flow_control() == iced_x86::FlowControl::IndirectBranch && i.is_ip_rel_memory_operand() {
-                    if let Some(n) = s.got.get(&i.ip_rel_memory_address()) {
-                        s.plt.insert(entry.unwrap_or(i.ip()), n.clone());
-                    }
-                }
-                entry = None;
-            }
-        }
+        // GOT slots filled by the dynamic loader, and the PLT stubs that jump through them.
+        s.got = crate::discover::got_names(&file);
+        s.plt = crate::discover::plt_names(&file, &s.got);
         s
     }
 

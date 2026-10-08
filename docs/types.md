@@ -53,7 +53,7 @@ Strongest first, per function:
 3. **Inference**, always on:
    - *Signedness*: values that flow into each other share a class (union-find over arithmetic, block parameters and their edge arguments, selects and compares). Signed compares, `SDiv`/`SRem`, `SAR`, `MOVSX` and small negative constants vote signed; unsigned compares, `UDiv`/`URem` and `SHR` vote unsigned; a class used as an address is unsigned.
    - *Narrow arguments and returns*: an argument whose every use truncates it is `i32`/`u32` (or narrower); a return value that is always zero-extended from 32 bits, or a `SETcc` result, returns `i32`/`u32` or `bool`.
-   - *Pointees*, Steensgaard style: values that flow into each other point at the same type. Each load or store `*(base + d)` adds a field at offset `d`, and the value stored or loaded there is unified with that field, so `p = p->next` makes `next: *mut S2` point at its own struct. Non-overlapping fields make a struct (`#[repr(C, packed)]`, since the real alignment isn't known, with fields `f{offset}`); indexed accesses of one width make a scalar pointee (`*const u32`). Only dereferences make a pointer: `lea` arithmetic on an integer argument doesn't.
+   - *Pointees*, Steensgaard style: values that flow into each other point at the same type. Each load or store `*(base + d)` adds a field at offset `d`, and the value stored or loaded there is unified with that field, so `p = p->next` makes `next: *mut S2` point at its own struct. Classes span the whole program: a value passed to a decompiled function joins the class of the parameter it arrives in, and a call's result the class of what the callee returns, so each function's partial view of a struct adds up to one struct. Two classes join only if their fields agree (no overlap at different widths, also for the classes their common pointer fields would join), neither holds a stack, global or constant address, and indexed and field accesses don't mix; otherwise the call leaves them apart. A prototype's pointer types type the classes they share with other functions, but only where every access fits the prototype's type: a struct and its first field have the same address, so a callee's `&self.items` can join `self`'s class. Mutability (`*const`/`*mut`) stays per function. Non-overlapping fields make a struct (`#[repr(C, packed)]`, since the real alignment isn't known, with fields `f{offset}`); indexed accesses of one width make a scalar pointee (`*const u32`). Only dereferences make a pointer: `lea` arithmetic on an integer argument doesn't.
 
 Every type is a claim the emitted code relies on, so each one keeps what the machine code does: a narrowed argument is only ever used truncated, a narrowed return value has zero upper bits, and a field access happens at exactly the offset and width the instruction used. Anything uncertain stays `u64`. Each emitted struct has a `const _: () = assert!(size_of::<S>() == N);`.
 
@@ -64,7 +64,7 @@ Every type is a claim the emitted code relies on, so each one keeps what the mac
 - In fast mode an access that is exactly a field of a typed pointer argument reads `(*p).field`; in safe mode an argument `borrow::analyze` classifies as a reference, all of whose accesses are exact fields, is `&S`/`&mut S` and accesses are `p.field`, unless decompiled code calls the function or it lends the argument to a callee as a slice (callers lend byte slices, not structs). A field access never replaces a bounds-checked slice access.
 - Calls between decompiled functions pass and receive the callee's types.
 
-The stderr summary adds a line: `types: A of B arguments typed, N structs inferred from field accesses, K prototypes from debug info`. On chungusite's own debug build: 19,922 of 43,024 arguments typed, 957 inferred structs, 5,362 prototypes from debug info; without debug info, 15,872 typed. The output type-checks in both modes.
+The stderr summary adds a line: `types: A of B arguments typed, N structs inferred from field accesses, K prototypes from debug info`. On chungusite's own debug build: 45,587 of 63,944 arguments typed, 1,938 inferred structs, 7,175 prototypes from debug info; without debug info, 42,546 typed. Before pointee classes crossed calls these were 29,392 and 23,922, and 72,892 accesses printed as struct fields, now 73,998. The fast-mode output type-checks.
 
 ## The model hook
 
@@ -80,11 +80,10 @@ It is asked about each argument and the return value (`Var::Arg`, `Var::Ret`) of
 
 ## Tests
 
-`tests/types.rs` checks prototypes and structs from `gcc -O2 -g`, safe-mode struct references, `--no-dwarf` inference, `parse_label` and the gate. `tests/differential.rs` runs each corpus build both without and with `-g`, so a wrong type from either source shows up as a wrong result. 427 of 468 function builds pass in each variant (854 of 936), the same as before type recovery.
+`tests/types.rs` checks prototypes and structs from `gcc -O2 -g`, safe-mode struct references, `--no-dwarf` inference, one struct across callers and callees (with and without the callees' debug info), `parse_label` and the gate. `tests/differential.rs` runs each corpus build both without and with `-g`, so a wrong type from either source shows up as a wrong result; 1,724 of 1,728 pairs pass and none disagree.
 
 ## Next
 
 - Pointer values inside bodies as real pointers rather than `u64`.
-- Interprocedural pointees: a callee's `*mut S` should type what the caller passes.
 - Indexed arguments in safe mode as `&[T]` rather than `&[u8]`.
 - Typed statics (`[u32; N]`, strings) from how globals are accessed.

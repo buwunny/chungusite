@@ -984,7 +984,7 @@ pub fn apply(f: &mut Function, sig: Sig, sites: &[Site], shape: &dyn Fn(usize) -
     remove_insts(f, |f, id| matches!(f.insts[id].kind, InstKind::Store { val, .. } if matches!(f.insts[val].kind, InstKind::Undef)));
 
     clean(f);
-    crate::frame::promote(f);
+    crate::frame::promote(f, sig.stack_args);
     clean(f);
     sites
 }

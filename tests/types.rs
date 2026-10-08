@@ -16,15 +16,34 @@ int length(struct node *p) { int n = 0; while (p) { n++; p = p->next; } return n
 /// Compiles `SRC` with `gcc -O2 -g` and decompiles it with `args`, or `None`
 /// when there is no gcc.
 fn decompile(args: &[&str]) -> Option<String> {
-    let dir = std::env::temp_dir().join(format!("chungusite-types-{}-{}", std::process::id(), args.join("")));
+    decompile_units(&[(SRC, true)], args)
+}
+
+/// Compiles each `(source, with debug info)` with `gcc -O2`, links them into one
+/// object, and decompiles it with `args`; `None` when there is no gcc.
+fn decompile_units(units: &[(&str, bool)], args: &[&str]) -> Option<String> {
+    let tag: String = units.iter().map(|u| format!("{}{}", u.0.len(), if u.1 { "g" } else { "" })).chain(args.iter().map(|a| a.to_string())).collect();
+    let dir = std::env::temp_dir().join(format!("chungusite-types-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let (c, o) = (dir.join("a.c"), dir.join("a.o"));
-    std::fs::write(&c, SRC).unwrap();
-    let ok = Command::new("gcc").args(["-O2", "-g", "-c"]).arg(&c).arg("-o").arg(&o).status().map(|s| s.success());
-    if !matches!(ok, Ok(true)) {
-        eprintln!("skipping: no gcc");
-        return None;
+    let mut objs = Vec::new();
+    for (k, &(src, g)) in units.iter().enumerate() {
+        let (c, o) = (dir.join(format!("u{k}.c")), dir.join(format!("u{k}.o")));
+        std::fs::write(&c, src).unwrap();
+        let ok = Command::new("gcc").args(["-O2", "-c"]).args(g.then_some("-g")).arg(&c).arg("-o").arg(&o).status().map(|s| s.success());
+        if !matches!(ok, Ok(true)) {
+            eprintln!("skipping: no gcc");
+            return None;
+        }
+        objs.push(o);
     }
+    let o = match objs.as_slice() {
+        [o] => o.clone(),
+        _ => {
+            let o = dir.join("all.o");
+            assert!(Command::new("ld").arg("-r").args(&objs).arg("-o").arg(&o).status().unwrap().success());
+            o
+        }
+    };
     let out = Command::new(env!("CARGO_BIN_EXE_chungusite")).args(args).arg(&o).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     Some(String::from_utf8(out.stdout).unwrap())
@@ -64,6 +83,42 @@ fn without_debug_info_types_are_inferred() {
     // Signedness from how the argument is compared and divided.
     has(&out, "pub fn sgn(rdi: i32) -> ");
     has(&out, "pub fn div3(rdi: u32) -> ");
+}
+
+const CALLS: &str = "
+struct node { int key; long count; struct node *next; unsigned char flag; };
+__attribute__((noinline)) long get(struct node *p) { return p->count + p->key; }
+__attribute__((noinline)) void bump(struct node *p) { p->count++; p->flag = 1; }
+";
+const CALLERS: &str = "
+struct node;
+long get(struct node *p);
+void bump(struct node *p);
+long caller(long *p) { bump((struct node *)p); return get((struct node *)p) + get((struct node *)p[2]); }
+long walk(long *p) { long s = 0; while (p) { s += get((struct node *)p); p = (long *)p[2]; } return s; }
+";
+
+#[test]
+fn callers_share_their_callees_pointee_types() {
+    // Without debug info, each function sees a few fields of `node`; across the
+    // calls they are one struct.
+    let Some(out) = decompile_units(&[(CALLS, false), (CALLERS, false)], &[]) else { return };
+    has(&out, "pub struct S1 {\n    pub f0: i32,\n    pub _pad4: [u8; 4],\n    pub f8: i64,\n    pub f16: *mut S1,\n    pub f24: u8,\n}");
+    assert!(!out.contains("pub struct S2"), "{out}");
+    for f in ["get", "bump", "caller", "walk"] {
+        has(&out, &format!("fn {f}(rdi_p: *"));
+    }
+    has(&out, "pub unsafe fn caller(rdi_p: *const S1) -> u64 {");
+    has(&out, "(*rdi_p).f16");
+}
+
+#[test]
+fn a_callees_prototype_types_its_callers() {
+    // `get` and `bump` have debug info and the callers don't.
+    let Some(out) = decompile_units(&[(CALLS, true), (CALLERS, false)], &[]) else { return };
+    has(&out, "pub unsafe fn caller(rdi_p: *const Node) -> u64 {");
+    has(&out, "(*rdi_p).next");
+    has(&out, "pub unsafe fn walk(rdi_p: *const Node) -> u64 {");
 }
 
 #[test]

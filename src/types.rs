@@ -27,6 +27,9 @@
 //!      pointer to the same struct. Non-overlapping fields make a struct
 //!      (`#[repr(C, packed)]`, since the real alignment isn't known); one field at
 //!      offset 0, or indexed accesses of one width, make a scalar pointee.
+//!      Classes span functions: a value passed to a decompiled function shares
+//!      the class of the parameter it arrives in, and a call's result the class
+//!      of what the callee returns, unless their accesses disagree.
 //!
 //! Every type here is a claim the emitted code relies on, so each one preserves
 //! what the machine code does: a narrowed argument is only ever used truncated,
@@ -447,9 +450,13 @@ impl Pts {
     fn union(&mut self, a: usize, b: usize) {
         self.pending.push((a as u32, b as u32));
         while let Some((a, b)) = self.pending.pop() {
-            let (ra, rb) = (self.find(a as usize), self.find(b as usize));
+            let (mut ra, mut rb) = (self.find(a as usize), self.find(b as usize));
             if ra == rb {
                 continue;
+            }
+            // move the smaller field map into the larger
+            if self.shape[ra].fields.len() < self.shape[rb].fields.len() {
+                std::mem::swap(&mut ra, &mut rb);
             }
             self.uf.0[rb] = ra as u32;
             let sb = std::mem::take(&mut self.shape[rb]);
@@ -503,6 +510,51 @@ impl Pts {
     }
 }
 
+impl Pts {
+    /// Whether joining the classes of `a` and `b` keeps a type: neither is
+    /// tainted or conflicting, and their fields don't overlap at different widths,
+    /// and the same holds for the classes their common pointer fields would join
+    /// (up to 64 pairs; past that, no). Indexed and field accesses don't mix (a
+    /// byte helper called with a struct).
+    fn compatible(&mut self, a: usize, b: usize) -> bool {
+        let mut work = vec![(a, b)];
+        let mut seen = std::collections::HashSet::new();
+        while let Some((a, b)) = work.pop() {
+            let (ra, rb) = (self.find(a), self.find(b));
+            if ra == rb || !seen.insert((ra.min(rb), ra.max(rb))) {
+                continue;
+            }
+            if seen.len() > 64 {
+                return false;
+            }
+            let (sa, sb) = (&self.shape[ra], &self.shape[rb]);
+            if sa.conflict || sb.conflict || sa.tainted || sb.tainted {
+                return false;
+            }
+            let mixed = |x: &Shape, y: &Shape| x.elem.is_some() && y.elem.is_none() && !y.fields.is_empty();
+            if matches!((sa.elem, sb.elem), (Some(x), Some(y)) if x != y) || mixed(sa, sb) || mixed(sb, sa) {
+                return false;
+            }
+            let (sa, sb) = if sa.fields.len() < sb.fields.len() { (sb, sa) } else { (sa, sb) };
+            for (&off, y) in &sb.fields {
+                match sa.fields.get(&off) {
+                    Some(x) if x.bytes != y.bytes => return false,
+                    Some(x) => work.extend(x.link.zip(y.link).map(|(l, m)| (l as usize, m as usize))),
+                    None => {
+                        let end = off + y.bytes as i64;
+                        let before = sa.fields.range(..off).next_back().is_some_and(|(o, x)| o + x.bytes as i64 > off);
+                        let after = sa.fields.range(off + 1..).next().is_some_and(|(o, _)| *o < end);
+                        if before || after {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
 fn gcd(a: u64, b: u64) -> u64 {
     if b == 0 { a } else { gcd(b, a % b) }
 }
@@ -530,9 +582,14 @@ struct Facts {
     evidence: Vec<i32>,
     /// The value's signedness class is used as an address.
     addr: Vec<bool>,
-    /// Pointee class root of each value.
+    /// Pointee class root of each value: a value of this function, until
+    /// `program_classes` makes it an index into the whole program's values.
     class: Vec<u32>,
+    /// The shape of each root (`program_classes` moves them out).
     shape: Vec<Shape>,
+    /// This function writes through the value's class (another function that
+    /// shares the class may write through it too).
+    written: Vec<bool>,
     params: Vec<ParamFacts>,
     ret: Option<RetFacts>,
 }
@@ -787,7 +844,8 @@ fn facts(f: &Function) -> Facts {
 
     // 4. Return value: how wide it really is.
     let ret = (!returned.is_empty()).then(|| ret_facts(f, &cfg, &returned, &evidence, &addr));
-    Facts { evidence, addr, class, shape: pts.shape, params, ret }
+    let written = class.iter().map(|&c| pts.shape[c as usize].written).collect();
+    Facts { evidence, addr, class, shape: pts.shape, written, params, ret }
 }
 
 /// How many low bytes of `v` can be non-zero, whether it is always 0 or 1, and
@@ -890,6 +948,18 @@ pub struct Input<'a> {
     pub addr: u64,
     /// Its symbol, to match against the debug info's name.
     pub name: &'a str,
+    /// Its calls to other functions of `recover`'s input.
+    pub calls: Vec<CallEdge>,
+}
+
+/// A call from one input function to another (`callee`, an index into the inputs).
+pub struct CallEdge {
+    pub callee: usize,
+    /// The arguments: the register (`STACK_ARG_BASE + j` for a stack argument)
+    /// and the value passed in it.
+    pub args: Vec<(u8, ValueId)>,
+    /// The call's result, for a call that isn't a tail call.
+    pub ret: Option<ValueId>,
 }
 
 /// Recover types for every function. `table` receives the structs and must be
@@ -900,7 +970,8 @@ pub fn recover(
     model: Option<&dyn TypeModel>,
     table: &mut TyTable,
 ) -> (Vec<Option<FnTypes>>, TypeStats) {
-    let facts: Vec<Option<Facts>> = inputs.par_iter().map(|x| x.as_ref().map(|x| facts(x.f))).collect();
+    let mut facts: Vec<Option<Facts>> = inputs.par_iter().map(|x| x.as_ref().map(|x| facts(x.f))).collect();
+    let g = program_classes(inputs, &mut facts);
     for b in [1, 2, 4, 8] {
         table.int(b, false);
         table.int(b, true);
@@ -908,15 +979,45 @@ pub fn recover(
     let mut stats = TypeStats::default();
     let mut layouts: HashMap<String, TyId> = HashMap::new();
     // Structs are shared between functions, so this part is sequential...
-    let sigs: Vec<Option<(FnTypes, HashMap<u32, TyId>)>> = inputs
+    // Inferred pointee types, in value order so struct names are deterministic.
+    let mut cl = Classes { shape: &g.shape, class: &g.class, memo: HashMap::new() };
+    for fa in facts.iter().flatten() {
+        for &c in &fa.class {
+            if c != NONE && !cl.memo.contains_key(&c) {
+                cl.ty(c, table, &mut layouts, &mut stats);
+            }
+        }
+    }
+    let inferred: HashMap<u32, TyId> = cl.memo.iter().filter_map(|(&c, t)| Some((c, (*t)?))).collect();
+    // Prototypes first: their pointer types type the classes everyone shares.
+    let dfns: Vec<Option<&DebugFn>> = inputs
         .iter()
-        .zip(&facts)
-        .map(|(x, fa)| {
-            let (x, fa) = (x.as_ref()?, fa.as_ref()?);
-            let dfn = debug.and_then(|d| d.funcs.get(&x.addr)).filter(|d| usable(d, x, table));
-            Some(one(x, fa, dfn, model, table, &mut layouts, &mut stats))
+        .map(|x| {
+            let x = x.as_ref()?;
+            debug.and_then(|d| d.funcs.get(&x.addr)).filter(|d| usable(d, x, table))
         })
         .collect();
+    let mut debug_of: HashMap<u32, TyId> = HashMap::new();
+    // (a prototype's own types win in its own function)
+    let mut sigs: Vec<Option<(FnTypes, HashMap<u32, TyId>)>> = (0..inputs.len()).map(|_| None).collect();
+    for (i, d) in dfns.iter().enumerate() {
+        if let (Some(d), Some(x), Some(fa)) = (d, &inputs[i], &facts[i]) {
+            sigs[i] = Some(from_debug(x, fa, d, &cl, &inferred, &mut debug_of, table, &mut stats));
+        }
+    }
+    // Elsewhere a prototype's type is used only if every access fits it: a
+    // struct and its first field share an address, so a callee's `&self.vec`
+    // can join `self`'s class.
+    let mut known = inferred.clone();
+    known.extend(debug_of.into_iter().filter(|&(c, t)| {
+        let s = &g.shape[c as usize];
+        s.fields.iter().all(|(&o, x)| leaf(table, t, o, x.bytes as u32).is_some()) && s.elem.is_none_or(|w| table.size_of(t) == w as u32)
+    }));
+    for (i, d) in dfns.iter().enumerate() {
+        if let (None, Some(x), Some(fa)) = (d, &inputs[i], &facts[i]) {
+            sigs[i] = Some((inferred_sig(x, fa, model, &known, table, &mut stats), HashMap::new()));
+        }
+    }
     // ... and the per-value tables are filled in parallel.
     let ints: Vec<TyId> = (0..8).map(|i| table.get(&Ty::Int { bits: 8 << (i / 2), signed: i % 2 == 1 }).unwrap()).collect();
     let int = |w: u8, signed: bool| ints[2 * w.trailing_zeros() as usize + signed as usize];
@@ -924,7 +1025,7 @@ pub fn recover(
         .into_par_iter()
         .zip(inputs.par_iter().zip(&facts))
         .map(|(sig, (x, fa))| {
-            let (mut t, classes) = sig?;
+            let (mut t, own) = sig?;
             let (f, fa) = (x.as_ref()?.f, fa.as_ref()?);
             let n = f.insts.len();
             t.vals = (0..n)
@@ -933,11 +1034,110 @@ pub fn recover(
                     width(ty).map_or(ty, |w| int(w, fa.evidence[v] > 0 && !fa.addr[v]))
                 })
                 .collect();
-            t.pointee = (0..n).map(|v| classes.get(&fa.class[v]).copied()).collect();
+            t.pointee = (0..n).map(|v| own.get(&fa.class[v]).or_else(|| known.get(&fa.class[v])).copied()).collect();
             Some(t)
         })
         .collect();
     (out, stats)
+}
+
+/// The program's pointee classes, joined across calls. Each function's class
+/// roots that can matter (accessed through, loaded from a field, or passed in a
+/// call) get a program-wide id; the others can't be typed. Rewrites each
+/// function's `class` to a program-wide root (`NONE` for the others) and its
+/// field links to program-wide ids, and moves the shapes out.
+fn program_classes(inputs: &[Option<Input>], facts: &mut [Option<Facts>]) -> Global {
+    let blank = |s: &Shape| s.fields.is_empty() && s.elem.is_none() && !s.conflict && !s.written && !s.tainted && s.stride == 0;
+    // the values each function passes or receives in a call
+    let mut passed: Vec<Vec<ValueId>> = facts.iter().map(|_| Vec::new()).collect();
+    for (i, x) in inputs.iter().enumerate() {
+        let Some(x) = x else { continue };
+        for e in &x.calls {
+            let Some(callee) = &facts[e.callee] else { continue };
+            let params: Vec<ValueId> = callee.params.iter().map(|p| p.value).chain(callee.ret.as_ref().map(|r| r.value)).collect();
+            passed[e.callee].extend(params);
+            passed[i].extend(e.args.iter().map(|a| a.1).chain(e.ret));
+        }
+    }
+    let mut id: Vec<Vec<u32>> = Vec::with_capacity(facts.len()); // local root -> program id
+    let mut pts = Pts { uf: Uf(Vec::new()), shape: Vec::new(), pending: Vec::new() };
+    for (fa, passed) in facts.iter_mut().zip(&passed) {
+        let Some(fa) = fa else {
+            id.push(Vec::new());
+            continue;
+        };
+        let mut want = vec![false; fa.class.len()];
+        for (r, s) in fa.shape.iter().enumerate() {
+            if fa.class[r] as usize == r && !blank(s) {
+                want[r] = true;
+            }
+        }
+        for s in &fa.shape {
+            for l in s.fields.values().filter_map(|x| x.link) {
+                want[fa.class[l as usize] as usize] = true;
+            }
+        }
+        for v in passed {
+            want[fa.class[v.index()] as usize] = true;
+        }
+        let mut ids = vec![NONE; fa.class.len()];
+        for (r, w) in want.into_iter().enumerate() {
+            if w {
+                ids[r] = pts.shape.len() as u32;
+                pts.uf.0.push(ids[r]);
+                pts.shape.push(std::mem::take(&mut fa.shape[r]));
+            }
+        }
+        let first = pts.shape.len() - ids.iter().filter(|&&x| x != NONE).count();
+        for s in &mut pts.shape[first..] {
+            for x in s.fields.values_mut() {
+                x.link = x.link.map(|l| ids[fa.class[l as usize] as usize]);
+            }
+        }
+        fa.shape = Vec::new();
+        id.push(ids);
+    }
+    let join = |pts: &mut Pts, a: u32, b: u32| {
+        if a != NONE && b != NONE && pts.compatible(a as usize, b as usize) {
+            pts.union(a as usize, b as usize);
+        }
+    };
+    let gid = |i: usize, v: ValueId| facts[i].as_ref().map_or(NONE, |fa| id[i][fa.class[v.index()] as usize]);
+    for (i, x) in inputs.iter().enumerate() {
+        let Some(x) = x else { continue };
+        for e in &x.calls {
+            let Some(callee) = &facts[e.callee] else { continue };
+            for &(reg, v) in &e.args {
+                if let Some(p) = callee.params.iter().find(|p| p.reg == reg && p.used) {
+                    join(&mut pts, gid(i, v), gid(e.callee, p.value));
+                }
+            }
+            if let (Some(v), Some(r)) = (e.ret, &callee.ret) {
+                join(&mut pts, gid(i, v), gid(e.callee, r.value));
+            }
+        }
+    }
+    let class: Vec<u32> = (0..pts.shape.len()).map(|c| pts.find(c) as u32).collect();
+    for (fa, ids) in facts.iter_mut().zip(&id) {
+        if let Some(fa) = fa {
+            for c in fa.class.iter_mut() {
+                *c = match ids[*c as usize] {
+                    NONE => NONE,
+                    x => class[x as usize],
+                };
+            }
+        }
+    }
+    Global { class, shape: pts.shape }
+}
+
+/// No pointee class: a value whose pointee nothing can type.
+const NONE: u32 = u32::MAX;
+
+/// Pointee classes of the whole program (see `program_classes`).
+struct Global {
+    class: Vec<u32>,
+    shape: Vec<Shape>,
 }
 
 /// Can the debug info's prototype be matched to registers?
@@ -958,22 +1158,23 @@ fn scalar(table: &TyTable, t: TyId) -> bool {
     }
 }
 
-/// Struct and scalar types for one function's pointee classes.
+/// Struct and scalar types for the program's pointee classes.
 struct Classes<'a> {
-    fa: &'a Facts,
+    shape: &'a [Shape],
+    class: &'a [u32],
     memo: HashMap<u32, Option<TyId>>,
 }
 
 impl Classes<'_> {
     fn typable(&self, c: u32) -> bool {
-        let s = &self.fa.shape[c as usize];
+        let s = &self.shape[c as usize];
         !s.conflict && !s.tainted && (!s.fields.is_empty() || s.elem.is_some())
     }
 
     /// A scalar pointee: one width, at offset 0 or indexed, or every field one
     /// width in an array walked in steps of that width.
     fn scalar(&self, c: u32) -> Option<(u8, Option<Slot>)> {
-        let s = &self.fa.shape[c as usize];
+        let s = &self.shape[c as usize];
         let w = s.fields.values().next().map(|x| x.bytes);
         let walk = w.filter(|&w| s.stride != 0 && s.stride.is_multiple_of(w as u64) && s.fields.values().all(|x| x.bytes == w));
         match s.elem.or(walk) {
@@ -984,7 +1185,7 @@ impl Classes<'_> {
     }
 
     fn link(&self, s: &Slot) -> Option<u32> {
-        s.link.map(|l| self.fa.class[l as usize]).filter(|&l| self.typable(l))
+        s.link.filter(|&l| l != NONE).map(|l| self.class[l as usize]).filter(|&l| self.typable(l))
     }
 
     /// A key for the layout, to share one struct between functions.
@@ -997,7 +1198,7 @@ impl Classes<'_> {
             return "~".into();
         }
         stack.push(c);
-        let s = &self.fa.shape[c as usize];
+        let s = &self.shape[c as usize];
         let mut k = format!("e{:?}{{", s.elem);
         for (o, x) in &s.fields {
             let _ = write!(k, "{o}:{}:{}:{}:", x.bytes, x.votes > 0, x.addr);
@@ -1034,7 +1235,7 @@ impl Classes<'_> {
             self.memo.insert(c, None);
             return None;
         }
-        let shape = self.fa.shape[c as usize].clone();
+        let shape = self.shape[c as usize].clone();
         if let Some((w, slot)) = self.scalar(c) {
             self.memo.insert(c, None); // a pointer to itself is a byte pointer
             let t = match slot {
@@ -1084,90 +1285,64 @@ fn param_ident(name: &str, used: &mut std::collections::HashSet<String>) -> Stri
     s
 }
 
-fn one(
+/// The signature of a function with a usable prototype, and the pointee types
+/// it gives the classes of its pointer arguments (and of what their pointer
+/// fields point at): in this function, and in others that share the class
+/// unless an earlier prototype typed it.
+#[allow(clippy::too_many_arguments)]
+fn from_debug(
     x: &Input,
     fa: &Facts,
-    dfn: Option<&DebugFn>,
-    model: Option<&dyn TypeModel>,
+    d: &DebugFn,
+    g: &Classes,
+    inferred: &HashMap<u32, TyId>,
+    debug_of: &mut HashMap<u32, TyId>,
     table: &mut TyTable,
-    layouts: &mut HashMap<String, TyId>,
     stats: &mut TypeStats,
 ) -> (FnTypes, HashMap<u32, TyId>) {
-    let f = x.f;
-    let n = f.insts.len();
-    let mut cl = Classes { fa, memo: HashMap::new() };
-    // Inferred pointee types, in value order so struct names are deterministic.
-    let mut pointee_of: HashMap<u32, TyId> = HashMap::new();
-    for v in 0..n {
-        let c = fa.class[v];
-        if c as usize == v {
-            if let Some(t) = cl.ty(c, table, layouts, stats) {
-                pointee_of.insert(c, t);
-            }
-        }
-    }
-
-    // Signature order: rdi, rsi, ... then stack arguments.
-    let regs: Vec<u8> = SYSV_ARGS[..x.sig.args as usize]
-        .iter()
-        .copied()
-        .chain((0..x.sig.stack_args).map(|j| STACK_ARG_BASE + j))
-        .collect();
+    let regs = sig_regs(x.sig);
     let param = |reg: u8| fa.params.iter().find(|p| p.reg == reg);
-
     let mut args: Vec<ArgTy> = Vec::new();
     let mut ret = None;
-    let mut debug_class: HashMap<u32, TyId> = HashMap::new();
-    if let Some(d) = dfn {
-        stats.debug_fns += 1;
-        let mut used = std::collections::HashSet::new();
-        for (j, &reg) in regs.iter().enumerate() {
-            let (name, ty) = &d.params[j];
-            let mut ty = *ty;
-            if let (Ty::RawPtr { pointee, mutbl }, Some(p)) = (table.tys[ty], param(reg)) {
-                let c = fa.class[p.value.index()];
-                // `void *` and `char *` say less than an inferred struct
-                let vague = matches!(table.tys[pointee], Ty::Unknown { .. } | Ty::Int { bits: 8, .. });
-                match pointee_of.get(&c) {
-                    Some(&inferred) if vague => ty = table.ptr(inferred, mutbl),
-                    _ => {
-                        debug_class.insert(c, pointee);
+    let mut debug_class: Vec<(u32, TyId)> = Vec::new();
+    stats.debug_fns += 1;
+    let mut used = std::collections::HashSet::new();
+    for (j, &reg) in regs.iter().enumerate() {
+        let (name, ty) = &d.params[j];
+        let mut ty = *ty;
+        if let (Ty::RawPtr { pointee, mutbl }, Some(p)) = (table.tys[ty], param(reg)) {
+            let c = fa.class[p.value.index()];
+            // `void *` and `char *` say less than an inferred struct
+            let vague = matches!(table.tys[pointee], Ty::Unknown { .. } | Ty::Int { bits: 8, .. });
+            match inferred.get(&c) {
+                Some(&t) if vague => ty = table.ptr(t, mutbl),
+                _ if c != NONE => debug_class.push((c, pointee)),
+                _ => {}
+            }
+        }
+        args.push(ArgTy { reg, ty: Some(ty), name: Some(param_ident(name, &mut used)) });
+    }
+    if x.sig.rax() && !x.sig.ret2 {
+        ret = d.ret.filter(|&t| scalar(table, t));
+    }
+    // Pointer fields of debug-info structs type the values loaded from them.
+    let mut work = debug_class;
+    let mut own = HashMap::new();
+    while let Some((c, t)) = work.pop() {
+        if own.contains_key(&c) {
+            continue;
+        }
+        own.insert(c, t);
+        debug_of.entry(c).or_insert(t);
+        for (o, slot) in &g.shape[c as usize].fields {
+            let Some(l) = slot.link.filter(|&l| l != NONE) else { continue };
+            if let Some((_, lt)) = leaf(table, t, *o, slot.bytes as u32) {
+                if let Ty::RawPtr { pointee, .. } = table.tys[lt] {
+                    if table.size_of(pointee) > 0 {
+                        work.push((g.class[l as usize], pointee));
                     }
                 }
             }
-            args.push(ArgTy { reg, ty: Some(ty), name: Some(param_ident(name, &mut used)) });
-        }
-        if x.sig.rax() && !x.sig.ret2 {
-            ret = d.ret.filter(|&t| scalar(table, t));
-        }
-        // Pointer fields of debug-info structs type the values loaded from them.
-        let mut work: Vec<(u32, TyId)> = debug_class.drain().collect();
-        while let Some((c, t)) = work.pop() {
-            if debug_class.contains_key(&c) {
-                continue;
-            }
-            debug_class.insert(c, t);
-            for (o, slot) in &fa.shape[c as usize].fields {
-                let Some(l) = slot.link else { continue };
-                if let Some((_, lt)) = leaf(table, t, *o, slot.bytes as u32) {
-                    if let Ty::RawPtr { pointee, .. } = table.tys[lt] {
-                        if table.size_of(pointee) > 0 {
-                            work.push((fa.class[l as usize], pointee));
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        for &reg in &regs {
-            let ty = param(reg).and_then(|p| infer_arg(p, fa, &pointee_of, table));
-            args.push(ArgTy { reg, ty, name: None });
-        }
-        if x.sig.rax() && !x.sig.ret2 {
-            ret = fa.ret.as_ref().and_then(|r| infer_ret(r, fa, &pointee_of, table));
-        }
-        if let Some(m) = model {
-            ask(m, x, fa, &pointee_of, &regs, &mut args, &mut ret, table, stats);
         }
     }
     if x.sig.fret {
@@ -1175,10 +1350,45 @@ fn one(
     }
     stats.args += args.len();
     stats.typed_args += args.iter().filter(|a| a.ty.is_some()).count();
+    (FnTypes { vals: Vec::new(), pointee: Vec::new(), args, ret }, own)
+}
 
-    let mut classes = pointee_of;
-    classes.extend(debug_class);
-    (FnTypes { vals: Vec::new(), pointee: Vec::new(), args, ret }, classes)
+/// Signature order: rdi, rsi, ... then stack arguments.
+fn sig_regs(sig: Sig) -> Vec<u8> {
+    SYSV_ARGS[..sig.args as usize].iter().copied().chain((0..sig.stack_args).map(|j| STACK_ARG_BASE + j)).collect()
+}
+
+/// The signature of a function without a usable prototype: from the facts, the
+/// pointee types `known` (inferred, or from a prototype that shares the class),
+/// and the model.
+fn inferred_sig(
+    x: &Input,
+    fa: &Facts,
+    model: Option<&dyn TypeModel>,
+    known: &HashMap<u32, TyId>,
+    table: &mut TyTable,
+    stats: &mut TypeStats,
+) -> FnTypes {
+    let regs = sig_regs(x.sig);
+    let param = |reg: u8| fa.params.iter().find(|p| p.reg == reg);
+    let mut args: Vec<ArgTy> = Vec::new();
+    let mut ret = None;
+    for &reg in &regs {
+        let ty = param(reg).and_then(|p| infer_arg(p, fa, known, table));
+        args.push(ArgTy { reg, ty, name: None });
+    }
+    if x.sig.rax() && !x.sig.ret2 {
+        ret = fa.ret.as_ref().and_then(|r| infer_ret(r, fa, known, table));
+    }
+    if let Some(m) = model {
+        ask(m, x, fa, known, &regs, &mut args, &mut ret, table, stats);
+    }
+    if x.sig.fret {
+        ret = Some(TyId::F64);
+    }
+    stats.args += args.len();
+    stats.typed_args += args.iter().filter(|a| a.ty.is_some()).count();
+    FnTypes { vals: Vec::new(), pointee: Vec::new(), args, ret }
 }
 
 fn infer_arg(p: &ParamFacts, fa: &Facts, pointee_of: &HashMap<u32, TyId>, table: &mut TyTable) -> Option<TyId> {
@@ -1187,7 +1397,7 @@ fn infer_arg(p: &ParamFacts, fa: &Facts, pointee_of: &HashMap<u32, TyId>, table:
     }
     let c = fa.class[p.value.index()];
     if let Some(&t) = pointee_of.get(&c) {
-        let m = if fa.shape[c as usize].written { Mutbl::Mut } else { Mutbl::Not };
+        let m = if fa.written[p.value.index()] { Mutbl::Mut } else { Mutbl::Not };
         return Some(table.ptr(t, m));
     }
     if fa.addr[p.value.index()] {

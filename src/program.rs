@@ -23,7 +23,7 @@ use crate::types::{FnTypes, TypeModel, TypeStats};
 use crate::verify::verify;
 use object::{Object, ObjectKind, ObjectSection, ObjectSymbol, RelocationTarget, SectionKind};
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 
 /// Signature inference stops after this many rounds even if a cycle of
@@ -206,21 +206,25 @@ impl Program {
         let syms = file.map(Symbols::parse).unwrap_or_default();
         let sections = file.map(loaded_sections).unwrap_or_default();
         let thread_pointer = file.and_then(|d| crate::load::tls(&object::File::parse(d).ok()?)).map(|t| t.thread_pointer);
-        // A call to an import that never returns (by relocation in an object
-        // file, or through the PLT) ends its block.
-        let noreturn = |ip: u64, target: Option<u64>| {
-            let name = match syms.reloc_at(ip) {
-                Some(Reloc::Sym(n)) => Some(n),
-                Some(Reloc::Addr(_)) => None,
-                None => target.and_then(|t| syms.plt.get(&t)),
-            };
-            name.is_some_and(|n| crate::discover::noreturn(n))
-        };
         let by_addr: HashMap<u64, usize> = inputs.iter().enumerate().map(|(i, x)| (x.addr, i)).rev().collect();
         let mut by_name: HashMap<String, usize> = HashMap::new();
         for (i, x) in inputs.iter().enumerate() {
             by_name.entry(x.name.clone()).or_insert(i);
         }
+        // A call that never returns ends its block: to an import like `abort`
+        // (by relocation in an object file, through the PLT or the GOT), or to a
+        // function that doesn't return, by name or by its code, directly or
+        // through a GOT slot.
+        let named: Vec<(u64, &[u8], &str)> = inputs.iter().map(|x| (x.addr, x.bytes, x.name.as_str())).collect();
+        let noreturn_at: HashSet<u64> = match file.and_then(|d| object::File::parse(d).ok()) {
+            Some(obj) if obj.kind() != ObjectKind::Relocatable => crate::discover::noreturn_calls(&obj, &named, &syms.got_addr),
+            _ => named.iter().filter(|x| crate::discover::noreturn(x.2)).map(|x| x.0).collect(),
+        };
+        let noreturn = |ip: u64, target: Option<u64>| match syms.reloc_at(ip) {
+            Some(Reloc::Sym(n)) => crate::discover::noreturn(n) || by_name.get(n).is_some_and(|&i| noreturn_at.contains(&inputs[i].addr)),
+            Some(Reloc::Addr(a)) => noreturn_at.contains(a),
+            None => target.is_some_and(|t| noreturn_at.contains(&t)),
+        };
 
         // 1. Lift and clean, and meanwhile read the debug info (one thread).
         let mut tys = TyTable::new();
@@ -363,6 +367,25 @@ impl Program {
                 }
             }
         }
+        // What callers set up and whether there are any, for functions with
+        // calls that don't return (`abi::infer`). A tail call passes on
+        // whatever the callee returns, so it counts as reading rax.
+        let mut set_args = vec![0u8; funcs.len()];
+        let mut called = vec![0u8; funcs.len()];
+        for f in &funcs {
+            for ((t, g), s) in f.targets.iter().zip(&f.guesses).zip(&f.sites) {
+                if let Target::Func(j) = t {
+                    set_args[*j] = set_args[*j].max(g.0);
+                    called[*j] |= abi::CALLED | if matches!(s, Site::Tail(_)) { abi::READ_RAX } else { 0 };
+                }
+            }
+        }
+        for (a, c) in set_args.iter_mut().zip(&called) {
+            if *c == 0 {
+                *a = 6;
+            }
+        }
+        wanted_by.clone_from(&called);
         let mut results: Vec<(Sig, Vec<u8>)> = sigs.iter().map(|&s| (s, Vec::new())).collect();
         let mut dirty = vec![true; funcs.len()];
         for _round in 0..MAX_ROUNDS {
@@ -372,7 +395,7 @@ impl Program {
                 .map(|(i, f)| match &f.ir {
                     Ok(ir) if dirty[i] => {
                         let callee = |k: usize| site_sig(&f.targets[k], f.guesses[k], &sigs, &guessed);
-                        let r = abi::infer(ir, &f.sites, &callee, sigs[i], wanted_by[i]);
+                        let r = abi::infer(ir, &f.sites, &callee, sigs[i], wanted_by[i], set_args[i]);
                         Some((Sig { stack_args: stack_args[i], ..r.sig }, r.reads))
                     }
                     _ => None,
@@ -383,7 +406,7 @@ impl Program {
                     results[i] = r;
                 }
             }
-            let mut wanted = vec![0u8; funcs.len()];
+            let mut wanted = called.clone();
             for (f, (_, read)) in funcs.iter().zip(&results) {
                 for (t, &r) in f.targets.iter().zip(read) {
                     if let Target::Func(j) = t {
@@ -478,7 +501,8 @@ impl Program {
             for k in 0..funcs[fi].sites.len() {
                 let (name, sig) = match &funcs[fi].targets[k] {
                     Target::Func(j) if !funcs[*j].selected || funcs[*j].ir.is_err() => {
-                        let s = if funcs[*j].ir.is_ok() { sigs[*j] } else { guessed[&Target::Func(*j)] };
+                        // (a function that failed only after signature recovery has its signature)
+                        let s = guessed.get(&Target::Func(*j)).copied().unwrap_or(sigs[*j]);
                         (funcs[*j].name.clone(), s)
                     }
                     Target::Import(n) => (n.clone(), site_sig(&funcs[fi].targets[k], (0, 0), &sigs, &guessed)),

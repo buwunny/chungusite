@@ -266,6 +266,9 @@ pub struct Function {
     pub proj_pool: Vec<Proj>,            // backing store for ListRef of projections
     pub consts: Vec<u128>,               // ConstId -> bits
     pub origin: Vec<u64>,                // ValueId -> x86 address (debug/side table)
+    /// Calls that never return, each with the block that starts right after it
+    /// (where the call would have fallen through), for `abi::infer`.
+    pub noreturn_falls: Vec<(ValueId, BlockId)>,
 }
 
 impl Function {
@@ -283,6 +286,7 @@ impl Function {
             proj_pool: Vec::with_capacity(0),
             consts: Vec::with_capacity(insts / 4),
             origin: Vec::with_capacity(insts),
+            noreturn_falls: Vec::new(),
         }
     }
 
@@ -295,6 +299,7 @@ impl Function {
         self.proj_pool.clear();
         self.consts.clear();
         self.origin.clear();
+        self.noreturn_falls.clear();
     }
 }
 

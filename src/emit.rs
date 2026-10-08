@@ -2146,12 +2146,18 @@ impl Emitter<'_> {
         }
         // The other arguments may read the roots lent here (`f(&mut s[..],
         // s[8])`), so they are evaluated first.
+        // So may the addresses of the lent ones.
+        let simple = |e: &str| e.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let mut offs: Vec<String> = args.iter().map(|&v| expr::recv(self.as_u64(v))).collect();
         if !groups.is_empty() {
             let lent: Vec<usize> = groups.iter().flat_map(|g| g.1.iter().copied()).collect();
             for k in 0..out.len() {
-                if !lent.contains(&k) && !out[k].chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                if !lent.contains(&k) && !simple(&out[k]) {
                     let _ = write!(lets, "let __a{k} = {}; ", out[k]);
                     out[k] = format!("__a{k}");
+                } else if lent.contains(&k) && !simple(&offs[k]) {
+                    let _ = write!(lets, "let __o{k}: u64 = {}; ", offs[k]);
+                    offs[k] = format!("__o{k}");
                 }
             }
         }
@@ -2159,7 +2165,7 @@ impl Emitter<'_> {
             let place = self.places[r as usize].as_ref().unwrap();
             let mutbl = |k: usize| matches!(pass[k], Pass::Borrow { mutbl: true, .. });
             let nullable = |k: usize| matches!(pass[k], Pass::Borrow { nullable: true, .. });
-            let off = |k: usize| expr::recv(self.as_u64(args[k]));
+            let off = |k: usize| offs[k].clone();
             let mut exprs: Vec<(usize, String)> = Vec::new();
             if ks.len() == 1 || !ks.iter().any(|&k| mutbl(k)) {
                 for &k in &ks {

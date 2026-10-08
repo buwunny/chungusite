@@ -107,6 +107,19 @@ const TABLE: &[(&str, u8, bool, bool)] = &[
 ];
 
 /// The signature of a C library function, if the table knows it.
+/// Functions that never return; a call to one ends its block.
+const NORETURN: &[&str] = &[
+    "abort", "exit", "_exit", "_Exit", "quick_exit", "__stack_chk_fail", "__assert_fail", "__assert_perror_fail",
+    "__fortify_fail", "__chk_fail", "err", "errx", "verr", "verrx", "longjmp", "siglongjmp", "__longjmp_chk",
+    "pthread_exit", "__cxa_throw", "__cxa_rethrow", "__cxa_bad_cast", "__cxa_bad_typeid", "_Unwind_Resume",
+    "__cxa_call_unexpected", "_ZSt9terminatev",
+];
+
+pub fn noreturn(name: &str) -> bool {
+    let name = name.split('@').next().unwrap_or(name);
+    NORETURN.contains(&name)
+}
+
 pub fn lookup(name: &str) -> Option<Sig> {
     // versioned names from some symbol tables: memcpy@GLIBC_2.14
     let name = name.split('@').next().unwrap_or(name);

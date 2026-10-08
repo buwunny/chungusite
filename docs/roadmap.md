@@ -8,15 +8,14 @@ The ML refinement layer (`src/refine`, behind the `ml` feature; see docs/ml-runt
 
 ## 1. Lifter coverage (the blocker for real code)
 
-`CALL`, `PUSH`/`POP`, the 8/16-bit `MOV` forms, `CMOVcc`/`SETcc`, memory operands, `MOVZX`/`MOVSX`, shifts, `IMUL`, `INC`/`DEC`/`NEG`/`NOT` and `DIV`/`IDIV` after `CQO` or `xor edx, edx` are lifted now ([lift.md](lift.md)). What still fails on the 11,580-function sample, by the first unsupported instruction in each function:
+`CALL`, `PUSH`/`POP`, the 8/16-bit `MOV` forms, `CMOVcc`/`SETcc`, memory operands, `MOVZX`/`MOVSX`, shifts, `IMUL`/`MUL`, `INC`/`DEC`/`NEG`/`NOT`, `DIV`/`IDIV` after `CQO` or `xor edx, edx`, jump tables, 16-byte SSE moves and zeroing, `ADC`/`SBB`, the bit instructions, the atomics and `rep movs` are lifted now ([lift.md](lift.md)). On a newer debug build of chungusite (20,025 functions), 19,862 lift (99.2%). What still fails, by the first unsupported instruction in each function:
 
 | Cause | Functions | What's needed |
 |---|---|---|
-| SSE (`MOVUPS`, `XORPS`, `MOVDQA`, `MOVAPS`, `MOVD`, ...) | ~600 | 16-byte copies first (`MOVUPS` pairs are mostly memcpy of two qwords), then scalar float (`F32`/`F64` exist in `Ty`), then vectors |
-| Indirect `JMP` | 136 | jump-table recovery into `Terminator::Switch` (the emitter needs a case for it too) |
-| `MUL` (one operand) | 46 | a 128-bit product: `rax` is the low half, `rdx` the high half, OF/CF = high != 0 |
-| `SBB`, `ADC`, `XADD`, `CMPXCHG`, `BSR`, `TZCNT`, `BT`, `BSWAP`, `ROL`, `MOVSQ`, ... | ~150 | one at a time; atomics need an `Atomic` op or `Opaque` |
-| Flags across blocks | 20 | materialize the flag values at the block exit when a successor reads them (`LiftError::FlagsNotInBlock`) |
+| Flags across blocks | 43 | materialize the flag values at the block exit when a successor reads them (`LiftError::FlagsNotInBlock`) |
+| SIMD (`PCMPEQB`, `PCMPGTB`, `PUNPCKLBW`, `PMOVMSKB`, ...) and scalar float (`MOVSD`, `CVTSI2SS`) | ~70 | vector lanes, then `F32`/`F64` values and xmm arguments across blocks and calls |
+| Thread-locals (`mov rax, fs:0`) | 23 | a model of the thread pointer |
+| The rest (`PAUSE`, AVX moves, 8-bit `DIV`/`MUL`, `CPUID`, ...) | ~25 | one at a time |
 
 ## 2. Calls and signatures (done)
 

@@ -174,10 +174,10 @@ fn cli_decompiles_an_elf() {
     use object::{Architecture, BinaryFormat, Endianness, SymbolFlags, SymbolKind, SymbolScope};
 
     let get_count = [0x48, 0x8B, 0x47, 0x08, 0xC3]; // mov rax, [rdi+8]; ret
-    let mul = [0x48, 0xF7, 0xE1, 0xC3]; // mul rcx; ret (rdx:rax result, not liftable yet)
+    let cpuid = [0x0F, 0xA2, 0xC3]; // cpuid; ret (not liftable)
     let mut obj = Obj::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
     let text = obj.section_id(StandardSection::Text);
-    for (name, code) in [("get_count", &get_count[..]), ("muller", &mul[..])] {
+    for (name, code) in [("get_count", &get_count[..]), ("probe", &cpuid[..])] {
         let off = obj.append_section_data(text, code, 16);
         obj.add_symbol(Symbol {
             name: name.as_bytes().to_vec(),
@@ -198,13 +198,13 @@ fn cli_decompiles_an_elf() {
     let list = Command::new(bin).arg(&elf).arg("--list").output().unwrap();
     let text = String::from_utf8(list.stdout).unwrap();
     assert!(text.contains("ok    get_count @ 0x0, 5 bytes"), "{text}");
-    assert!(text.contains("FAIL  muller @ 0x10, 4 bytes: unsupported instruction Mul at 0x10"), "{text}");
+    assert!(text.contains("FAIL  probe @ 0x10, 3 bytes: unsupported instruction Cpuid at 0x10"), "{text}");
     assert_eq!(list.status.code(), Some(1), "not everything lifted");
 
     for mode in ["fast", "safe"] {
         let out = Command::new(bin).arg(&elf).args(["--mode", mode]).output().unwrap();
         let src = String::from_utf8(out.stdout).unwrap();
-        assert!(src.contains("pub fn muller() -> u64 {\n    todo!(\"not lifted: unsupported instruction Mul at 0x10\")"), "{src}");
+        assert!(src.contains("pub fn probe() -> u64 {\n    todo!(\"not lifted: unsupported instruction Cpuid at 0x10\")"), "{src}");
         if mode == "safe" {
             assert!(src.contains("pub fn get_count(rdi_ref: &[u8]) -> u64 {"), "{src}");
         }
@@ -214,7 +214,7 @@ fn cli_decompiles_an_elf() {
     let one = Command::new(bin).arg(&elf).args(["-f", "get_count", "--emit", "ir"]).output().unwrap();
     assert!(one.status.success());
     let ir = String::from_utf8(one.stdout).unwrap();
-    assert!(ir.contains("load v1") && !ir.contains("muller"), "{ir}");
+    assert!(ir.contains("load v1") && !ir.contains("probe"), "{ir}");
 
     let missing = Command::new(bin).arg(&elf).args(["-f", "nope"]).output().unwrap();
     assert_eq!(missing.status.code(), Some(2));

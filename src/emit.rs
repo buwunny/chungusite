@@ -22,7 +22,7 @@
 use crate::abi::{Sig, Site, STACK_ARG_BASE, SYSV_ARGS};
 use crate::borrow::{analyze, Class, ParamBorrow, RSP};
 use crate::cfg::Cfg;
-use crate::structure::{print, structure, Node, Source};
+use crate::structure::{print, structure, switch_arms, Node, Source};
 use crate::ir::*;
 use crate::verify::for_each_operand;
 use std::fmt::Write;
@@ -303,7 +303,11 @@ fn term_uses(f: &Function, t: Terminator, mut cb: impl FnMut(ValueId)) {
             cb(c);
             list(args, &mut cb)
         }
-        Terminator::Return(Some(v)) | Terminator::Switch { v, .. } => cb(v),
+        Terminator::Return(Some(v)) => cb(v),
+        Terminator::Switch { v, args, .. } => {
+            cb(v);
+            list(args, &mut cb)
+        }
         Terminator::TailCall { callee, args } => {
             cb(callee);
             list(args, &mut cb)
@@ -320,6 +324,7 @@ fn rty(ty: TyId) -> &'static str {
         TyId::BOOL => "bool",
         TyId::UNIT => "()",
         TyId::PAIR => "(u64, u64)",
+        TyId::B16 => "u128",
         _ => "u64", // B8, PTR, and anything richer the IR grows later
     }
 }
@@ -329,6 +334,7 @@ fn bytes(ty: TyId) -> usize {
         TyId::B1 => 1,
         TyId::B2 => 2,
         TyId::B4 => 4,
+        TyId::B16 => 16,
         _ => 8,
     }
 }
@@ -338,6 +344,7 @@ fn signed(ty: TyId) -> &'static str {
         1 => "i8",
         2 => "i16",
         4 => "i32",
+        16 => "i128",
         _ => "i64",
     }
 }
@@ -454,7 +461,7 @@ impl Emitter<'_> {
                 }
             }
         }
-        let has_edges = cfg.rpo.iter().any(|&b| f.blocks[b].term.successors()[0].is_some());
+        let has_edges = cfg.rpo.iter().any(|&b| f.blocks[b].term.successors(&f.value_pool).next().is_some());
         if !has_edges {
             self.block(f.entry, "    ", out);
             return;
@@ -527,12 +534,8 @@ impl Emitter<'_> {
                     (false, _) => format!("{call}; return;"),
                 }
             }
-            Terminator::Switch { .. } => {
-                self.stats.todo += 1;
-                "todo!(\"switch\");".to_string()
-            }
             Terminator::Unreachable => "panic!(\"execution ran past the end of the lifted code\");".to_string(),
-            Terminator::Jump { .. } | Terminator::Branch { .. } => unreachable!("not an exit"),
+            Terminator::Jump { .. } | Terminator::Branch { .. } | Terminator::Switch { .. } => unreachable!("not an exit"),
         }
     }
 
@@ -556,9 +559,27 @@ impl Emitter<'_> {
                 self.goto(e, &a[nt..], &inner, out);
                 let _ = writeln!(out, "{ind}}}");
             }
+            Terminator::Switch { v, .. } => {
+                let inner = format!("{ind}        ");
+                let _ = writeln!(out, "{ind}match {} {{", self.switch_on(v));
+                for (to, pat, args) in switch_arms(f, b) {
+                    let _ = writeln!(out, "{ind}    {pat} => {{");
+                    self.goto(to, &args, &inner, out);
+                    let _ = writeln!(out, "{ind}    }}");
+                }
+                let _ = writeln!(out, "{ind}}}");
+            }
             _ => {
                 let _ = writeln!(out, "{ind}{}", self.exit_line(b));
             }
+        }
+    }
+
+    /// A `Switch` index as a `u64`, to match on.
+    fn switch_on(&self, v: ValueId) -> String {
+        match self.ty(v) {
+            TyId::B8 => self.name(v),
+            _ => format!("{} as u64", self.name(v)),
         }
     }
 
@@ -601,7 +622,7 @@ impl Emitter<'_> {
                 match ty {
                     TyId::BOOL => (v != 0).to_string(),
                     _ => {
-                        let mask = if bytes(ty) >= 8 { u64::MAX as u128 } else { (1u128 << (bytes(ty) * 8)) - 1 };
+                        let mask = if bytes(ty) >= 16 { u128::MAX } else if bytes(ty) >= 8 { u64::MAX as u128 } else { (1u128 << (bytes(ty) * 8)) - 1 };
                         format!("{:#x}_{t}", v & mask)
                     }
                 }
@@ -833,6 +854,10 @@ impl Source for Emitter<'_> {
 
     fn cond(&self, c: ValueId) -> String {
         self.name(c)
+    }
+
+    fn scrutinee(&self, v: ValueId) -> String {
+        self.switch_on(v)
     }
 
     fn exit(&mut self, b: BlockId) -> Node {

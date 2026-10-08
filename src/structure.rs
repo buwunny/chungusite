@@ -37,6 +37,8 @@ pub enum Node {
     /// A statement that never continues (`return`, `panic!`, `todo!`).
     Exit(String),
     If { c: String, then: Vec<Node>, els: Vec<Node> },
+    /// `match v { pattern => arm, ... }`; the last pattern is `_`.
+    Match { v: String, arms: Vec<(String, Vec<Node>)> },
     Loop { head: u32, body: Vec<Node> },
     Block { label: u32, body: Vec<Node> },
     /// Leave the labeled block or loop.
@@ -53,6 +55,8 @@ pub trait Source {
     fn edge(&mut self, to: BlockId, args: &[ValueId]) -> Vec<Node>;
     /// The condition of a `Branch`, as an expression.
     fn cond(&self, c: ValueId) -> String;
+    /// The value a `Switch` matches on, as a `u64` expression.
+    fn scrutinee(&self, v: ValueId) -> String;
     /// A terminator without successors (return, tail call, ...), as a statement.
     fn exit(&mut self, b: BlockId) -> Node;
 }
@@ -66,7 +70,7 @@ const MAX_DEPTH: usize = 512;
 /// source, and is a back edge of a natural loop.
 pub fn reducible(f: &Function, cfg: &Cfg) -> bool {
     cfg.rpo.iter().all(|&b| {
-        f.blocks[b].term.successors().into_iter().flatten().all(|s| {
+        f.blocks[b].term.successors(&f.value_pool).all(|s| {
             cfg.rpo_index[s.index()] > cfg.rpo_index[b.index()] || cfg.dominates(s, b)
         })
     })
@@ -90,7 +94,13 @@ pub fn structure(f: &Function, cfg: &Cfg, src: &mut dyn Source) -> Option<Vec<No
                 return None;
             }
         }
-        for s in f.blocks[b].term.successors().into_iter().flatten() {
+        // A switch is one edge per distinct target: each target is one arm.
+        let mut succs: Vec<BlockId> = f.blocks[b].term.successors(&f.value_pool).collect();
+        if let Terminator::Switch { .. } = f.blocks[b].term {
+            succs.sort_unstable_by_key(|s| s.index());
+            succs.dedup();
+        }
+        for s in succs {
             if cfg.rpo_index[s.index()] > cfg.rpo_index[b.index()] {
                 forward_in[s.index()] += 1;
             } else {
@@ -190,6 +200,14 @@ impl Structurer<'_, '_> {
                         let els = self.branch(b, e, &a[nt..]);
                         out.push(Node::If { c: self.src.cond(c), then, els });
                     }
+                    Terminator::Switch { v, .. } => {
+                        let mut arms = Vec::new();
+                        for (to, cases, args) in switch_arms(f, b) {
+                            let body = self.branch(b, to, &args);
+                            arms.push((cases, body));
+                        }
+                        out.push(Node::Match { v: self.src.scrutinee(v), arms });
+                    }
                     _ => out.push(self.src.exit(b)),
                 }
                 out
@@ -211,6 +229,51 @@ impl Structurer<'_, '_> {
     }
 }
 
+/// A `Switch`'s table grouped by target, in order of first appearance, as
+/// (target, `match` pattern, edge arguments). The target with the most cases
+/// goes last, with pattern `_`.
+pub fn switch_arms(f: &Function, b: BlockId) -> Vec<(BlockId, String, Vec<ValueId>)> {
+    let mut groups: Vec<(BlockId, Vec<usize>, Vec<ValueId>)> = Vec::new();
+    for (k, (to, args)) in f.edges(b).enumerate() {
+        match groups.iter_mut().find(|g| g.0 == to) {
+            Some(g) => g.1.push(k),
+            None => groups.push((to, vec![k], args.to_vec())),
+        }
+    }
+    if let Some(big) = (0..groups.len()).max_by_key(|&i| (groups[i].1.len(), std::cmp::Reverse(i))) {
+        let g = groups.remove(big);
+        groups.push(g);
+    }
+    let last = groups.len().saturating_sub(1);
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(i, (to, cases, args))| {
+            let pat = if i == last { "_".to_string() } else { patterns(&cases) };
+            (to, pat, args)
+        })
+        .collect()
+}
+
+/// `0 | 2..=5 | 9`: runs of consecutive cases as ranges.
+fn patterns(cases: &[usize]) -> String {
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i < cases.len() {
+        let mut j = i;
+        while j + 1 < cases.len() && cases[j + 1] == cases[j] + 1 {
+            j += 1;
+        }
+        parts.push(match j - i {
+            0 => format!("{}", cases[i]),
+            1 => format!("{} | {}", cases[i], cases[j]),
+            _ => format!("{}..={}", cases[i], cases[j]),
+        });
+        i = j + 1;
+    }
+    parts.join(" | ")
+}
+
 // ---------------------------------------------------------------------------
 // Tidying
 
@@ -220,6 +283,7 @@ fn uses(nodes: &[Node], l: Label) -> bool {
         Node::Break(x) => *x == l,
         Node::Continue(h) => l == Label::Loop(*h),
         Node::If { then, els, .. } => uses(then, l) || uses(els, l),
+        Node::Match { arms, .. } => arms.iter().any(|(_, a)| uses(a, l)),
         Node::Loop { body, .. } | Node::Block { body, .. } => uses(body, l),
         Node::Line(_) | Node::Exit(_) => false,
     })
@@ -230,6 +294,7 @@ fn diverges(nodes: &[Node]) -> bool {
     match nodes.last() {
         Some(Node::Exit(_) | Node::Break(_) | Node::Continue(_)) => true,
         Some(Node::If { then, els, .. }) => diverges(then) && diverges(els),
+        Some(Node::Match { arms, .. }) => arms.iter().all(|(_, a)| diverges(a)),
         Some(Node::Block { label, body }) => diverges(body) && !uses(body, Label::Block(*label)),
         Some(Node::Loop { head, body }) => !uses_break(body, Label::Loop(*head)),
         Some(Node::Line(_)) | None => false,
@@ -241,6 +306,7 @@ fn uses_break(nodes: &[Node], l: Label) -> bool {
     nodes.iter().any(|n| match n {
         Node::Break(x) => *x == l,
         Node::If { then, els, .. } => uses_break(then, l) || uses_break(els, l),
+        Node::Match { arms, .. } => arms.iter().any(|(_, a)| uses_break(a, l)),
         Node::Loop { body, .. } | Node::Block { body, .. } => uses_break(body, l),
         _ => false,
     })
@@ -261,6 +327,7 @@ fn drop_tail(nodes: &mut Vec<Node>, jump: &Node) -> bool {
             true
         }
         Some(Node::If { then, els, .. }) => drop_tail(then, jump) | drop_tail(els, jump),
+        Some(Node::Match { arms, .. }) => arms.iter_mut().fold(false, |c, (_, a)| drop_tail(a, jump) | c),
         // Falling off an inner block's end also falls off ours.
         Some(Node::Block { body, .. }) => drop_tail(body, jump),
         _ => false,
@@ -284,6 +351,7 @@ fn size(nodes: &[Node]) -> usize {
         .iter()
         .map(|n| match n {
             Node::If { then, els, .. } => 1 + size(then) + size(els),
+            Node::Match { arms, .. } => 1 + arms.iter().map(|(_, a)| size(a)).sum::<usize>(),
             Node::Loop { body, .. } | Node::Block { body, .. } => 1 + size(body),
             _ => 1,
         })
@@ -296,6 +364,7 @@ pub fn tidy(nodes: Vec<Node>) -> Vec<Node> {
         .into_iter()
         .map(|n| match n {
             Node::If { c, then, els } => Node::If { c, then: tidy(then), els: tidy(els) },
+            Node::Match { v, arms } => Node::Match { v, arms: arms.into_iter().map(|(p, a)| (p, tidy(a))).collect() },
             // Tail jumps go first, while both arms of an `if` still end in one:
             // tidying the body first could turn `if c { A; break 'b } else { B; break 'b }`
             // into `if c { A; break 'b } B; break 'b`, which keeps the label.
@@ -328,6 +397,7 @@ fn retarget(nodes: &mut [Node], from: Label, to: Label) {
                 retarget(then, from, to);
                 retarget(els, from, to);
             }
+            Node::Match { arms, .. } => arms.iter_mut().for_each(|(_, a)| retarget(a, from, to)),
             Node::Loop { body, .. } | Node::Block { body, .. } => retarget(body, from, to),
             _ => {}
         }
@@ -407,6 +477,7 @@ fn needs_label(nodes: &[Node], stack: &mut Vec<Label>, named: &mut std::collecti
                 needs_label(then, stack, named);
                 needs_label(els, stack, named);
             }
+            Node::Match { arms, .. } => arms.iter().for_each(|(_, a)| needs_label(a, stack, named)),
             Node::Loop { head, body } => {
                 stack.push(Label::Loop(*head));
                 needs_label(body, stack, named);
@@ -464,6 +535,15 @@ impl Printer {
                         self.list(els, depth + 1, out);
                         let _ = writeln!(out, "{ind}}}");
                     }
+                }
+                Node::Match { v, arms } => {
+                    let _ = writeln!(out, "{ind}match {v} {{");
+                    for (pat, arm) in arms {
+                        let _ = writeln!(out, "{ind}    {pat} => {{");
+                        self.list(arm, depth + 2, out);
+                        let _ = writeln!(out, "{ind}    }}");
+                    }
+                    let _ = writeln!(out, "{ind}}}");
                 }
                 Node::Loop { head, body } => {
                     let l = Label::Loop(*head);

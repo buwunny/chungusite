@@ -94,11 +94,33 @@ bb0():
 
 After lifting, `opt::clean` removes trivial block params and dead code; see [ownership.md](ownership.md) for that pass and the safe-mode analyses built on it.
 
+## Jump tables
+
+An indirect `jmp` is a jump table when the instructions just before it, in the same straight-line run, compute its target from a table:
+
+- `lea b, [rip+T]; movsxd e, dword [b+x*4]; add e, b; jmp e` (position-independent code: entries are 32-bit offsets from `T`), or
+- `jmp [x*8+T]` and `mov r, [x*8+T]; jmp r` (absolute addresses).
+
+Pass 1 recognizes these from a window of the last 8 instructions and reads the table through `lift::Context`, which `program.rs` backs with the linked program's sections (`load::Image`). Nothing bounds the table: Rust's `match` on an enum discriminant has no range check before the jump. So entries are read until one isn't the start of an instruction in this function, or the table runs into another table of the same function. Extra entries past the real end are harmless, since no index reaches them. Every target becomes a leader, and the `jmp` becomes `Terminator::Switch { v, table, args }`, where `v` is the index register read at the table load. The table lists one block per case (`ir::block_of` decodes an entry), edge arguments go per entry in table order like `Branch`'s, and `Terminator::successors` and `Function::edges` walk them. The emitter prints a `match` with one arm per target; the target with the most cases becomes `_`.
+
+Any other indirect `jmp` (through a register, a vtable slot or the GOT) leaves the function, so it is a tail call. A jump that looks like a table but can't be read (no `Context`, or a relocatable object whose sections aren't laid out) is unsupported rather than a guess.
+
+## SSE, wide multiplies and the rest
+
+- **xmm registers** are tracked within a block only: `movups`/`movdqu`/`movaps`/`movdqa` loads, stores and copies, `xorps`/`pxor` zeroing and the other bitwise ops, `pcmpeq x, x` (all ones), `movq`/`movd` to and from GPRs and memory, and `punpcklqdq`/`movlhps` (two qwords into one register). Values are 16 bytes (`TyId::B16`, a `u128` in Rust). That covers struct copies and zeroing, which are almost all the SSE in integer code. A block that reads an xmm register it didn't write, or reads one after a call, is unsupported: there are no xmm block parameters or float arguments yet.
+- **One-operand `mul`/`imul`** (32 and 64-bit) compute the double-width product, and `rdx` (`edx`) gets the high half. The flags after any `mul`/`imul` are `Flags::Mul`: `jo`/`jc` and `seto`/`setc` rebuild the overflow check from the operands only if something reads them.
+- **`adc`/`sbb`** add or subtract the carry the previous instruction left (`cmp; sbb eax, eax` and 128-bit `add; adc` chains). The carry out of them isn't modelled.
+- **`shld`/`shrd`** shift the register pair as one double-width value. **8/16-bit shifts** by `cl` or by 8 or more shift a 32-bit copy, since x86 masks the count to 5 bits, not to the operand width.
+- **`bt`** (CF only), **`bsf`/`bsr`/`tzcnt`/`lzcnt`/`popcnt`**, **`bswap`**, **`rol`/`ror`**, **`xchg`**, **`xadd`** and **`cmpxchg`**. The atomics are lifted as plain loads and stores, which is right for one thread.
+- **`rep movs`** is a `MemCopy` of `rcx` elements, with the direction flag assumed clear.
+- **The stack protector's canary** `fs:[0x28]` reads as a constant, so the check at the end of the function always passes. Other `fs:`/`gs:` accesses (thread-locals) stay unsupported.
+- **Calls that don't return** (`abort`, `exit`, `__stack_chk_fail`, `__cxa_throw`, ...; `libc::noreturn`) end their block, so a caller doesn't merge their undefined `rax` into its return value. `Context::noreturn` names the callee from the relocation or PLT entry at the call.
+
 ## Not handled yet
 
-- SSE and AVX (`MOVUPS`, `MOVAPS`, `MOVSD`, `XORPS`, ...), the largest group of failures left.
-- Indirect jumps other than `JMP [RIP+x]`, which are mostly jump tables to recover into `Terminator::Switch`.
-- One-operand `MUL`/`IMUL` and `DIV` with a real 128-bit dividend, which need a 128-bit product.
-- `ADC`/`SBB`, atomics (`LOCK XADD`, `CMPXCHG`), `BSR`/`TZCNT`/`BSWAP`/`BT`, rotates, and string ops (`MOVSQ`).
-- Flags that cross blocks (`LiftError::FlagsNotInBlock`), and parity, plus the signed conditions after `ADD`.
-- FS/GS (TLS) accesses.
+- Scalar float and vector arithmetic (`movsd`, `addsd`, `cvtsi2sd`, `pshufd`, `pcmpeqb`, ...), and xmm values across blocks and calls.
+- `rep stos` (there is no memset instruction in the IR yet).
+- `DIV` with a real 128-bit dividend, and 8/16-bit `MUL`/`DIV`.
+- Flags that cross blocks (`LiftError::FlagsNotInBlock`), parity, the carry out of `adc`/`sbb`, and the signed conditions after `ADD`.
+- Thread-locals (`fs:`/`gs:` other than the canary).
+- Conditional branches into another function (gcc's `.cold` parts).

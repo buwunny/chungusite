@@ -454,8 +454,8 @@ fn uses_value(f: &Function, v: ValueId) -> bool {
         let list = |l: ListRef| l.get(&f.value_pool).contains(&v);
         match blk.term {
             Terminator::Jump { args, .. } => used |= list(args),
-            Terminator::Branch { c, args, .. } => used |= c == v || list(args),
-            Terminator::Return(Some(r)) | Terminator::Switch { v: r, .. } => used |= r == v,
+            Terminator::Branch { c: r, args, .. } | Terminator::Switch { v: r, args, .. } => used |= r == v || list(args),
+            Terminator::Return(Some(r)) => used |= r == v,
             Terminator::TailCall { callee, args } => used |= callee == v || list(args),
             _ => {}
         }
@@ -488,14 +488,33 @@ fn mem2reg(f: &mut Function, cfg: &Cfg, o: &Offsets, accesses: &[Access], slots:
     let mut entry_head: Vec<ValueId> = Vec::new();
     let mut entry_params: Vec<ValueId> = Vec::new();
 
+    // A stack argument slot's value on entry: its word's parameter (one per word,
+    // shared), narrowed to the slot's size.
+    let stack_arg = |f: &mut Function, s: usize, entry_head: &mut Vec<ValueId>, entry_params: &mut Vec<ValueId>| -> ValueId {
+        let slot = slots[promoted[s]];
+        let reg = STACK_ARG_BASE + ((slot.off - 8) / 8) as u8;
+        let p = match entry_params.iter().copied().find(|&q| matches!(f.insts[q].kind, InstKind::BlockParam(r) if r == reg)) {
+            Some(q) => q,
+            None => {
+                let p = new_inst(f, InstKind::BlockParam(reg), TyId::B8, at);
+                entry_params.push(p);
+                p
+            }
+        };
+        if slot.size >= 8 {
+            return p;
+        }
+        let t = new_inst(f, InstKind::Cast { kind: CastKind::Trunc, v: p }, TyId::unknown(slot.size as usize), at);
+        entry_head.push(t);
+        t
+    };
+
     // A slot's value on entry to block `b`.
     let live_in_value = |f: &mut Function, b: BlockId, s: usize, entry_head: &mut Vec<ValueId>, entry_params: &mut Vec<ValueId>| -> ValueId {
         let slot = slots[promoted[s]];
         if b == entry || cfg.preds(b).is_empty() {
             if b == entry && slot.off >= 8 {
-                let p = new_inst(f, InstKind::BlockParam(STACK_ARG_BASE + ((slot.off - 8) / 8) as u8), TyId::B8, at);
-                entry_params.push(p);
-                p
+                stack_arg(f, s, entry_head, entry_params)
             } else {
                 let u = new_inst(f, InstKind::Undef, TyId::unknown(slot.size as usize), at);
                 entry_head.push(u);
@@ -521,17 +540,7 @@ fn mem2reg(f: &mut Function, cfg: &Cfg, o: &Offsets, accesses: &[Access], slots:
                     let v = match cur[s] {
                         Some(v) => v,
                         None => {
-                            // only an entry-reaching stack argument can be shared:
-                            // one parameter per word
-                            let v = if b == entry && slots[promoted[s]].off >= 8 {
-                                let reg = STACK_ARG_BASE + ((slots[promoted[s]].off - 8) / 8) as u8;
-                                match entry_params.iter().copied().find(|&p| matches!(f.insts[p].kind, InstKind::BlockParam(r) if r == reg)) {
-                                    Some(p) => p,
-                                    None => live_in_value(f, b, s, &mut entry_head, &mut entry_params),
-                                }
-                            } else {
-                                live_in_value(f, b, s, &mut entry_head, &mut entry_params)
-                            };
+                            let v = live_in_value(f, b, s, &mut entry_head, &mut entry_params);
                             live_in[bi][s] = Some(v);
                             cur[s] = Some(v);
                             v
@@ -553,42 +562,24 @@ fn mem2reg(f: &mut Function, cfg: &Cfg, o: &Offsets, accesses: &[Access], slots:
         out[bi] = cur;
     }
 
-    // Live-ins must be defined at the end of every predecessor.
-    loop {
-        let mut changed = false;
-        for bi in 0..n {
-            let b = BlockId::new(bi);
-            for s in 0..ns {
-                if live_in[bi][s].is_none() || b == entry {
-                    continue;
-                }
-                for &p in cfg.preds(b) {
-                    let pi = p.index();
-                    if out[pi][s].is_none() {
-                        let v = if p == entry {
-                            let reg_off = slots[promoted[s]].off;
-                            let existing = if reg_off >= 8 {
-                                let reg = STACK_ARG_BASE + ((reg_off - 8) / 8) as u8;
-                                entry_params.iter().copied().find(|&q| matches!(f.insts[q].kind, InstKind::BlockParam(r) if r == reg))
-                            } else {
-                                None
-                            };
-                            match existing {
-                                Some(q) => q,
-                                None => live_in_value(f, p, s, &mut entry_head, &mut entry_params),
-                            }
-                        } else {
-                            live_in_value(f, p, s, &mut entry_head, &mut entry_params)
-                        };
-                        live_in[pi][s] = Some(v);
-                        out[pi][s] = Some(v);
-                        changed = true;
-                    }
-                }
-            }
+    // Live-ins must be defined at the end of every predecessor. A worklist of
+    // (block, slot) live-ins whose predecessors haven't been checked yet.
+    let mut work: Vec<(usize, usize)> =
+        (0..n).flat_map(|bi| (0..ns).map(move |s| (bi, s))).filter(|&(bi, s)| live_in[bi][s].is_some()).collect();
+    work.reverse();
+    while let Some((bi, s)) = work.pop() {
+        let b = BlockId::new(bi);
+        if b == entry {
+            continue;
         }
-        if !changed {
-            break;
+        for &p in cfg.preds(b) {
+            let pi = p.index();
+            if out[pi][s].is_none() {
+                let v = live_in_value(f, p, s, &mut entry_head, &mut entry_params);
+                live_in[pi][s] = Some(v);
+                out[pi][s] = Some(v);
+                work.push((pi, s));
+            }
         }
     }
 
@@ -613,11 +604,8 @@ fn mem2reg(f: &mut Function, cfg: &Cfg, o: &Offsets, accesses: &[Access], slots:
     for bi in 0..n {
         let b = BlockId::new(bi);
         let term = f.blocks[b].term;
-        let (old_args, succs) = match term {
-            Terminator::Jump { to, args } => (args, vec![to]),
-            Terminator::Branch { t, f: e, args, .. } => (args, vec![t, e]),
-            _ => continue,
-        };
+        let Some(old_args) = term.edge_args() else { continue };
+        let succs: Vec<BlockId> = term.successors(&f.value_pool).collect();
         if !succs.iter().any(|s| (0..ns).any(|k| has_param(s.index(), k, &live_in, f))) {
             continue;
         }
@@ -638,9 +626,8 @@ fn mem2reg(f: &mut Function, cfg: &Cfg, o: &Offsets, accesses: &[Access], slots:
         let start = f.value_pool.len() as u32;
         f.value_pool.extend_from_slice(&new);
         let list = ListRef { start, len: new.len() as u32 };
-        match &mut f.blocks[b].term {
-            Terminator::Jump { args, .. } | Terminator::Branch { args, .. } => *args = list,
-            _ => {}
+        if let Some(args) = f.blocks[b].term.edge_args_mut() {
+            *args = list;
         }
     }
 

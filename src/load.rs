@@ -203,6 +203,45 @@ impl<'a> Binary<'a> {
     }
 }
 
+/// Every allocated section of a linked program at its load address, for reading
+/// jump tables (`lift::Context`). Empty for relocatable objects, whose sections all
+/// sit at address 0 until linked.
+#[derive(Default)]
+pub struct Image<'a> {
+    /// (address, bytes), sorted by address.
+    sections: Vec<(u64, &'a [u8])>,
+}
+
+impl<'a> Image<'a> {
+    pub fn parse(data: &'a [u8]) -> Image<'a> {
+        let Ok(file) = object::File::parse(data) else { return Image::default() };
+        Image::of(&file)
+    }
+
+    pub fn of(file: &object::File<'a>) -> Image<'a> {
+        if file.kind() == ObjectKind::Relocatable {
+            return Image::default();
+        }
+        let mut sections: Vec<(u64, &'a [u8])> = file
+            .sections()
+            .filter(|s| s.address() != 0 && !matches!(s.kind(), SectionKind::UninitializedData | SectionKind::Metadata | SectionKind::Debug | SectionKind::Other))
+            .filter_map(|s| Some((s.address(), s.data().ok().filter(|d| d.len() as u64 == s.size())?)))
+            .collect();
+        sections.sort_by_key(|s| s.0);
+        Image { sections }
+    }
+}
+
+impl Image<'_> {
+    /// `len` bytes at `addr`, if they are all inside one section.
+    pub fn read(&self, addr: u64, len: usize) -> Option<&[u8]> {
+        let i = self.sections.partition_point(|s| s.0 <= addr).checked_sub(1)?;
+        let (start, bytes) = self.sections[i];
+        let off = usize::try_from(addr - start).ok()?;
+        bytes.get(off..off.checked_add(len)?)
+    }
+}
+
 /// Slots the loader fills with an address: 64-bit dynamic relocations whose
 /// target is known (`R_X86_64_RELATIVE`, or a symbol the binary defines), plus,
 /// for a binary without dynamic relocations (static, non-PIE), every nonzero GOT slot.

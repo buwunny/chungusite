@@ -22,7 +22,7 @@ impl Cfg {
         // Predecessors, counting sort style.
         let mut count = vec![0u32; n + 1];
         for (_, blk) in f.blocks.iter() {
-            for s in blk.term.successors().into_iter().flatten() {
+            for s in blk.term.successors(&f.value_pool) {
                 count[s.index() + 1] += 1;
             }
         }
@@ -33,7 +33,7 @@ impl Cfg {
         let mut fill = count;
         let mut preds = vec![f.entry; pred_start[n] as usize];
         for (b, blk) in f.blocks.iter() {
-            for s in blk.term.successors().into_iter().flatten() {
+            for s in blk.term.successors(&f.value_pool) {
                 preds[fill[s.index()] as usize] = b;
                 fill[s.index()] += 1;
             }
@@ -42,17 +42,14 @@ impl Cfg {
         // Reverse postorder with an explicit stack.
         let mut post = Vec::with_capacity(n);
         let mut seen = vec![false; n];
-        let mut stack: Vec<(BlockId, u8)> = vec![(f.entry, 0)];
+        let mut stack: Vec<(BlockId, u32)> = vec![(f.entry, 0)];
         seen[f.entry.index()] = true;
         while let Some(&mut (b, ref mut next)) = stack.last_mut() {
-            let succ = f.blocks[b].term.successors();
-            if (*next as usize) < succ.len() {
-                let s = succ[*next as usize];
+            // `next` counts the successors already visited.
+            if let Some(s) = f.blocks[b].term.successors(&f.value_pool).nth(*next as usize) {
                 *next += 1;
-                if let Some(s) = s {
-                    if !std::mem::replace(&mut seen[s.index()], true) {
-                        stack.push((s, 0));
-                    }
+                if !std::mem::replace(&mut seen[s.index()], true) {
+                    stack.push((s, 0));
                 }
             } else {
                 post.push(b);

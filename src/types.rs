@@ -1018,6 +1018,10 @@ pub fn recover(
             sigs[i] = Some((inferred_sig(x, fa, model, &known, table, &mut stats), HashMap::new()));
         }
     }
+    // the emitter types pointer values in bodies `*mut S`
+    for &t in known.values() {
+        table.ptr(t, Mutbl::Mut);
+    }
     // ... and the per-value tables are filled in parallel.
     let ints: Vec<TyId> = (0..8).map(|i| table.get(&Ty::Int { bits: 8 << (i / 2), signed: i % 2 == 1 }).unwrap()).collect();
     let int = |w: u8, signed: bool| ints[2 * w.trailing_zeros() as usize + signed as usize];

@@ -296,7 +296,10 @@ fn cli_decompiles_an_elf() {
         let src = String::from_utf8(out.stdout).unwrap();
         assert!(src.contains("pub fn bit_scan() -> u64 {\n    todo!(\"not lifted: unsupported instruction Bsr at 0x10\")"), "{src}");
         if mode == "safe" {
-            assert!(src.contains("pub fn get_count(rdi_ref: &[u8]) -> u64 {"), "{src}");
+            // one field at offset 8: a struct inferred from the access
+            assert!(src.contains("pub fn get_count(rdi_ref: &S1) -> u64 {"), "{src}");
+            assert!(src.contains("return rdi_ref.f8;"), "{src}");
+            assert!(src.contains("pub struct S1 {\n    pub _pad0: [u8; 8],\n    pub f8: u64,\n}"), "{src}");
         }
         rustc(&dir, &format!("{mode}.rs"), &src, &["--crate-type", "lib", "--emit", "metadata"]);
     }

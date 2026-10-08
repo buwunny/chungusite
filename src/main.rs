@@ -13,7 +13,7 @@ use chungusite::{
     ir::{Function, Idx},
     load::{Binary, FuncBytes},
     names::rust_ident,
-    program::{Input, Options, Program},
+    program::{BuildOptions, Input, Options, Program},
     sources::SOURCES,
 };
 use clap::{Parser, ValueEnum};
@@ -64,6 +64,10 @@ struct Cli {
     /// Skip functions that fail to lift instead of emitting a todo!() stub for them.
     #[arg(long)]
     skip_failed: bool,
+
+    /// Ignore DWARF debug info: infer every type from the code.
+    #[arg(long)]
+    no_dwarf: bool,
 
     /// Safe mode: compile the output with rustc (in batches) and emit every
     /// function it rejects in fast mode instead, until everything compiles.
@@ -193,7 +197,8 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         }
     }
     let file = data.as_deref();
-    let program = Program::build(inputs, file, cli.emit == Emit::RawIr);
+    let build = BuildOptions { dwarf: !cli.no_dwarf, model: None };
+    let program = Program::build_with(inputs, file, cli.emit == Emit::RawIr, build);
     // Function pointers in data are named by their identifier in the output; a
     // function --skip-failed leaves out keeps its slot's bytes from the file.
     let kept = |i: usize| !cli.skip_failed || program.funcs[i].ir.is_ok();
@@ -299,7 +304,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     let mut out = String::new();
     if rust {
         let _ = writeln!(out, "// Decompiled by chungusite from {source} (--mode {mode_name}).");
-        out.push_str("#![allow(unused_mut, unused_variables, unused_assignments, unreachable_code, non_snake_case, non_upper_case_globals, unused_parens, unused_unsafe, clippy::all)]\n");
+        out.push_str("#![allow(unused_mut, unused_variables, unused_assignments, unreachable_code, non_snake_case, non_upper_case_globals, non_camel_case_types, unused_parens, unused_unsafe, clippy::all)]\n");
         out.push_str(&program.prelude());
     }
     let mut failures: BTreeMap<String, usize> = BTreeMap::new();
@@ -346,7 +351,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 emitted_fns += 1;
                 let _ = write!(out, "\n// {header}");
                 if s.checked + s.raw > 0 {
-                    let _ = write!(out, "; {} of {} memory accesses bounds-checked", s.checked, s.checked + s.raw);
+                    let _ = write!(out, "; {} of {} memory accesses safe", s.checked, s.checked + s.raw);
                 }
                 out.push('\n');
                 out.push_str(body);
@@ -378,9 +383,17 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     }
     if total.checked + total.raw > 0 {
         let mem_raw: usize = total.raw_by.iter().sum();
-        eprintln!("  memory accesses: {} bounds-checked, {} raw", total.checked, mem_raw);
+        eprintln!("  memory accesses: {} safe (slice bounds-checked or a struct field), {} raw", total.checked, mem_raw);
         let by: Vec<String> = SOURCES.iter().zip(total.raw_by).map(|(n, c)| format!("{n} {c}")).collect();
         eprintln!("  raw accesses by source: {}", by.join(", "));
+    }
+    let ts = program.type_stats;
+    if ts.args > 0 || ts.debug_fns > 0 {
+        let from = if ts.debug_fns > 0 { format!(", {} prototypes from debug info", ts.debug_fns) } else { String::new() };
+        eprintln!(
+            "  types: {} of {} arguments typed, {} structs inferred from field accesses{from}",
+            ts.typed_args, ts.args, ts.inferred_structs
+        );
     }
     if emitted_fns > 0 {
         eprintln!("  {no_raw} of {emitted_fns} functions have no raw pointer; {safe_fns} are safe `fn`s");

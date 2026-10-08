@@ -1,6 +1,6 @@
 # ML runtime: from IR to an ONNX model
 
-`src/refine/` turns a lifted `Function` into model input and runs it through ONNX Runtime. The model only *proposes* names and types. Nothing here changes the IR.
+`src/refine/` turns a lifted `Function` into model input and runs it through ONNX Runtime. The model only *proposes* names and types. Nothing here changes the IR. Type proposals reach the decompiler through `types::TypeModel` ([types.md](types.md#the-model-hook)), which checks each one against what the code does before using it.
 
 ## Building
 

@@ -136,18 +136,19 @@ pub extern "C" fn corners(s: Shape, x: u64) -> u64 {
 }
 "#;
 
+// Arguments and results `as _`: type recovery narrows them (`op: u32`).
 const SWITCHES_MAIN: &str = r#"
 fn main() {
     for op in 0..12u64 {
         for (a, b) in [(0u64, 0u64), (0x1234, 0xff00), (u64::MAX, 3)] {
             let want = match op { 0 => a ^ b, 1 => a & b, 2 => a | b, 3 => !a, 4 => a, 5 => b, 6 => a ^ 0x55, 7 => b & 0xff, _ => 7 };
-            assert_eq!(unsafe { dec::dispatch(op, a, b) }, want, "dispatch({op}, {a}, {b})");
+            assert_eq!(unsafe { dec::dispatch(op as _, a as _, b as _) } as u64, want, "dispatch({op}, {a}, {b})");
         }
     }
     for s in 0..6u64 {
         let x = 0x5a5a;
         let want = [x, x ^ 2, x | 3, x & 4, !x, 6][s as usize];
-        assert_eq!(unsafe { dec::corners(s, x) }, want, "corners({s})");
+        assert_eq!(unsafe { dec::corners(s as _, x as _) } as u64, want, "corners({s})");
     }
 }
 "#;

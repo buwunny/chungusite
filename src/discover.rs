@@ -18,7 +18,7 @@
 //! a prologue. A candidate strictly inside an FDE's range is rejected: unwind
 //! info is authoritative, and such addresses are mostly the cold half of a
 //! split function or a misread of something that isn't a call.
-use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{Code, ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use object::{Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationTarget, SectionKind};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -200,6 +200,10 @@ fn walk(img: &Image, bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk 
     let mut insn = Instruction::default();
     while let Some(at) = todo.pop() {
         let mut ip = at;
+        // `cmp idx, n` (or clang's `sub idx, n`) just before, and the number of
+        // cases its `ja` (`jae`) leaves
+        let mut cmp_imm: Option<u64> = None;
+        let mut cases = None;
         while ip < limit && seen.insert(ip) {
             dec.set_ip(ip);
             if dec.set_position((ip - start) as usize).is_err() {
@@ -232,6 +236,18 @@ fn walk(img: &Image, bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk 
                     }
                 }
             }
+            let imm = (matches!(insn.mnemonic(), Mnemonic::Cmp | Mnemonic::Sub) && insn.op_count() == 2 && matches!(insn.op0_kind(), OpKind::Register | OpKind::Memory))
+                .then(|| insn.op_kind(1))
+                .filter(|&k| matches!(k, OpKind::Immediate8 | OpKind::Immediate8to32 | OpKind::Immediate8to64 | OpKind::Immediate32 | OpKind::Immediate32to64))
+                .map(|_| insn.immediate(1));
+            if insn.flow_control() == FlowControl::ConditionalBranch {
+                cases = match (cmp_imm, insn.condition_code()) {
+                    (Some(n), ConditionCode::a) => Some(n.saturating_add(1)),
+                    (Some(n), ConditionCode::ae) => Some(n),
+                    _ => cases,
+                };
+            }
+            cmp_imm = imm;
             match insn.flow_control() {
                 FlowControl::Call if insn.op0_kind() == OpKind::NearBranch64 => {
                     let t = insn.near_branch_target();
@@ -247,7 +263,7 @@ fn walk(img: &Image, bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk 
                     }
                 }
                 FlowControl::IndirectBranch => {
-                    todo.extend(jump_table(&insn, img, &leas, start, limit));
+                    todo.extend(jump_table(&insn, img, &leas, start, limit, cases));
                     break;
                 }
                 FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch
@@ -279,15 +295,17 @@ fn walk(img: &Image, bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk 
 /// The cases of a jump table behind the indirect `jmp` `insn`, as far as they
 /// land in `[start, limit)`: `jmp [table + idx*8]` with absolute entries
 /// (non-PIE), or `jmp reg` after adding a 32-bit entry to a table base the
-/// function `lea`s (PIE). The table's length isn't known here, so it is read
-/// until an entry lands outside the function. Empty for a tail call through a
-/// register or the GOT.
-fn jump_table(insn: &Instruction, img: &Image, leas: &[u64], start: u64, limit: u64) -> Vec<u64> {
+/// function `lea`s (PIE). The table has `cases` entries when a bounds check
+/// before the jump says so; otherwise (Rust's `match` on a discriminant has
+/// none) it is read until an entry lands outside the function. Empty for a tail
+/// call through a register or the GOT.
+fn jump_table(insn: &Instruction, img: &Image, leas: &[u64], start: u64, limit: u64, cases: Option<u64>) -> Vec<u64> {
     let inside = |t: u64| t >= start && t < limit;
+    let n = cases.unwrap_or(1024).min(1024);
     let mut out = Vec::new();
     if insn.op0_kind() == OpKind::Memory && insn.memory_base() == Register::None && insn.memory_index_scale() == 8 {
         let table = insn.memory_displacement64();
-        for k in 0..1024 {
+        for k in 0..n {
             match img.read(table + 8 * k, 8).map(|b| u64::from_le_bytes(b.try_into().unwrap())) {
                 Some(t) if inside(t) => out.push(t),
                 _ => break,
@@ -295,7 +313,7 @@ fn jump_table(insn: &Instruction, img: &Image, leas: &[u64], start: u64, limit: 
         }
     } else if insn.op0_kind() == OpKind::Register {
         for &table in leas.iter().rev() {
-            for k in 0..1024 {
+            for k in 0..n {
                 match img.read(table + 4 * k, 4).map(|b| table.wrapping_add(i32::from_le_bytes(b.try_into().unwrap()) as u64)) {
                     Some(t) if inside(t) => out.push(t),
                     _ => break,
@@ -339,7 +357,8 @@ impl<'a> Image<'a> {
 }
 
 /// Imports that don't return: code after a call to one belongs to the next function.
-fn noreturn(name: &str) -> bool {
+/// Imports that never return: a call to one ends its block.
+pub fn noreturn(name: &str) -> bool {
     let name = name.split('@').next().unwrap_or(name);
     matches!(
         name,

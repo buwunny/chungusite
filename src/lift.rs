@@ -67,6 +67,8 @@ enum Flags {
     Res { res: ValueId },
     /// mul / imul: only CF = OF (the product doesn't fit `lo`) is modelled.
     Mul { lhs: ValueId, rhs: ValueId, lo: ValueId, signed: bool },
+    /// bt: only CF is defined.
+    Carry { cf: ValueId },
 }
 
 /// How many instructions before an indirect `jmp` pass 1 keeps, to recognize the
@@ -182,6 +184,20 @@ impl Lifter {
     /// `lift`, reading jump tables from `data`: the binary's sections as
     /// (load address, bytes), sorted by address.
     pub fn lift_with_data(&mut self, code: &[u8], ip: u64, data: &[(u64, &[u8])], f: &mut Function) -> Result<(), LiftError> {
+        self.lift_full(code, ip, data, &|_, _| false, f)
+    }
+
+    /// `lift_with_data`, where `noreturn(ip, target)` says whether the call at
+    /// `ip` (to `target`, if it is direct) never returns (`abort`,
+    /// `__stack_chk_fail`): such a call ends its block.
+    pub fn lift_full(
+        &mut self,
+        code: &[u8],
+        ip: u64,
+        data: &[(u64, &[u8])],
+        noreturn: &dyn Fn(u64, Option<u64>) -> bool,
+        f: &mut Function,
+    ) -> Result<(), LiftError> {
         f.clear();
         self.find_leaders(code, ip, data)?;
         self.state.clear();
@@ -216,7 +232,7 @@ impl Lifter {
                 if let Some(t) = self.tables.iter().find(|t| t.load == self.ip) {
                     self.switch_index = Some(self.read_full(f, t.index.number()));
                 }
-                open = !self.lift_insn(f)?;
+                open = !self.lift_insn(f, noreturn)?;
             }
         }
         if open {
@@ -422,7 +438,7 @@ impl Lifter {
     }
 
     /// Lift `self.insn`. Returns true if it ended the block.
-    fn lift_insn(&mut self, f: &mut Function) -> Result<bool, LiftError> {
+    fn lift_insn(&mut self, f: &mut Function, noreturn: &dyn Fn(u64, Option<u64>) -> bool) -> Result<bool, LiftError> {
         let i = self.insn; // Instruction is Copy (40 bytes); avoids borrowing self
         // ud2 / int3 / hlt: traps the compiler puts where control can't continue
         if matches!(i.mnemonic(), Mnemonic::Ud2 | Mnemonic::Int3 | Mnemonic::Hlt) {
@@ -431,7 +447,15 @@ impl Lifter {
         }
         match i.flow_control() {
             FlowControl::Next => self.lift_data(f, &i).map(|_| false),
-            FlowControl::Call | FlowControl::IndirectCall => self.call(f, &i).map(|_| false),
+            FlowControl::Call | FlowControl::IndirectCall => {
+                self.call(f, &i)?;
+                let target = (i.op0_kind() == OpKind::NearBranch64).then(|| i.near_branch_target());
+                if noreturn(self.ip, target) {
+                    self.end_block(f, Terminator::Unreachable);
+                    return Ok(true);
+                }
+                Ok(false)
+            }
             FlowControl::ConditionalBranch if i.condition_code() != ConditionCode::None => {
                 let c = self.condition(f, i.condition_code())?;
                 let t = self.target(i.near_branch_target())?;
@@ -500,9 +524,8 @@ impl Lifter {
                 }
                 // mov rax, [rdi+8]
                 (OpKind::Register, OpKind::Memory) => {
-                    let ptr = self.ea(f, i)?;
-                    let ty = TyId::unknown(i.op0_register().size());
-                    let v = self.emit(f, InstKind::Load { ptr, align: 1, volatile: false }, ty);
+                    let sz = i.op0_register().size();
+                    let v = self.operand(f, i, 1, sz)?;
                     self.write(f, i.op0_register(), v)?;
                 }
                 // mov [rax+8], rcx
@@ -556,7 +579,29 @@ impl Lifter {
                 self.write(f, dst, v)?;
                 self.flags = Flags::Mul { lhs, rhs, lo: v, signed: true };
             }
-            Mnemonic::Movups | Mnemonic::Movaps | Mnemonic::Movdqu | Mnemonic::Movdqa => self.mov128(f, i)?,
+            Mnemonic::Movups | Mnemonic::Movaps | Mnemonic::Movdqu | Mnemonic::Movdqa | Mnemonic::Movupd | Mnemonic::Movapd
+            | Mnemonic::Lddqu => self.mov128(f, i)?,
+            // bitwise ops, a qword at a time
+            Mnemonic::Andps | Mnemonic::Andpd | Mnemonic::Pand | Mnemonic::Orps | Mnemonic::Orpd | Mnemonic::Por => {
+                let a = self.xmm_of(i.op0_register())?;
+                let op = match i.mnemonic() {
+                    Mnemonic::Andps | Mnemonic::Andpd | Mnemonic::Pand => BinOp::And,
+                    _ => BinOp::Or,
+                };
+                let (lo, hi) = self.xmm_operand(f, i)?;
+                let (alo, ahi) = self.xmm_get(a)?;
+                let lo = self.emit(f, InstKind::Bin { op, lhs: alo, rhs: lo }, TyId::B8);
+                let hi = self.emit(f, InstKind::Bin { op, lhs: ahi, rhs: hi }, TyId::B8);
+                self.xmm[a] = Some((lo, hi));
+            }
+            // pcmpeqd xmm0, xmm0: all ones
+            Mnemonic::Pcmpeqb | Mnemonic::Pcmpeqw | Mnemonic::Pcmpeqd | Mnemonic::Pcmpeqq
+                if i.op1_kind() == OpKind::Register && i.op1_register() == i.op0_register() =>
+            {
+                let a = self.xmm_of(i.op0_register())?;
+                let ones = self.konst(f, u64::MAX, TyId::B8);
+                self.xmm[a] = Some((ones, ones));
+            }
             Mnemonic::Xorps | Mnemonic::Xorpd | Mnemonic::Pxor => {
                 let a = self.xmm_of(i.op0_register())?;
                 let v = if i.op1_kind() == OpKind::Register && i.op1_register() == i.op0_register() {
@@ -572,13 +617,164 @@ impl Lifter {
                 self.xmm[a] = Some(v);
             }
             // punpcklqdq xmm0, xmm1: xmm0 = (xmm0.lo, xmm1.lo), how gcc pairs two qwords
-            Mnemonic::Punpcklqdq => {
+            Mnemonic::Punpcklqdq | Mnemonic::Movlhps => {
                 let a = self.xmm_of(i.op0_register())?;
                 let (lo, _) = self.xmm_get(a)?;
                 let (hi, _) = self.xmm_operand(f, i)?;
                 self.xmm[a] = Some((lo, hi));
             }
+            // rep movs: memcpy(rdi, rsi, rcx * size), with the direction flag clear
+            // (before `movsd`, which is also the SSE move)
+            Mnemonic::Movsb | Mnemonic::Movsw | Mnemonic::Movsd | Mnemonic::Movsq
+                if i.has_rep_prefix() && i.op0_kind() == OpKind::MemoryESRDI =>
+            {
+                let size = i.memory_size().size() as u64;
+                let n = self.read(f, Register::RCX)?;
+                let len = if size == 1 {
+                    n
+                } else {
+                    let k = self.konst(f, size, TyId::B8);
+                    self.emit(f, InstKind::Bin { op: BinOp::Mul, lhs: n, rhs: k }, TyId::B8)
+                };
+                let dst = self.read(f, Register::RDI)?;
+                let src = self.read(f, Register::RSI)?;
+                let d = self.emit(f, InstKind::IntToPtr(dst), TyId::PTR);
+                let sp = self.emit(f, InstKind::IntToPtr(src), TyId::PTR);
+                self.emit(f, InstKind::MemCopy { dst: d, src: sp, len }, TyId::UNIT);
+                let d2 = self.emit(f, InstKind::Bin { op: BinOp::Add, lhs: dst, rhs: len }, TyId::B8);
+                let s2 = self.emit(f, InstKind::Bin { op: BinOp::Add, lhs: src, rhs: len }, TyId::B8);
+                let zero = self.konst(f, 0, TyId::B8);
+                self.write(f, Register::RDI, d2)?;
+                self.write(f, Register::RSI, s2)?;
+                self.write(f, Register::RCX, zero)?;
+            }
             Mnemonic::Movq | Mnemonic::Movd | Mnemonic::Movsd => self.movq(f, i)?,
+            Mnemonic::Bswap => {
+                let r = i.op0_register();
+                let v = self.read(f, r)?;
+                let v = self.emit(f, InstKind::Un { op: UnOp::Bswap, v }, TyId::unknown(r.size()));
+                self.write(f, r, v)?;
+            }
+            // tzcnt / lzcnt / popcnt: the count of a zero source is the width, like
+            // Rust's; bsf / bsr: the index of the lowest / highest set bit, with ZF
+            // set (and the result undefined) for a zero source
+            Mnemonic::Tzcnt | Mnemonic::Lzcnt | Mnemonic::Popcnt | Mnemonic::Bsf | Mnemonic::Bsr => {
+                let dst = i.op0_register();
+                let sz = dst.size();
+                let ty = TyId::unknown(sz);
+                let v = self.operand(f, i, 1, sz)?;
+                let op = match i.mnemonic() {
+                    Mnemonic::Tzcnt | Mnemonic::Bsf => UnOp::Ctz,
+                    Mnemonic::Popcnt => UnOp::Popcnt,
+                    _ => UnOp::Clz,
+                };
+                let mut res = self.emit(f, InstKind::Un { op, v }, ty);
+                if i.mnemonic() == Mnemonic::Bsr {
+                    let top = self.konst(f, sz as u64 * 8 - 1, ty);
+                    res = self.emit(f, InstKind::Bin { op: BinOp::Xor, lhs: res, rhs: top }, ty);
+                }
+                self.write(f, dst, res)?;
+                self.flags = match i.mnemonic() {
+                    // ZF: the source was zero
+                    Mnemonic::Bsf | Mnemonic::Bsr | Mnemonic::Popcnt => Flags::Logic { res: v },
+                    _ => Flags::Res { res },
+                };
+            }
+            Mnemonic::Shld | Mnemonic::Shrd => self.double_shift(f, i)?,
+            Mnemonic::Rol | Mnemonic::Ror => {
+                let sz = self.op_size(i, 0)?;
+                let ty = TyId::unknown(sz);
+                let count = match i.op1_kind() {
+                    k if is_imm(k) => self.konst(f, i.immediate(1) & if sz == 8 { 63 } else { 31 }, TyId::B1),
+                    OpKind::Register if i.op1_register() == Register::CL => self.read(f, Register::CL)?,
+                    _ => return Err(self.unsupported()),
+                };
+                let dst = self.dst(f, i)?;
+                let v = self.get(f, dst, sz)?;
+                let op = if i.mnemonic() == Mnemonic::Rol { BinOp::RotL } else { BinOp::RotR };
+                // Rust rotates by the count modulo the width, as x86 does after masking it
+                let res = self.emit(f, InstKind::Bin { op, lhs: v, rhs: count }, ty);
+                self.put(f, dst, res)?;
+                self.flags = Flags::Unknown; // only CF and OF, which nothing here models
+            }
+            // adc / sbb: with the carry the previous instruction left
+            Mnemonic::Adc | Mnemonic::Sbb => {
+                let sz = self.op_size(i, 0)?;
+                let ty = TyId::unknown(sz);
+                let cf = self.condition(f, ConditionCode::b)?;
+                let cf = self.emit(f, InstKind::Cast { kind: CastKind::ZExt, v: cf }, ty);
+                let dst = self.dst(f, i)?;
+                let a = self.get(f, dst, sz)?;
+                let same = i.op0_kind() == OpKind::Register && i.op1_kind() == OpKind::Register && i.op0_register() == i.op1_register();
+                let b = if same { a } else { self.operand(f, i, 1, sz)? };
+                let op = if i.mnemonic() == Mnemonic::Adc { BinOp::Add } else { BinOp::Sub };
+                let t = self.emit(f, InstKind::Bin { op, lhs: a, rhs: b }, ty);
+                let res = self.emit(f, InstKind::Bin { op, lhs: t, rhs: cf }, ty);
+                self.put(f, dst, res)?;
+                self.flags = Flags::Res { res }; // ZF and SF; the carry out isn't modelled
+            }
+            // bt: CF = bit n of the operand
+            Mnemonic::Bt => {
+                let sz = self.op_size(i, 0)?;
+                let ty = TyId::unknown(sz);
+                let n = match i.op1_kind() {
+                    k if is_imm(k) => self.konst(f, i.immediate(1) & (sz as u64 * 8 - 1), ty),
+                    // with a memory operand, a register bit offset can reach past it
+                    OpKind::Register if i.op0_kind() == OpKind::Register => {
+                        let r = self.read(f, i.op1_register())?;
+                        let m = self.konst(f, sz as u64 * 8 - 1, ty);
+                        self.emit(f, InstKind::Bin { op: BinOp::And, lhs: r, rhs: m }, ty)
+                    }
+                    _ => return Err(self.unsupported()),
+                };
+                let dst = self.dst(f, i)?;
+                let v = self.get(f, dst, sz)?;
+                let sh = self.emit(f, InstKind::Bin { op: BinOp::LShr, lhs: v, rhs: n }, ty);
+                let one = self.konst(f, 1, ty);
+                let bit = self.emit(f, InstKind::Bin { op: BinOp::And, lhs: sh, rhs: one }, ty);
+                let zero = self.konst(f, 0, ty);
+                let cf = self.emit(f, InstKind::Cmp { cc: Cond::Ne, lhs: bit, rhs: zero }, TyId::BOOL);
+                self.flags = Flags::Carry { cf };
+            }
+            // xchg: swap (with memory it is atomic; the lifted code is not)
+            Mnemonic::Xchg => {
+                let sz = self.op_size(i, 0)?;
+                let (a, b) = (self.dst(f, i)?, i.op1_register());
+                let va = self.get(f, a, sz)?;
+                let vb = self.read(f, b)?;
+                self.put(f, a, vb)?;
+                self.write(f, b, va)?;
+            }
+            // xadd [m], r: m += r, r = the old m (atomic with `lock`; the lifted code is not)
+            Mnemonic::Xadd => {
+                let sz = self.op_size(i, 0)?;
+                let ty = TyId::unknown(sz);
+                let dst = self.dst(f, i)?;
+                let old = self.get(f, dst, sz)?;
+                let r = self.read(f, i.op1_register())?;
+                let res = self.emit(f, InstKind::Bin { op: BinOp::Add, lhs: old, rhs: r }, ty);
+                self.put(f, dst, res)?;
+                self.write(f, i.op1_register(), old)?;
+                self.flags = Flags::Add { lhs: old, rhs: r, res };
+            }
+            // cmpxchg [m], r: if m == rax { m = r } else { rax = m }; ZF says which.
+            // The destination is written either way (atomic with `lock`; the lifted
+            // code is not).
+            Mnemonic::Cmpxchg => {
+                let sz = self.op_size(i, 0)?;
+                let ty = TyId::unknown(sz);
+                let acc = match sz { 8 => Register::RAX, 4 => Register::EAX, 2 => Register::AX, _ => Register::AL };
+                let dst = self.dst(f, i)?;
+                let old = self.get(f, dst, sz)?;
+                let a = self.read(f, acc)?;
+                let r = self.read(f, i.op1_register())?;
+                let eq = self.emit(f, InstKind::Cmp { cc: Cond::Eq, lhs: old, rhs: a }, TyId::BOOL);
+                let new = self.emit(f, InstKind::Select { c: eq, t: r, f: old }, ty);
+                self.put(f, dst, new)?;
+                // rax = m, which equals rax when the exchange happened
+                self.write(f, acc, old)?;
+                self.flags = Flags::Sub { lhs: a, rhs: old };
+            }
             Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd => {
                 let dst = i.op0_register();
                 let src_sz = self.op_size(i, 1)?;
@@ -742,15 +938,10 @@ impl Lifter {
                 if n == 0 {
                     return Ok(()); // no effect, not even on the flags
                 }
-                if n >= sz as u64 * 8 {
-                    // 8/16-bit operands can shift everything out, which Rust's
-                    // wrapping shifts (count mod width) don't model
-                    return Err(self.unsupported());
-                }
-                (self.konst(f, n, TyId::B1), true)
+                (self.konst(f, n, TyId::B1), n < sz as u64 * 8)
             }
             // a count of 0 leaves the flags alone, so they are unknown after this
-            OpKind::Register if i.op1_register() == Register::CL && sz >= 4 => {
+            OpKind::Register if i.op1_register() == Register::CL => {
                 let cl = self.read(f, Register::CL)?;
                 let m = self.konst(f, mask, TyId::B1);
                 (self.emit(f, InstKind::Bin { op: BinOp::And, lhs: cl, rhs: m }, TyId::B1), false)
@@ -759,9 +950,59 @@ impl Lifter {
         };
         let dst = self.dst(f, i)?;
         let v = self.get(f, dst, sz)?;
-        let res = self.emit(f, InstKind::Bin { op, lhs: v, rhs: count }, ty);
+        let res = if sz >= 4 {
+            self.emit(f, InstKind::Bin { op, lhs: v, rhs: count }, ty)
+        } else {
+            // 8/16-bit operands can shift everything out (counts up to 31), which
+            // Rust's shifts (count modulo the width) don't: shift a 32-bit copy
+            let kind = if matches!(op, BinOp::AShr) { CastKind::SExt } else { CastKind::ZExt };
+            let w = self.emit(f, InstKind::Cast { kind, v }, TyId::B4);
+            let r = self.emit(f, InstKind::Bin { op, lhs: w, rhs: count }, TyId::B4);
+            self.emit(f, InstKind::Cast { kind: CastKind::Trunc, v: r }, ty)
+        };
         self.put(f, dst, res)?;
         self.flags = if flags_known { Flags::Res { res } } else { Flags::Unknown };
+        Ok(())
+    }
+
+    /// shld d, s, n: d = d << n | s >> (w - n); shrd d, s, n: d = d >> n | s << (w - n).
+    /// A count of 0 leaves d (and the flags) alone.
+    fn double_shift(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
+        let sz = self.op_size(i, 0)?;
+        if sz < 4 {
+            return Err(self.unsupported());
+        }
+        let ty = TyId::unknown(sz);
+        let mask = if sz == 8 { 63 } else { 31 };
+        let count = match i.op2_kind() {
+            k if is_imm(k) => {
+                if i.immediate(2) & mask == 0 {
+                    return Ok(());
+                }
+                self.konst(f, i.immediate(2) & mask, TyId::B1)
+            }
+            OpKind::Register if i.op2_register() == Register::CL => {
+                let cl = self.read(f, Register::CL)?;
+                let m = self.konst(f, mask, TyId::B1);
+                self.emit(f, InstKind::Bin { op: BinOp::And, lhs: cl, rhs: m }, TyId::B1)
+            }
+            _ => return Err(self.unsupported()),
+        };
+        let dst = self.dst(f, i)?;
+        let d = self.get(f, dst, sz)?;
+        let s = self.read(f, i.op1_register())?;
+        let w = self.konst(f, sz as u64 * 8, TyId::B1);
+        let rest = self.emit(f, InstKind::Bin { op: BinOp::Sub, lhs: w, rhs: count }, TyId::B1);
+        let (into_d, from_s) = if i.mnemonic() == Mnemonic::Shld { (BinOp::Shl, BinOp::LShr) } else { (BinOp::LShr, BinOp::Shl) };
+        let a = self.emit(f, InstKind::Bin { op: into_d, lhs: d, rhs: count }, ty);
+        let b = self.emit(f, InstKind::Bin { op: from_s, lhs: s, rhs: rest }, ty);
+        let res = self.emit(f, InstKind::Bin { op: BinOp::Or, lhs: a, rhs: b }, ty);
+        // a count of 0 would shift s by the full width, which wraps to no shift
+        let zero = self.konst(f, 0, TyId::B1);
+        let none = self.emit(f, InstKind::Cmp { cc: Cond::Eq, lhs: count, rhs: zero }, TyId::BOOL);
+        let res = self.emit(f, InstKind::Select { c: none, t: d, f: res }, ty);
+        self.put(f, dst, res)?;
+        self.flags = Flags::Unknown; // a count of 0 leaves them alone
         Ok(())
     }
 
@@ -1013,6 +1254,7 @@ impl Lifter {
         match i.op_kind(op) {
             OpKind::Register => self.read(f, i.op_register(op)),
             k if is_imm(k) => Ok(self.konst(f, imm(i, op, size), TyId::unknown(size))),
+            OpKind::Memory if is_canary(i) => Ok(self.konst(f, CANARY, TyId::B8)),
             OpKind::Memory => {
                 let sz = self.op_size(i, op)?;
                 let ptr = self.ea(f, i)?;
@@ -1137,6 +1379,16 @@ impl Lifter {
                     (p, self.emit(f, InstKind::Cast { kind, v: lo }, TyId::B8))
                 };
                 (cond, full, fits)
+            }
+            Flags::Carry { cf } => {
+                return match cc {
+                    C::b => Ok(cf),
+                    C::ae => {
+                        let no = self.konst(f, 0, TyId::BOOL);
+                        Ok(self.emit(f, InstKind::Cmp { cc: Cond::Eq, lhs: cf, rhs: no }, TyId::BOOL))
+                    }
+                    _ => Err(self.unsupported()),
+                };
             }
             Flags::Res { res } => {
                 let cond = match cc {
@@ -1438,7 +1690,9 @@ fn handled(i: &Instruction) -> bool {
                 Nop | Endbr64 | Mov | Lea | Add | Sub | And | Or | Xor | Cmp | Test | Inc | Dec | Neg | Not | Shl | Shr
                     | Sar | Mul | Imul | Movzx | Movsx | Movsxd | Div | Idiv | Cqo | Cdq | Cdqe | Cwde | Push | Pop
                     | Leave | Movups | Movaps | Movdqu | Movdqa | Xorps | Xorpd | Pxor | Punpcklqdq | Movq | Movd
-                    | Movsd
+                    | Movsd | Movupd | Movapd | Lddqu | Andps | Andpd | Pand | Orps | Orpd | Por | Pcmpeqb | Pcmpeqw
+                    | Pcmpeqd | Pcmpeqq | Movlhps | Movsb | Movsw | Movsq | Bswap | Tzcnt | Lzcnt | Popcnt | Bsf | Bsr
+                    | Shld | Shrd | Rol | Ror | Adc | Sbb | Bt | Xchg | Xadd | Cmpxchg
             ) || cmov_or_setcc(m).is_some()
         }
         FlowControl::ConditionalBranch => i.condition_code() != ConditionCode::None,
@@ -1446,6 +1700,16 @@ fn handled(i: &Instruction) -> bool {
         | FlowControl::IndirectCall => true,
         _ => false,
     }
+}
+
+/// The stack protector's canary, `fs:[0x28]` on Linux. The lifted code doesn't
+/// model thread-local storage; any constant works for the canary, since all the
+/// function does with it is check that the copy on its stack is unchanged.
+const CANARY: u64 = 0x2f8a_61c3_9d0e_7b00;
+
+fn is_canary(i: &Instruction) -> bool {
+    i.memory_segment() == Register::FS && i.memory_base() == Register::None && i.memory_index() == Register::None
+        && i.memory_displacement64() == 0x28 && i.memory_size().size() == 8
 }
 
 /// `len` bytes at `addr` in one of `data`'s (address, bytes) sections.

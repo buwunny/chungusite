@@ -563,42 +563,38 @@ fn mem2reg(f: &mut Function, cfg: &Cfg, o: &Offsets, accesses: &[Access], slots:
         out[bi] = cur;
     }
 
-    // Live-ins must be defined at the end of every predecessor.
-    loop {
-        let mut changed = false;
-        for bi in 0..n {
-            let b = BlockId::new(bi);
-            for s in 0..ns {
-                if live_in[bi][s].is_none() || b == entry {
-                    continue;
-                }
-                for &p in cfg.preds(b) {
-                    let pi = p.index();
-                    if out[pi][s].is_none() {
-                        let v = if p == entry {
-                            let reg_off = slots[promoted[s]].off;
-                            let existing = if reg_off >= 8 {
-                                let reg = STACK_ARG_BASE + ((reg_off - 8) / 8) as u8;
-                                entry_params.iter().copied().find(|&q| matches!(f.insts[q].kind, InstKind::BlockParam(r) if r == reg))
-                            } else {
-                                None
-                            };
-                            match existing {
-                                Some(q) => narrow(f, q, s, &mut entry_head),
-                                None => live_in_value(f, p, s, &mut entry_head, &mut entry_params),
-                            }
-                        } else {
-                            live_in_value(f, p, s, &mut entry_head, &mut entry_params)
-                        };
-                        live_in[pi][s] = Some(v);
-                        out[pi][s] = Some(v);
-                        changed = true;
-                    }
-                }
-            }
+    // Live-ins must be defined at the end of every predecessor. A worklist of
+    // (block, slot) live-ins whose predecessors haven't been checked yet.
+    let mut work: Vec<(usize, usize)> =
+        (0..n).flat_map(|bi| (0..ns).map(move |s| (bi, s))).filter(|&(bi, s)| live_in[bi][s].is_some()).collect();
+    work.reverse();
+    while let Some((bi, s)) = work.pop() {
+        let b = BlockId::new(bi);
+        if b == entry {
+            continue;
         }
-        if !changed {
-            break;
+        for &p in cfg.preds(b) {
+            let pi = p.index();
+            if out[pi][s].is_none() {
+                let v = if p == entry {
+                    let reg_off = slots[promoted[s]].off;
+                    let existing = if reg_off >= 8 {
+                        let reg = STACK_ARG_BASE + ((reg_off - 8) / 8) as u8;
+                        entry_params.iter().copied().find(|&q| matches!(f.insts[q].kind, InstKind::BlockParam(r) if r == reg))
+                    } else {
+                        None
+                    };
+                    match existing {
+                        Some(q) => narrow(f, q, s, &mut entry_head),
+                        None => live_in_value(f, p, s, &mut entry_head, &mut entry_params),
+                    }
+                } else {
+                    live_in_value(f, p, s, &mut entry_head, &mut entry_params)
+                };
+                live_in[pi][s] = Some(v);
+                out[pi][s] = Some(v);
+                work.push((pi, s));
+            }
         }
     }
 

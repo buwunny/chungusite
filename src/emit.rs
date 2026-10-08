@@ -312,6 +312,21 @@ fn term_uses(f: &Function, t: Terminator, mut cb: impl FnMut(ValueId)) {
     }
 }
 
+/// Sorted case values as a pattern, runs as ranges: `0 | 3..=5`.
+fn case_pattern(cases: &[u64]) -> String {
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i < cases.len() {
+        let mut j = i;
+        while j + 1 < cases.len() && cases[j + 1] == cases[j] + 1 {
+            j += 1;
+        }
+        parts.push(if j == i { cases[i].to_string() } else { format!("{}..={}", cases[i], cases[j]) });
+        i = j + 1;
+    }
+    parts.join(" | ")
+}
+
 fn rty(ty: TyId) -> &'static str {
     match ty {
         TyId::B1 => "u8",
@@ -454,7 +469,7 @@ impl Emitter<'_> {
                 }
             }
         }
-        let has_edges = cfg.rpo.iter().any(|&b| f.blocks[b].term.successors()[0].is_some());
+        let has_edges = cfg.rpo.iter().any(|&b| f.blocks[b].term.successors(&f.value_pool).next().is_some());
         if !has_edges {
             self.block(f.entry, "    ", out);
             return;
@@ -527,12 +542,8 @@ impl Emitter<'_> {
                     (false, _) => format!("{call}; return;"),
                 }
             }
-            Terminator::Switch { .. } => {
-                self.stats.todo += 1;
-                "todo!(\"switch\");".to_string()
-            }
             Terminator::Unreachable => "panic!(\"execution ran past the end of the lifted code\");".to_string(),
-            Terminator::Jump { .. } | Terminator::Branch { .. } => unreachable!("not an exit"),
+            Terminator::Jump { .. } | Terminator::Branch { .. } | Terminator::Switch { .. } => unreachable!("not an exit"),
         }
     }
 
@@ -555,6 +566,17 @@ impl Emitter<'_> {
                 let _ = writeln!(out, "{ind}}} else {{");
                 self.goto(e, &a[nt..], &inner, out);
                 let _ = writeln!(out, "{ind}}}");
+            }
+            Terminator::Switch { v, table, default } => {
+                let cases = table.get(&f.value_pool);
+                let _ = writeln!(out, "{ind}bb = match {} {{", self.name(v));
+                for t in f.blocks[b].term.successors(&f.value_pool).skip(1) {
+                    let ks: Vec<u64> =
+                        (0..cases.len() as u64).filter(|&k| BlockId::from_value(cases[k as usize]) == t).collect();
+                    let _ = writeln!(out, "{ind}    {} => {},", case_pattern(&ks), t.index());
+                }
+                let _ = writeln!(out, "{ind}    _ => {},", default.index());
+                let _ = writeln!(out, "{ind}}};");
             }
             _ => {
                 let _ = writeln!(out, "{ind}{}", self.exit_line(b));
@@ -751,6 +773,8 @@ impl Emitter<'_> {
             BinOp::Add => format!("{a}.wrapping_add({b})"),
             BinOp::Sub => format!("{a}.wrapping_sub({b})"),
             BinOp::Mul => format!("{a}.wrapping_mul({b})"),
+            BinOp::UMulHi => format!("(({a} as u128 * {b} as u128) >> 64) as {t}"),
+            BinOp::SMulHi => format!("(({a} as {s} as i128 * {b} as {s} as i128) >> 64) as {t}"),
             BinOp::UDiv => format!("{a} / {b}"),
             BinOp::URem => format!("{a} % {b}"),
             BinOp::SDiv => format!("({a} as {s}).wrapping_div({b} as {s}) as {t}"),
@@ -833,6 +857,13 @@ impl Source for Emitter<'_> {
 
     fn cond(&self, c: ValueId) -> String {
         self.name(c)
+    }
+
+    fn case(&self, v: ValueId, cases: &[u64]) -> String {
+        match cases {
+            [k] => format!("{} == {k}", self.name(v)),
+            _ => format!("matches!({}, {})", self.name(v), case_pattern(cases)),
+        }
     }
 
     fn exit(&mut self, b: BlockId) -> Node {

@@ -78,6 +78,20 @@ pub fn verify(f: &Function) -> Result<(), VerifyError> {
         if let Some(c) = cond {
             use_ok(None, c)?;
         }
+        // switch edges carry no arguments, so their targets take no parameters
+        if let Terminator::Switch { table, default, .. } = blk.term {
+            if !in_pool(table) {
+                return Err(VerifyError::ListOutOfRange { block: b });
+            }
+            for t in table.get(&f.value_pool).iter().map(|&v| BlockId::from_value(v)).chain([default]) {
+                if t.index() >= f.blocks.len() {
+                    return Err(VerifyError::DanglingBlock { block: b, target: t });
+                }
+                if f.blocks[t].params.len != 0 {
+                    return Err(VerifyError::EdgeArity { block: b, expected: f.blocks[t].params.len as usize, got: 0 });
+                }
+            }
+        }
         if !in_pool(args) {
             return Err(VerifyError::ListOutOfRange { block: b });
         }

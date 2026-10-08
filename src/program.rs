@@ -168,6 +168,19 @@ impl Symbols {
     }
 }
 
+/// The sections a linked binary loads, as (address, bytes), for reading jump
+/// tables. Empty for relocatable objects, whose tables are relocations.
+fn loaded_sections(data: &[u8]) -> Vec<(u64, &[u8])> {
+    let Ok(file) = object::File::parse(data) else { return Vec::new() };
+    if file.kind() == ObjectKind::Relocatable {
+        return Vec::new();
+    }
+    file.sections()
+        .filter(|s| s.address() != 0 && s.kind() != SectionKind::UninitializedData)
+        .filter_map(|s| Some((s.address(), s.data().ok().filter(|d| !d.is_empty())?)))
+        .collect()
+}
+
 fn konst(f: &Function, v: ValueId) -> Option<u64> {
     match f.insts[v].kind {
         InstKind::Const(c) => Some(f.consts[c.index()] as u64),
@@ -180,6 +193,7 @@ impl Program {
     /// whole binary, for relocations and import names (`None` for raw bytes).
     pub fn build(inputs: Vec<Input>, file: Option<&[u8]>, keep_raw_ir: bool) -> Program {
         let syms = file.map(Symbols::parse).unwrap_or_default();
+        let sections = file.map(loaded_sections).unwrap_or_default();
         let by_addr: HashMap<u64, usize> = inputs.iter().enumerate().map(|(i, x)| (x.addr, i)).rev().collect();
         let mut by_name: HashMap<String, usize> = HashMap::new();
         for (i, x) in inputs.iter().enumerate() {
@@ -198,8 +212,12 @@ impl Program {
                 |lifter, x| {
                 let mut f = Function::with_capacity(256, 16);
                 let mut raw = None;
-                let r = lifter
-                    .lift(x.bytes, x.addr, &mut f)
+                let r = if sections.is_empty() {
+                    lifter.lift(x.bytes, x.addr, &mut f)
+                } else {
+                    lifter.lift_with_data(x.bytes, x.addr, &sections, &mut f)
+                };
+                let r = r
                     .map_err(|e| describe(&e))
                     .and_then(|()| verify(&f).map_err(|e| format!("lifted IR failed verification: {e:?}")))
                     .and_then(|()| {

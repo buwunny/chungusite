@@ -19,12 +19,20 @@ impl Cfg {
     pub fn new(f: &Function) -> Cfg {
         let n = f.blocks.len();
 
+        // Successors, flattened: those of `b` are `succs[succ_start[b]..succ_start[b + 1]]`.
+        let mut succ_start = Vec::with_capacity(n + 1);
+        let mut succs = Vec::with_capacity(2 * n);
+        for (_, blk) in f.blocks.iter() {
+            succ_start.push(succs.len());
+            succs.extend(blk.term.successors(&f.value_pool));
+        }
+        succ_start.push(succs.len());
+        let succ = |b: BlockId| &succs[succ_start[b.index()]..succ_start[b.index() + 1]];
+
         // Predecessors, counting sort style.
         let mut count = vec![0u32; n + 1];
-        for (_, blk) in f.blocks.iter() {
-            for s in blk.term.successors().into_iter().flatten() {
-                count[s.index() + 1] += 1;
-            }
+        for &s in &succs {
+            count[s.index() + 1] += 1;
         }
         for i in 0..n {
             count[i + 1] += count[i];
@@ -32,8 +40,8 @@ impl Cfg {
         let pred_start = count.clone();
         let mut fill = count;
         let mut preds = vec![f.entry; pred_start[n] as usize];
-        for (b, blk) in f.blocks.iter() {
-            for s in blk.term.successors().into_iter().flatten() {
+        for (b, _) in f.blocks.iter() {
+            for &s in succ(b) {
                 preds[fill[s.index()] as usize] = b;
                 fill[s.index()] += 1;
             }
@@ -42,17 +50,15 @@ impl Cfg {
         // Reverse postorder with an explicit stack.
         let mut post = Vec::with_capacity(n);
         let mut seen = vec![false; n];
-        let mut stack: Vec<(BlockId, u8)> = vec![(f.entry, 0)];
+        let mut stack: Vec<(BlockId, u32)> = vec![(f.entry, 0)];
         seen[f.entry.index()] = true;
         while let Some(&mut (b, ref mut next)) = stack.last_mut() {
-            let succ = f.blocks[b].term.successors();
+            let succ = succ(b);
             if (*next as usize) < succ.len() {
                 let s = succ[*next as usize];
                 *next += 1;
-                if let Some(s) = s {
-                    if !std::mem::replace(&mut seen[s.index()], true) {
-                        stack.push((s, 0));
-                    }
+                if !std::mem::replace(&mut seen[s.index()], true) {
+                    stack.push((s, 0));
                 }
             } else {
                 post.push(b);

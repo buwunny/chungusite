@@ -80,7 +80,7 @@ It is asked about each argument and the return value (`Var::Arg`, `Var::Ret`) of
 
 ## Tests
 
-`tests/types.rs` checks prototypes and structs from `gcc -O2 -g`, safe-mode struct references, `--no-dwarf` inference, `parse_label` and the gate. `tests/differential.rs` runs each corpus build both without and with `-g`, so a wrong type from either source shows up as a wrong result. 427 of 468 functions pass in each variant (854 of 936), the same as before type recovery.
+`tests/types.rs` checks prototypes and structs from `gcc -O2 -g`, safe-mode struct references, `--no-dwarf` inference, `parse_label` and the gate. `tests/differential.rs` runs each corpus build both without and with `-g`, so a wrong type from either source shows up as a wrong result. 427 of 468 function builds pass in each variant (854 of 936), the same as before type recovery.
 
 ## Next
 

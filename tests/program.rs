@@ -104,6 +104,65 @@ fn a_callee_can_return_rax_and_rdx() {
 }
 
 #[test]
+fn float_arguments_and_results_are_f64() {
+    // half(x) = x * 0.5 in xmm0; caller(x, n) = half(x) + n as f64
+    let (p, _) = program(&[
+        ("half", &|a| {
+            a.mov(rax, 0x3fe0_0000_0000_0000u64).unwrap();
+            a.movq(xmm1, rax).unwrap();
+            a.mulsd(xmm0, xmm1).unwrap();
+            a.ret().unwrap();
+        }),
+        ("caller", &|a| {
+            a.push(rbx).unwrap();
+            a.mov(rbx, rdi).unwrap();
+            a.call(addr(0)).unwrap();
+            a.cvtsi2sd(xmm1, rbx).unwrap();
+            a.addsd(xmm0, xmm1).unwrap();
+            a.pop(rbx).unwrap();
+            a.ret().unwrap();
+        }),
+    ]);
+    let s = p.funcs[0].sig;
+    assert_eq!((s.args, s.fargs, s.fret), (0, 1, true));
+    let s = p.funcs[1].sig;
+    assert_eq!((s.args, s.fargs, s.fret), (1, 1, true));
+    let src = emitted(&p, Mode::Fast);
+    assert!(src[0].contains("fn half(xmm0: f64) -> f64"), "{}", src[0]);
+    assert!(src[1].contains("half(f64::from_bits(xmm0"), "{}", src[1]);
+}
+
+#[test]
+fn an_integer_result_is_not_a_float_one() {
+    // trunc(x) = x as i64 leaves x in xmm0, but returns rax
+    let (p, _) = program(&[("trunc", &|a| {
+        a.cvttsd2si(rax, xmm0).unwrap();
+        a.ret().unwrap();
+    })]);
+    let s = p.funcs[0].sig;
+    assert_eq!((s.fargs, s.ret, s.fret), (1, true, false));
+}
+
+#[test]
+fn an_xmm_register_the_callee_preserves_survives_the_call() {
+    // gcc's IPA-RA again: `sq` only touches xmm0, so xmm2 lives across it
+    let (p, _) = program(&[
+        ("sq", &|a| {
+            a.mulsd(xmm0, xmm0).unwrap();
+            a.ret().unwrap();
+        }),
+        ("caller", &|a| {
+            a.movapd(xmm2, xmm1).unwrap();
+            a.call(addr(0)).unwrap();
+            a.addsd(xmm0, xmm2).unwrap();
+            a.ret().unwrap();
+        }),
+    ]);
+    assert!(p.funcs[0].sig.keeps(chungusite::lift::XMM0 + 4), "sq keeps xmm2");
+    assert_eq!(p.funcs[1].sig.fargs, 2);
+}
+
+#[test]
 fn stack_slots_become_values() {
     // gcc -O0: the argument goes through [rbp-8]
     let (p, _) = program(&[("o0", &|a| {

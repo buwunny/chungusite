@@ -102,6 +102,7 @@ impl TyId {
     pub const PTR: TyId = TyId::from_u32(5);  // *mut B1, i.e. *mut u8
     pub const UNIT: TyId = TyId::from_u32(6); // stores, which define no value
     pub const PAIR: TyId = TyId::from_u32(7); // [B8; 2]: a 16-byte rax:rdx return value
+    pub const F64: TyId = TyId::from_u32(8);  // a float argument or result, as xmm holds it
 
     #[inline]
     pub fn unknown(bytes: usize) -> TyId {
@@ -159,7 +160,7 @@ impl TyTable {
         for ty in [
             Ty::Unknown { bytes: 1 }, Ty::Unknown { bytes: 2 }, Ty::Unknown { bytes: 4 }, Ty::Unknown { bytes: 8 },
             Ty::Bool, Ty::RawPtr { pointee: TyId::B1, mutbl: Mutbl::Mut }, Ty::Array { elem: TyId::B1, len: 0 },
-            Ty::Array { elem: TyId::B8, len: 2 },
+            Ty::Array { elem: TyId::B8, len: 2 }, Ty::F64,
         ] {
             let id = t.tys.push(ty);
             t.lookup.entry(ty).or_insert(id);
@@ -475,6 +476,14 @@ pub enum LaneOp {
     FCmpGt, FCmpGe, FCmpLtGt,
 }
 
+impl LaneOp {
+    /// Arithmetic on float lanes (compares give masks, not floats).
+    pub fn makes_float(self) -> bool {
+        use LaneOp::*;
+        matches!(self, FAdd | FSub | FMul | FDiv | FMin | FMax)
+    }
+}
+
 /// One-operand lane ops of `UnOp::Lane`: `w` is the lane (or source) width.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LaneUn {
@@ -487,6 +496,14 @@ pub enum LaneUn {
     /// rounding to nearest even (`cvt*`); out of range gives the minimum, as x86 does.
     F32ToIntTrunc, F64ToIntTrunc, F32ToInt, F64ToInt,
     F32ToF64, F64ToF32,
+}
+
+impl LaneUn {
+    /// The result is a float bit pattern.
+    pub fn makes_float(self) -> bool {
+        use LaneUn::*;
+        matches!(self, FSqrt | IntToF32 | IntToF64 | F32ToF64 | F64ToF32)
+    }
 }
 #[derive(Copy, Clone, Debug)] pub enum Cond { Eq, Ne, Ult, Ule, Ugt, Uge, Slt, Sle, Sgt, Sge }
 #[derive(Copy, Clone, Debug)] pub enum CastKind { Trunc, ZExt, SExt, Bitcast, IntToFloat, FloatToInt }

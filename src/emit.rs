@@ -1631,6 +1631,10 @@ impl Emitter<'_> {
     fn field(&self, ptr: ValueId, bytes: usize, write: bool) -> Option<(String, bool, TyId)> {
         let types = self.types?;
         let (r, d) = base_of(self.f, &self.alias, ptr);
+        // an undefined base prints as 0, and `(*(0 as *const S)).f` is rejected
+        if matches!(self.f.insts[r].kind, InstKind::Undef | InstKind::Const(_)) {
+            return None;
+        }
         let s = types.pointee[r.index()].or_else(|| types.pointee[ptr.index()].filter(|_| d == 0))?;
         if !matches!(self.table.tys[s], Ty::Struct(_)) {
             return None;

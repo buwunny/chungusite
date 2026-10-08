@@ -73,6 +73,8 @@ pub trait Source {
     fn edge(&mut self, to: BlockId, args: &[ValueId]) -> Vec<Node>;
     /// The condition of a `Branch`, as an expression.
     fn cond(&self, c: ValueId) -> String;
+    /// "`v` is one of `cases`", for a `Switch`, as an expression.
+    fn case(&self, v: ValueId, cases: &[u64]) -> String;
     /// A terminator without successors (return, tail call, ...), as a statement.
     fn exit(&mut self, b: BlockId) -> Node;
     /// The block has no parameters and no statements: all it computes is inlined
@@ -91,7 +93,7 @@ const MAX_DEPTH: usize = 512;
 /// (to a block no later in reverse postorder) goes to a block that dominates its
 /// source, and is a back edge of a natural loop.
 pub fn reducible(f: &Function, cfg: &Cfg) -> bool {
-    cfg.rpo.iter().all(|&b| f.blocks[b].term.successors().into_iter().flatten().all(|s| back_ok(cfg, b, s)))
+    cfg.rpo.iter().all(|&b| f.blocks[b].term.successors(&f.value_pool).all(|s| back_ok(cfg, b, s)))
 }
 
 fn back_ok(cfg: &Cfg, b: BlockId, s: BlockId) -> bool {
@@ -123,6 +125,9 @@ enum VTerm {
     /// `quiet`: blocks folded into the condition, whose (empty) statements are
     /// emitted first so their inlined values are ready.
     Branch { c: Test, t: BlockId, e: BlockId, ta: Vec<ValueId>, ea: Vec<ValueId>, quiet: Vec<BlockId> },
+    /// A jump table: each arm's cases go to its block, any other value to `default`.
+    /// Its edges carry no arguments.
+    Switch { v: ValueId, default: BlockId, arms: Vec<(BlockId, Vec<u64>)> },
     /// An irreducible region, in reverse postorder.
     Region(Vec<BlockId>),
     /// Folded into another node, or part of a region.
@@ -141,6 +146,12 @@ pub fn structure(f: &Function, cfg: &Cfg, src: &mut dyn Source) -> Option<Struct
         match t {
             VTerm::Jump { to, .. } => *to = fwd[to.index()],
             VTerm::Branch { t, e, .. } => (*t, *e) = (fwd[t.index()], fwd[e.index()]),
+            VTerm::Switch { default, arms, .. } => {
+                *default = fwd[default.index()];
+                for (t, _) in arms {
+                    *t = fwd[t.index()];
+                }
+            }
             _ => {}
         }
     }
@@ -160,9 +171,12 @@ pub fn structure(f: &Function, cfg: &Cfg, src: &mut dyn Source) -> Option<Struct
             VTerm::Exit | VTerm::Gone => Vec::new(),
             VTerm::Jump { to, .. } => vec![node_of[to.index()]],
             VTerm::Branch { t, e, .. } => vec![node_of[t.index()], node_of[e.index()]],
+            VTerm::Switch { default, arms, .. } => {
+                std::iter::once(*default).chain(arms.iter().map(|a| a.0)).map(|t| node_of[t.index()]).collect()
+            }
             VTerm::Region(r) => {
                 let me = BlockId::new(i);
-                let out = r.iter().flat_map(|&b| f.blocks[b].term.successors().into_iter().flatten());
+                let out = r.iter().flat_map(|&b| f.blocks[b].term.successors(&f.value_pool));
                 out.map(|s| node_of[s.index()]).filter(|&s| s != me).collect()
             }
         };
@@ -225,6 +239,19 @@ fn own_term(f: &Function, b: BlockId) -> VTerm {
             let a = args.get(&f.value_pool);
             let nt = f.blocks[t].params.len as usize;
             VTerm::Branch { c: Test::Leaf(c), t, e, ta: a[..nt].to_vec(), ea: a[nt..].to_vec(), quiet: Vec::new() }
+        }
+        Terminator::Switch { v, table, default } => {
+            let cases = table.get(&f.value_pool);
+            let arms = f.blocks[b]
+                .term
+                .successors(&f.value_pool)
+                .skip(1)
+                .map(|t| {
+                    let ks = (0..cases.len() as u64).filter(|&k| BlockId::from_value(cases[k as usize]) == t).collect();
+                    (t, ks)
+                })
+                .collect();
+            VTerm::Switch { v, default, arms }
         }
         _ => VTerm::Exit,
     }
@@ -295,7 +322,7 @@ fn irreducible_regions(f: &Function, cfg: &Cfg) -> Vec<Vec<BlockId>> {
             in_set[b.index()] = true;
         }
         let sccs = sccs(&set, |b| {
-            f.blocks[b].term.successors().into_iter().flatten().filter(|s| in_set[s.index()] && !cut[s.index()]).collect()
+            f.blocks[b].term.successors(&f.value_pool).filter(|s| in_set[s.index()] && !cut[s.index()]).collect()
         });
         for &b in &set {
             in_set[b.index()] = false;
@@ -458,6 +485,11 @@ impl Structurer<'_, '_> {
                 out.extend(self.branch(b, to, &args));
                 out
             }
+            VTerm::Switch { v, default, arms } => {
+                let mut out = self.src.stmts(b);
+                out.extend(self.switch(v, default, &arms, |this, t| this.branch(b, t, &[])));
+                out
+            }
             VTerm::Branch { c, t, e, ta, ea, quiet } => {
                 let mut out = self.src.stmts(b);
                 for y in quiet {
@@ -518,11 +550,33 @@ impl Structurer<'_, '_> {
                     let els = self.go(r, me, e, &ea);
                     body.push(Node::If { c: self.test(&c), then, els });
                 }
+                VTerm::Switch { v, default, arms } => {
+                    body.extend(self.switch(v, default, &arms, |this, t| this.go(r, me, t, &[])))
+                }
                 _ => body.push(self.src.exit(b)),
             }
             arms.push((b.index() as u32, body));
         }
         vec![Node::Loop { head: me, body: vec![Node::Dispatch { arms }] }]
+    }
+
+    /// `if v == 0 { .. } else if matches!(v, 1 | 3) { .. } else { default }`
+    fn switch(
+        &mut self,
+        v: ValueId,
+        default: BlockId,
+        arms: &[(BlockId, Vec<u64>)],
+        mut to: impl FnMut(&mut Self, BlockId) -> Vec<Node>,
+    ) -> Vec<Node> {
+        let mut conds = Vec::new();
+        for (t, ks) in arms {
+            conds.push((self.src.case(v, ks), to(self, *t)));
+        }
+        let mut chain = to(self, default);
+        for (c, then) in conds.into_iter().rev() {
+            chain = vec![Node::If { c, then, els: chain }];
+        }
+        chain
     }
 
     fn go(&mut self, r: BlockId, me: u32, to: BlockId, args: &[ValueId]) -> Vec<Node> {

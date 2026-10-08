@@ -77,3 +77,31 @@ pub fn random_programs(count: usize, mut seed: u64) -> Vec<Vec<u8>> {
         })
         .collect()
 }
+
+/// A jump table: `switch (x) { case 0: return x + 10; case 1: return x + 20;
+/// case 2: return x + 30; default: return 0; }` (32-bit `x`), as gcc lays it out
+/// without PIC: the table is at `table`, the cases meet at one `ret`. Returns the
+/// code (at `BASE`) and the table's bytes.
+#[allow(dead_code)]
+pub fn jump_table(table: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut a = CodeAssembler::new(64).unwrap();
+    let mut cases = [a.create_label(), a.create_label(), a.create_label()];
+    let mut default = a.create_label();
+    let mut done = a.create_label();
+    a.cmp(edi, 2).unwrap();
+    a.ja(default).unwrap();
+    a.mov(eax, edi).unwrap();
+    a.jmp(qword_ptr(rax * 8 + table as i32)).unwrap();
+    for (k, l) in cases.iter_mut().enumerate() {
+        a.set_label(l).unwrap();
+        a.lea(eax, dword_ptr(rdi + 10 * (k as i32 + 1))).unwrap();
+        a.jmp(done).unwrap();
+    }
+    a.set_label(&mut default).unwrap();
+    a.xor(eax, eax).unwrap();
+    a.set_label(&mut done).unwrap();
+    a.ret().unwrap();
+    let r = a.assemble_options(BASE, iced_x86::BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS).unwrap();
+    let targets: Vec<u8> = cases.iter().flat_map(|l| r.label_ip(l).unwrap().to_le_bytes()).collect();
+    (r.inner.code_buffer, targets)
+}

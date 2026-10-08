@@ -152,6 +152,32 @@ fn main() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// A jump table comes out as an `if`/`else if` chain on the case, or a `match`
+/// in a state machine, and computes the same thing in both modes.
+#[test]
+fn jump_table_runs() {
+    let (code, table) = common::jump_table(0x3000);
+    let mut f = Function::with_capacity(64, 8);
+    Lifter::new().lift_with_data(&code, common::BASE, &[(0x3000, &table)], &mut f).unwrap();
+    clean(&mut f);
+    verify(&f).unwrap();
+    let mut src = String::from(PRELUDE);
+    for (mode, structure, name) in [(Mode::Fast, true, "fast"), (Mode::Safe, true, "safe"), (Mode::Fast, false, "machine")] {
+        emit_function_with(&f, name, mode, structure, &|_| None, &|_| None, &mut src);
+    }
+    assert!(src.contains(" == 0 {") && src.contains("} else if ") && src.contains("bb = match "), "{src}");
+    let main = format!(
+        "{src}\nfn main() {{\n    for x in [0u64, 1, 2, 3, 7, 1 << 32, u64::MAX] {{\n        \
+         let want = match x as u32 {{ 0 => (x as u32) + 10, 1 => (x as u32) + 20, 2 => (x as u32) + 30, _ => 0 }} as u64;\n        \
+         assert_eq!(fast(x), want, \"{{x}}\");\n        assert_eq!(safe(x), want);\n        \
+         assert_eq!(unsafe {{ machine(x) }}, want);\n    }}\n}}\n"
+    );
+    let dir = scratch("switch");
+    rustc(&dir, "main.rs", &main, &["-o", dir.join("run").to_str().unwrap()]);
+    let out = Command::new(dir.join("run")).output().unwrap();
+    assert!(out.status.success(), "{}\n{main}", String::from_utf8_lossy(&out.stderr));
+}
+
 /// xorshift64*, as in tests/robust.rs.
 struct Rng(u64);
 impl Rng {
@@ -238,10 +264,10 @@ fn cli_decompiles_an_elf() {
     use object::{Architecture, BinaryFormat, Endianness, SymbolFlags, SymbolKind, SymbolScope};
 
     let get_count = [0x48, 0x8B, 0x47, 0x08, 0xC3]; // mov rax, [rdi+8]; ret
-    let mul = [0x48, 0xF7, 0xE1, 0xC3]; // mul rcx; ret (rdx:rax result, not liftable yet)
+    let bsr = [0x48, 0x0F, 0xBD, 0xC1, 0xC3]; // bsr rax, rcx; ret (not liftable yet)
     let mut obj = Obj::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
     let text = obj.section_id(StandardSection::Text);
-    for (name, code) in [("get_count", &get_count[..]), ("muller", &mul[..])] {
+    for (name, code) in [("get_count", &get_count[..]), ("bit_scan", &bsr[..])] {
         let off = obj.append_section_data(text, code, 16);
         obj.add_symbol(Symbol {
             name: name.as_bytes().to_vec(),
@@ -262,13 +288,13 @@ fn cli_decompiles_an_elf() {
     let list = Command::new(bin).arg(&elf).arg("--list").output().unwrap();
     let text = String::from_utf8(list.stdout).unwrap();
     assert!(text.contains("ok    get_count @ 0x0, 5 bytes"), "{text}");
-    assert!(text.contains("FAIL  muller @ 0x10, 4 bytes: unsupported instruction Mul at 0x10"), "{text}");
+    assert!(text.contains("FAIL  bit_scan @ 0x10, 5 bytes: unsupported instruction Bsr at 0x10"), "{text}");
     assert_eq!(list.status.code(), Some(1), "not everything lifted");
 
     for mode in ["fast", "safe"] {
         let out = Command::new(bin).arg(&elf).args(["--mode", mode]).output().unwrap();
         let src = String::from_utf8(out.stdout).unwrap();
-        assert!(src.contains("pub fn muller() -> u64 {\n    todo!(\"not lifted: unsupported instruction Mul at 0x10\")"), "{src}");
+        assert!(src.contains("pub fn bit_scan() -> u64 {\n    todo!(\"not lifted: unsupported instruction Bsr at 0x10\")"), "{src}");
         if mode == "safe" {
             assert!(src.contains("pub fn get_count(rdi_ref: &[u8]) -> u64 {"), "{src}");
         }
@@ -278,7 +304,7 @@ fn cli_decompiles_an_elf() {
     let one = Command::new(bin).arg(&elf).args(["-f", "get_count", "--emit", "ir"]).output().unwrap();
     assert!(one.status.success());
     let ir = String::from_utf8(one.stdout).unwrap();
-    assert!(ir.contains("load v1") && !ir.contains("muller"), "{ir}");
+    assert!(ir.contains("load v1") && !ir.contains("bit_scan"), "{ir}");
 
     let missing = Command::new(bin).arg(&elf).args(["-f", "nope"]).output().unwrap();
     assert_eq!(missing.status.code(), Some(2));

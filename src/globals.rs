@@ -16,8 +16,9 @@
 //! vtables, tables of string pointers) are emitted as pointers to the target's
 //! static or function, so code that loads an address out of the GOT and follows it
 //! lands in the right static. Each GOT slot is its own 8-byte item, so only the
-//! slots the code uses are emitted. A slot whose target is outside the output (an
-//! import, or a function not selected) is null.
+//! slots the code uses are emitted. A slot whose target is outside the output is
+//! null if it is an import, and keeps its bytes from the file if it is a function
+//! of the binary that isn't emitted (not selected, or skipped by `--skip-failed`).
 use crate::ir::{Function, Idx, InstKind};
 use crate::load::Binary;
 use std::collections::{HashMap, HashSet};
@@ -132,17 +133,20 @@ impl<'b, 'a> Globals<'b, 'a> {
     }
 
     /// The initializer of a pointer slot holding `target`: the function or static
-    /// it points to (adding that static to `more`), or null.
-    fn pointer(&self, target: u64, more: &mut Vec<Item>) -> String {
+    /// it points to (adding that static to `more`), or null; `None` for a function
+    /// of the binary that isn't in the output, whose slot keeps its file bytes.
+    fn pointer(&self, target: u64, more: &mut Vec<Item>) -> Option<String> {
         if let Some(f) = self.funcs.get(&target) {
-            return format!("{f} as *const u8");
+            return Some(format!("{f} as *const u8"));
         }
-        let Some(item) = self.item_at(target) else { return "core::ptr::null()".into() };
+        let Some(item) = self.item_at(target) else {
+            return self.bin.func_at(target).is_none().then(|| "core::ptr::null()".into());
+        };
         more.push(item);
-        match target - item.start {
+        Some(match target - item.start {
             0 => format!("{} as *const u8", self.addr_of(&item)),
             off => format!("({} as *const u8).wrapping_add({off:#x})", self.addr_of(&item)),
-        }
+        })
     }
 
     /// Items that `f` uses as pointers, the same addresses `expr` rewrites.
@@ -194,8 +198,10 @@ impl<'b, 'a> Globals<'b, 'a> {
             out.push_str(if j % 4 == 0 { "\n    " } else { " " });
             if slots.peek().is_some_and(|&(a, _)| a == at) {
                 let (_, t) = slots.next().unwrap();
-                let _ = write!(out, "Word {{ p: {} }},", self.pointer(t, more));
-                continue;
+                if let Some(p) = self.pointer(t, more) {
+                    let _ = write!(out, "Word {{ p: {p} }},");
+                    continue;
+                }
             }
             let mut w = [0u8; 8];
             if let Some(b) = bytes {

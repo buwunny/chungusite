@@ -42,10 +42,13 @@ fn unconditional_jump_out_of_range_is_a_tail_call() {
 }
 
 #[test]
-fn flags_from_another_block_are_an_error() {
-    // cmp rdi, rsi ; jmp L ; L: je L ; ret
-    let code = [0x48, 0x39, 0xF7, 0xEB, 0x00, 0x74, 0xFE, 0xC3];
-    assert_eq!(lift(&code).0, Err(LiftError::FlagsNotInBlock { ip: 0x1005 }));
+fn flags_nothing_set_are_an_error() {
+    // je L ; L: ret: nothing before the entry set the flags
+    let code = [0x74, 0x00, 0xC3];
+    assert_eq!(lift(&code).0, Err(LiftError::FlagsNotInBlock { ip: 0x1000 }));
+    // call rax ; jmp L ; L: je L ; ret: the call leaves them undefined
+    let code = [0xFF, 0xD0, 0xEB, 0x00, 0x74, 0xFE, 0xC3];
+    assert_eq!(lift(&code).0, Err(LiftError::FlagsNotInBlock { ip: 0x1004 }));
 }
 
 #[test]

@@ -8,14 +8,14 @@ The ML refinement layer (`src/refine`, behind the `ml` feature; see docs/ml-runt
 
 ## 1. Lifter coverage (the blocker for real code)
 
-`CALL`, `PUSH`/`POP`, the 8/16-bit `MOV` forms, `CMOVcc`/`SETcc`, memory operands, `MOVZX`/`MOVSX`, shifts, `IMUL`, one-operand `MUL`, `INC`/`DEC`/`NEG`/`NOT`, `DIV`/`IDIV` after `CQO` or `xor edx, edx`, 16-byte SSE copies, zeroing and bitwise ops, jump tables (`Terminator::Switch`), `ADC`/`SBB`, the bit instructions, rotates, double shifts, the atomics and `rep movs` are lifted now ([lift.md](lift.md)). On chungusite's own debug build (29,783 functions), 29,602 lift (99.4%). What still fails (181 functions), by the first unsupported instruction in each function:
+`CALL`, `PUSH`/`POP`, the 8/16-bit `MOV` forms, `CMOVcc`/`SETcc`, memory operands, `MOVZX`/`MOVSX`, shifts, `IMUL`, one-operand `MUL` and `DIV` at every width, `INC`/`DEC`/`NEG`/`NOT`, 16-byte SSE copies, zeroing and bitwise ops, jump tables (`Terminator::Switch`), `ADC`/`SBB`, the bit instructions, rotates, double shifts, the atomics, `rep movs`, flags read in another block and thread-locals are lifted now ([lift.md](lift.md)). On chungusite's own debug build (29,735 functions), 29,650 lift (99.7%). What still fails (85 functions), by the first unsupported instruction in each function:
 
 | Cause | Functions | What's needed |
 |---|---|---|
-| Flags across blocks, and conditions the lazy flags don't model (`SETO`, `JLE`/`JG`, `CMOVO` after a shift or `ADC`) | ~65 | materialize the flag values at the block exit when a successor reads them (`LiftError::FlagsNotInBlock`), and OF/SF for more instructions |
-| SSE vectors and floats (`PMOVMSKB`, `PCMPGTB`, `PUNPCKLBW`, `UCOMISD`, `PADDQ`, `PCMPEQB`, `PINSRW`, `CVTSI2SS`, AVX moves) | ~75 | xmm values across blocks, then vector ops; scalar float (`F32`/`F64` exist in `Ty`) |
-| `MOV` through `fs:` (thread-locals) | 23 | a model of the thread pointer |
-| The rest (`PAUSE`, 8/16-bit `DIV`/`MUL`, `BTS`, `CPUID`, `XGETBV`, ...) | ~18 | one at a time |
+| SSE vectors and floats (`PMOVMSKB`, `PCMPGTB`, `PUNPCKLBW`, `UCOMISD`, `PADDQ`, `PCMPEQB`, `PINSRW`, `CVTSI2SS`, AVX moves) | 80 | xmm values across blocks, then vector ops; scalar float (`F32`/`F64` exist in `Ty`) |
+| Flags read after a call through the GOT that doesn't return (`handle_alloc_error`), so the code after it is never reached | 2 | noreturn detection for calls through a pointer (step 8) |
+| A conditional branch into another function (a `.cold` part) | 1 | a tail call on one side of a branch |
+| `CPUID`, `XGETBV` | 2 | an opaque intrinsic |
 
 ## 2. Calls and signatures (done)
 
@@ -54,7 +54,7 @@ Done: `src/structure.rs` turns every CFG into `if`/`else`, `while`, `loop` with 
 Done for the common case ([cli.md](cli.md#globals)): constant addresses into data sections become `static`s named from data symbols, and loader-filled pointer slots (GOT, vtables) point at the right static or function. Still to do:
 
 - Typed statics: today every static is `Bytes<N>` or `Words<N>`. Once types (step 5) also cover globals and know an access is a `u32` table or a `&str`, emit `[u32; N]` or a string.
-- Thread-locals (`fs:`-relative accesses) are still unsupported in the lifter.
+- Thread-locals reached through a register (the initial-exec model in shared objects) and `__tls_get_addr` (dynamic TLS) are unsupported; thread-locals of an executable are one `static mut THREAD_LOCALS` shared by all threads.
 - Mach-O chained fixups and PE base relocations aren't read, so pointer slots in those formats keep their file bytes.
 - Relocatable objects (`.o`) have no addresses, so their data, jump tables included, isn't read. The differential harness links the corpus into a program (`-nostartfiles`) to get around it; laying out an object's sections and applying its relocations would make `.o` input work directly.
 

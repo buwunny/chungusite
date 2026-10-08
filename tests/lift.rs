@@ -72,26 +72,29 @@ fn call_passes_registers_and_leaves_placeholders_for_the_rest() {
         a.add(rax, rcx).unwrap(); // rcx: clobbered, unless the callee preserves it
         a.ret().unwrap();
     });
-    // The call lists rdi (= rsi), rsi, rdx, rcx, r8, r9, rsp, rax, r10, r11; every
+    // The call lists rdi (= rsi), rsi, rdx, rcx, r8, r9, rsp, rax, r10, r11, then
+    // the xmm halves (undef: the function never touches an xmm register); every
     // caller-saved register afterwards is a `callout` that `abi::apply` resolves
     // once the callee's signature is known.
-    let expected = "\
+    let xmm = ["v11"; 32].join(", ");
+    let expected = format!("\
 bb0(v8, v4, v3, v7, v0, v5, v6, v9, v10):
   v1 = const 0x2000
   v2 = inttoptr v1
-  v11 = call v2(v0, v0, v3, v4, v5, v6, v7, v8, v9, v10)
-  v12 = callout v11 r1
-  v13 = callout v11 r2
-  v14 = callout v11 r6
-  v15 = callout v11 r7
-  v16 = callout v11 r8
-  v17 = callout v11 r9
-  v18 = callout v11 r10
-  v19 = callout v11 r11
-  v20 = Add v11, v13
-  v21 = Add v20, v12
-  ret v21
-";
+  v11 = undef
+  v12 = call v2(v0, v0, v3, v4, v5, v6, v7, v8, v9, v10, {xmm})
+  v13 = callout v12 r1
+  v14 = callout v12 r2
+  v15 = callout v12 r6
+  v16 = callout v12 r7
+  v17 = callout v12 r8
+  v18 = callout v12 r9
+  v19 = callout v12 r10
+  v20 = callout v12 r11
+  v21 = Add v12, v14
+  v22 = Add v21, v13
+  ret v22
+");
     assert_eq!(out, expected);
 }
 
@@ -367,43 +370,21 @@ fn xmm_values_cross_blocks_as_block_params() {
     assert!(out.contains("bb2(v21, v22, v2, v4) bb1("), "{out}");
 }
 
-fn lift_err(build: impl FnOnce(&mut CodeAssembler)) -> LiftError {
-    let mut a = CodeAssembler::new(64).unwrap();
-    build(&mut a);
-    let code = a.assemble(0x1000).unwrap();
-    let mut f = Function::with_capacity(64, 8);
-    Lifter::new().lift(&code, 0x1000, &mut f).unwrap_err()
-}
-
 #[test]
-fn xmm_arguments_and_call_results_are_refused() {
-    // an argument in xmm0
-    let err = lift_err(|a| {
+fn xmm_arguments_and_call_results_are_values() {
+    // an argument in xmm0 is an entry param; a call defines all xmm registers
+    let out = ir(|a| {
         a.movq(rax, xmm0).unwrap();
-        a.ret().unwrap();
-    });
-    assert!(matches!(err, LiftError::XmmNotSet { ip: 0x1000 }), "{err:?}");
-    // a call leaves xmm0 undefined (or holding a float result)
-    let err = lift_err(|a| {
-        a.pxor(xmm0, xmm0).unwrap();
         a.call(0x2000).unwrap();
-        a.movq(rax, xmm0).unwrap();
+        a.movq(rdx, xmm0).unwrap();
+        a.add(rax, rdx).unwrap();
         a.ret().unwrap();
     });
-    assert!(matches!(err, LiftError::XmmNotSet { .. }), "{err:?}");
-    // ... also when the read is in a later block
-    let err = lift_err(|a| {
-        let mut l = a.create_label();
-        a.pxor(xmm0, xmm0).unwrap();
-        a.call(0x2000).unwrap();
-        a.test(eax, eax).unwrap();
-        a.jne(l).unwrap();
-        a.nop().unwrap();
-        a.set_label(&mut l).unwrap();
-        a.movq(rax, xmm0).unwrap();
-        a.ret().unwrap();
-    });
-    assert!(matches!(err, LiftError::XmmNotSet { .. }), "{err:?}");
+    // xmm0's halves are entry params v0, v1, passed on to the call ...
+    assert!(out.contains("v12, v0, v1, v13"), "{out}");
+    // ... and its result is read back through a callout
+    assert!(out.contains("v52 = callout v43 r192"), "{out}");
+    assert!(out.contains("Add v43, v52"), "{out}");
 }
 
 #[test]

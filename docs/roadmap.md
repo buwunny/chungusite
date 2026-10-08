@@ -8,12 +8,11 @@ The ML refinement layer (`src/refine`, behind the `ml` feature; see docs/ml-runt
 
 ## 1. Lifter coverage (the blocker for real code)
 
-`CALL`, `PUSH`/`POP`, the 8/16-bit `MOV` forms, `CMOVcc`/`SETcc`, memory operands, `MOVZX`/`MOVSX`, shifts, `IMUL`, one-operand `MUL` and `DIV` at every width, `INC`/`DEC`/`NEG`/`NOT`, SSE2 vectors and floats, jump tables (`Terminator::Switch`), `ADC`/`SBB`, the bit instructions, rotates, double shifts, the atomics, `rep movs`/`rep stos`, flags read in another block and thread-locals are lifted now ([lift.md](lift.md)). On chungusite's own debug build (29,735 functions), 29,717 lift (99.9%). What still fails (18 functions), by the first unsupported instruction in each function:
+`CALL`, `PUSH`/`POP`, the 8/16-bit `MOV` forms, `CMOVcc`/`SETcc`, memory operands, `MOVZX`/`MOVSX`, shifts, `IMUL`, one-operand `MUL` and `DIV` at every width, `INC`/`DEC`/`NEG`/`NOT`, SSE2 vectors and floats, jump tables (`Terminator::Switch`), `ADC`/`SBB`, the bit instructions, rotates, double shifts, the atomics, `rep movs`/`rep stos`, flags read in another block and thread-locals are lifted now ([lift.md](lift.md)). On chungusite's own debug build (29,735 functions), 29,721 lift (99.95%). What still fails (14 functions), by the first unsupported instruction in each function:
 
 | Cause | Functions | What's needed |
 |---|---|---|
 | AVX2 (`ymm` moves in `memchr` and `core::arch` wrappers) | 8 | 32-byte registers: four halves instead of two |
-| xmm arguments or call results (float math in `clap`'s suggestions and help layout) | 4 | float arguments and returns in signatures (step 2) |
 | Flags read after a call through the GOT that doesn't return (`handle_alloc_error`), so the code after it is never reached | 3 | noreturn detection for calls through a pointer (step 8) |
 | A conditional branch into another function (a `.cold` part) | 1 | a tail call on one side of a branch |
 | `CPUID`, `XGETBV` | 2 | an opaque intrinsic |
@@ -23,7 +22,7 @@ The ML refinement layer (`src/refine`, behind the `ml` feature; see docs/ml-runt
 Whole-program signature recovery ([calls.md](calls.md)): arguments, stack arguments, one or two return registers, and which caller-saved registers a function preserves (gcc's interprocedural register allocation depends on it). Direct calls, tail calls and imports through relocations, the PLT and the GOT are emitted by name, with `extern "C"` declarations for imports. On the sample binary this took the `todo!()` count from 37,048 to the 983 functions that don't lift. Still open:
 
 - Indirect calls (function pointers, vtables) guess their arguments from the call site. Recovering vtables (step 6) would give them targets.
-- Floating-point and vector arguments and returns (xmm registers) aren't tracked yet. SSE lifts now (step 1), so a function that reads an xmm argument or a call's float result fails with `XmmNotSet` until they are.
+- ~~Floating-point arguments and returns (xmm registers) aren't tracked yet.~~ Done: float arguments and results are `f64` parameters and returns, and preserved xmm registers survive calls. Vector (`__m128`) arguments are still open.
 - ~~In safe mode, functions that other decompiled functions call take integers.~~ Done in step 7: callers lend slices, and a caller that can't calls the callee's raw twin.
 
 ## 3. Stack frames (done)
@@ -78,4 +77,4 @@ Stages 5 to 7 in [ownership.md](ownership.md) are in: the frame, read-only globa
 
 `tests/emit.rs` already runs one decompiled function in both modes and compares results. Generalize that into differential testing: compile small C functions, decompile them, call both on random inputs, and compare. That is the test that says the decompiler is *correct*, not just that its output compiles.
 
-Started: `tests/differential.rs` compiles `tests/differential/corpus.c` (132 functions, including calls, stack arguments, address-taken locals, wide multiplies, 16-byte copies, jump tables, bit instructions, atomics, SSE2 intrinsics and float math) with gcc and clang at -O1, -O2 and -Os, links it into a program so its data and jump tables have addresses, decompiles each function in both modes with its data as statics, and runs original and decompiled code side by side on random inputs, comparing return values and buffer contents. A function that doesn't lift yet is counted; one that lifts and computes something different fails the test unless `KNOWN_BAD` lists it. The pass rate it prints is a second to-do list next to `--list`: it shows which missing instructions cost the most real code. Add a function to the corpus with a `// @diff name: ret(args)` line above it. It passes 1,580 of 1,584 (function, build) pairs, and no function that lifts gives a wrong result.
+Started: `tests/differential.rs` compiles `tests/differential/corpus.c` (144 functions, including calls, stack arguments, address-taken locals, wide multiplies, 16-byte copies, jump tables, bit instructions, atomics, SSE2 intrinsics, float math, and float arguments and results) with gcc and clang at -O1, -O2 and -Os, links it into a program so its data and jump tables have addresses, decompiles each function in both modes with its data as statics, and runs original and decompiled code side by side on random inputs, comparing return values and buffer contents. A function that doesn't lift yet is counted; one that lifts and computes something different fails the test unless `KNOWN_BAD` lists it. The pass rate it prints is a second to-do list next to `--list`: it shows which missing instructions cost the most real code. Add a function to the corpus with a `// @diff name: ret(args)` line above it. It passes 1,724 of 1,728 (function, build) pairs, and no function that lifts gives a wrong result.

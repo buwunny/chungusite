@@ -28,9 +28,13 @@ const NGPR: usize = 16;
 const NREG: usize = NGPR + 32;
 type RegFile = [Option<ValueId>; NREG];
 /// `BlockParam` register number of xmm register half `k` (2 * xmm + high).
+/// Float argument `j` is the low half of xmm `j`, `XMM_PARAM + 2 * j`.
 pub const XMM_PARAM: u8 = 0xc0;
-/// The xmm slots of the register file, as a bit mask.
-const XMM_SLOTS: u64 = ((1 << 32) - 1) << NGPR;
+/// Register number (in `CallOut`, `BlockParam`) of xmm0's low half: the first
+/// float argument, and where a float result is returned.
+pub const XMM0: u8 = XMM_PARAM;
+/// Float arguments in registers: xmm0-7.
+pub const FLOAT_ARGS: usize = 8;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum LiftError {
@@ -42,25 +46,29 @@ pub enum LiftError {
     BranchOutOfRange { ip: u64, target: u64 },
     /// A branch targets the middle of another instruction (overlapping code).
     TargetInsideInstruction { target: u64 },
-    /// An xmm register read before anything set it: a float or vector argument,
-    /// or a value a call clobbered (a float result).
-    XmmNotSet { ip: u64 },
 }
 
 /// A call's arguments as the lifter records them: every register a callee could
 /// read. The six argument registers, then rsp (stack arguments), then rax, r10 and
-/// r11, whose values `abi` needs when the callee preserves them.
+/// r11, whose values `abi` needs when the callee preserves them, then from
+/// `CALL_XMM` on the halves of xmm0-15 (low, high): float arguments, and values a
+/// callee that preserves the register leaves there.
 pub const CALL_REGS: [Register; 10] = [
     Register::RDI, Register::RSI, Register::RDX, Register::RCX, Register::R8, Register::R9,
     Register::RSP, Register::RAX, Register::R10, Register::R11,
 ];
-pub const CALL_ARGS: usize = CALL_REGS.len();
+pub const CALL_XMM: usize = CALL_REGS.len();
+pub const CALL_ARGS: usize = CALL_XMM + 32;
 type CallRegs = [ValueId; CALL_ARGS];
 /// Caller-saved registers besides rax: each is a `CallOut` after a call, and an
-/// `Exit` lists them at a return.
+/// `Exit` lists them at a return, followed by the halves of xmm0-15 from
+/// `EXIT_XMM0` on (xmm0's low half: a float result).
 pub const EXIT_REGS: [Register; 8] = [
     Register::RCX, Register::RDX, Register::RSI, Register::RDI, Register::R8, Register::R9, Register::R10, Register::R11,
 ];
+/// Position of xmm0's low half (a float result) in an `Exit`'s list.
+pub const EXIT_XMM0: usize = EXIT_REGS.len();
+const EXIT_LEN: usize = EXIT_XMM0 + 32;
 /// `BlockParam` register number of a condition (a `Bool`) that a block reads from
 /// the flags its predecessors left.
 pub const FLAG_PARAM: u8 = 0xfe;
@@ -127,11 +135,6 @@ struct BlockState {
     out: RegFile,
     /// `BlockParam` created for each live-in register.
     params: RegFile,
-    /// Registers a call left undefined (xmm only: the GPRs it clobbers are
-    /// `CallOut`s), as a bit mask over the register file.
-    clobbered: u64,
-    /// The instruction that first read an xmm live-in, for errors.
-    xmm_read: u64,
     /// `BlockParam` created for each condition read before the block sets the flags.
     cparams: CondFile,
     /// Each condition's value at block exit, filled in `finalize` for the ones a
@@ -146,7 +149,7 @@ struct BlockState {
 }
 
 const EMPTY_STATE: BlockState =
-    BlockState { out: [None; NREG], params: [None; NREG], clobbered: 0, xmm_read: 0, cparams: [None; NCC], cout: [None; NCC], flags: Flags::Unknown, exit_ip: 0, flags_read: 0 };
+    BlockState { out: [None; NREG], params: [None; NREG], cparams: [None; NCC], cout: [None; NCC], flags: Flags::Unknown, exit_ip: 0, flags_read: 0 };
 
 /// Where an instruction's destination operand lives.
 #[derive(Copy, Clone)]
@@ -165,7 +168,7 @@ pub struct Lifter {
     /// The same for each block that ends in a `TailCall`.
     tails: Vec<(BlockId, CallRegs)>,
     /// Each `Exit` and the registers it lists.
-    exits: Vec<(ValueId, [ValueId; 8])>,
+    exits: Vec<(ValueId, [ValueId; EXIT_LEN])>,
     /// Jump tables found in pass 1, in address order.
     tables: Vec<JumpTable>,
     /// Target address of every case of every table, table after table.
@@ -176,6 +179,12 @@ pub struct Lifter {
     nrecent: usize,
     /// Pass 1: the address of every instruction, in order.
     starts: Vec<u64>,
+    /// Pass 1: some instruction names an xmm (or wider) register. Without one,
+    /// calls and returns don't track xmm registers: they can only hold what the
+    /// function was entered with, or what its callees left, which `abi` works
+    /// out from the callees' signatures. Most functions are like that, and
+    /// threading 32 xmm halves through them doubles the lifting time.
+    xmm: bool,
     /// Pass 2: the case index, read where the current block loads from its table.
     switch_index: Option<ValueId>,
     /// Each block that ends in a `Switch`, and its table (index into `tables`).
@@ -210,6 +219,7 @@ impl Lifter {
             recent: [Instruction::default(); RECENT],
             nrecent: 0,
             starts: Vec::with_capacity(256),
+            xmm: false,
             switch_index: None,
             switches: Vec::with_capacity(4),
             track_exits: false,
@@ -306,6 +316,7 @@ impl Lifter {
         self.cases.clear();
         self.nrecent = 0;
         self.starts.clear();
+        self.xmm = false;
         let mut dec = Decoder::with_ip(64, code, ip, DecoderOptions::NONE);
         while dec.can_decode() {
             dec.decode_out(&mut self.insn);
@@ -318,6 +329,8 @@ impl Lifter {
             if !handled(&self.insn) {
                 return Err(self.unsupported());
             }
+            let i = &self.insn;
+            self.xmm |= (0..i.op_count()).any(|k| i.op_kind(k) == OpKind::Register && i.op_register(k).is_vector_register());
             match self.insn.flow_control() {
                 FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch => {
                     let t = self.insn.near_branch_target();
@@ -544,9 +557,14 @@ impl Lifter {
             }
             FlowControl::Return => {
                 if self.track_exits {
-                    let mut regs = [ValueId::from_u32(0); 8];
+                    let mut regs = [ValueId::from_u32(0); EXIT_LEN];
                     for (v, r) in regs.iter_mut().zip(EXIT_REGS) {
                         *v = self.read_full(f, r.number());
+                    }
+                    if self.xmm {
+                        for k in 0..32 {
+                            regs[EXIT_XMM0 + k] = self.read_full(f, NGPR + k);
+                        }
                     }
                     let exit = self.emit(f, InstKind::Exit { regs: ListRef::EMPTY }, TyId::UNIT);
                     self.exits.push((exit, regs));
@@ -1200,11 +1218,15 @@ impl Lifter {
         let args = self.call_regs(f);
         let call = self.emit(f, InstKind::Call { callee, args: ListRef::EMPTY }, TyId::B8);
         self.calls.push((call, args));
-        self.state[self.cur].clobbered |= XMM_SLOTS;
         self.state[self.cur].out[Register::RAX.number()] = Some(call);
         for r in EXIT_REGS {
             let v = self.emit(f, InstKind::CallOut { call, reg: r.number() as u8 }, TyId::B8);
             self.state[self.cur].out[r.number()] = Some(v);
+        }
+        // xmm registers are caller-saved too; xmm0 may hold a float result
+        for k in 0..if self.xmm { 32 } else { 0 } {
+            let v = self.emit(f, InstKind::CallOut { call, reg: XMM_PARAM + k as u8 }, TyId::B8);
+            self.state[self.cur].out[NGPR + k] = Some(v);
         }
         self.flags = Flags::Unknown;
         Ok(())
@@ -1215,6 +1237,13 @@ impl Lifter {
         let mut regs = [ValueId::from_u32(0); CALL_ARGS];
         for (a, r) in regs.iter_mut().zip(CALL_REGS) {
             *a = self.read_full(f, r.number());
+        }
+        if self.xmm {
+            for k in 0..32 {
+                regs[CALL_XMM + k] = self.read_full(f, NGPR + k);
+            }
+        } else {
+            regs[CALL_XMM..].fill(self.emit(f, InstKind::Undef, TyId::B8));
         }
         regs
     }
@@ -1716,14 +1745,7 @@ impl Lifter {
                         if self.state[s].params[r].is_none() {
                             continue;
                         }
-                        // an xmm register a call clobbered, or one read on entry
-                        if self.state[b].clobbered >> r & 1 != 0 {
-                            return Err(LiftError::XmmNotSet { ip: self.state[s].xmm_read });
-                        }
                         if self.state[b].out[r].is_none() {
-                            if r >= NGPR && self.state[b].xmm_read == 0 {
-                                self.state[b].xmm_read = self.state[s].xmm_read;
-                            }
                             self.live_in(f, b, r);
                             changed = true;
                         }
@@ -1731,10 +1753,6 @@ impl Lifter {
                 }
             }
             if !changed { break; }
-        }
-        // xmm registers aren't arguments yet (floats and vectors)
-        if self.state[0].params[NGPR..].iter().any(Option::is_some) {
-            return Err(LiftError::XmmNotSet { ip: self.state[0].xmm_read });
         }
         // 1b. Switch edges carry no arguments: each case goes through a new block
         //     without parameters (one per target) that jumps on with them.
@@ -1748,8 +1766,8 @@ impl Lifter {
                     Some(j) => f.value_pool[table + j],
                     None => {
                         let to = self.block_at(target).expect("case targets are leaders");
-                        let BlockState { out, cout, clobbered, .. } = self.state[b.index()];
-                        self.state.push(BlockState { out, cout, clobbered, ..EMPTY_STATE });
+                        let BlockState { out, cout, .. } = self.state[b.index()];
+                        self.state.push(BlockState { out, cout, ..EMPTY_STATE });
                         let term = Terminator::Jump { to, args: ListRef::EMPTY };
                         f.blocks.push(Block { insts: ListRef::EMPTY, params: ListRef::EMPTY, term }).as_value()
                     }
@@ -1777,7 +1795,7 @@ impl Lifter {
             let start = f.value_pool.len() as u32;
             f.value_pool.extend_from_slice(&regs);
             if let InstKind::Exit { regs } = &mut f.insts[exit].kind {
-                *regs = ListRef { start, len: 8 };
+                *regs = ListRef { start, len: if self.xmm { EXIT_LEN } else { EXIT_XMM0 } as u32 };
             }
         }
         for &(b, args) in &self.tails {

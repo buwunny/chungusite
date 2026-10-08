@@ -759,3 +759,54 @@ void f_vec(uint8_t *p) {
     r = _mm_unpackhi_pd(r, _mm_div_pd(_mm_sqrt_pd(a), b));
     _mm_storeu_pd((double *)(p + 32), r);
 }
+
+/* ---- float arguments and results ---- */
+
+// @diff f_add: f64(f64, f64)
+double f_add(double a, double b) { return a + b * 2.0; }
+
+// Integer and float arguments interleaved: each kind fills its own registers.
+// @diff f_mixed: f64(i32, f64, i64, f32)
+double f_mixed(int32_t a, double x, int64_t b, float y) { return x * a - (double)y + (double)(b >> 3); }
+
+// @diff f_poly: f64(f64)
+double f_poly(double x) { return ((0.25 * x - 1.5) * x + 3.0) * x - 7.0; }
+
+// @diff f_cmp: i32(f64, f64)
+int32_t f_cmp(double a, double b) { return (a < b) | (a <= b) << 1 | (a == b) << 2 | (a > b) << 3; }
+
+NOINLINE double f_scale(double x, int32_t k) { return x * k + 0.5; }
+
+// A float argument and result across a call.
+// @diff f_call: f64(f64, i32:-50..50)
+double f_call(double x, int32_t k) { return f_scale(x + 1.0, k) - f_scale(x, k + 1); }
+
+// A tail call that returns the callee's float.
+// @diff f_tail: f64(f64)
+double f_tail(double x) { return f_scale(x * 3.0, 7); }
+
+// @diff f_sum: f64(buf:64, u64:0..9)
+double f_sum(const uint8_t *p, uint64_t n) {
+    double s = 0.0;
+    for (uint64_t i = 0; i < n; i++) {
+        double d;
+        memcpy(&d, p + 8 * i, 8);
+        s += d;
+    }
+    return s;
+}
+
+// @diff f32_ops: f32(f32, f32)
+float f32_ops(float a, float b) { return a * b - a / 4.0f; }
+
+// @diff f_trunc64: i64(f64)
+int64_t f_trunc64(double x) { return (int64_t)x; }
+
+// @diff f_select: f64(f64, f64, i32:0..2)
+double f_select(double a, double b, int32_t c) { return c ? a - b : b * 0.5; }
+
+// @diff f_abs: f64(f64)
+double f_abs(double x) { return -__builtin_fabs(x) + 1.0; }
+
+// @diff f_to_f32: f32(f64, i32)
+float f_to_f32(double x, int32_t k) { return (float)x + (float)k; }

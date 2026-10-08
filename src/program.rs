@@ -67,7 +67,7 @@ pub struct Func {
     pub types: Option<FnTypes>,
     sites: Vec<Site>,
     targets: Vec<Target>,
-    guesses: Vec<u8>,
+    guesses: Vec<(u8, u8)>,
 }
 
 /// An `extern "C"` declaration in `mod ffi`.
@@ -305,7 +305,7 @@ impl Program {
                     Ok(f) => {
                         let sites = abi::sites(f);
                         let targets = sites.iter().map(|&s| resolve(f, s)).collect();
-                        let guesses = sites.iter().map(|&s| abi::guess_args(f, s)).collect();
+                        let guesses = sites.iter().map(|&s| (abi::guess_args(f, s), abi::guess_fargs(f, s))).collect();
                         (sites, targets, guesses)
                     }
                     Err(_) => Default::default(),
@@ -338,19 +338,21 @@ impl Program {
                     _ => continue,
                 };
                 let e = guessed.entry(key).or_insert(Sig { ret: true, ..Sig::default() });
-                e.args = e.args.max(g);
+                e.args = e.args.max(g.0);
+                e.fargs = e.fargs.max(g.1);
             }
         }
         let stack_args: Vec<u8> = funcs.par_iter().map(|f| f.ir.as_ref().map_or(0, abi::stack_args)).collect();
 
         // 3. Signatures, to a fixpoint (Jacobi rounds: every function from the
         //    previous round's callee signatures). A function returns rdx too
-        //    (`ret2`) only if some caller reads rdx after calling it. A function
-        //    whose inputs (its own signature, its callees', and whether rdx is
-        //    wanted) didn't change last round gets the same result again, so only
-        //    the others are re-inferred.
+        //    (`ret2`) only if some caller reads rdx after calling it; a caller
+        //    reading xmm0 says it returns a float. A function whose inputs (its
+        //    own signature, its callees', and what its callers read) didn't
+        //    change last round gets the same result again, so only the others
+        //    are re-inferred.
         let mut sigs: Vec<Sig> = stack_args.iter().map(|&s| Sig { stack_args: s, ..Sig::default() }).collect();
-        let mut rdx_wanted = vec![false; funcs.len()];
+        let mut wanted_by = vec![0u8; funcs.len()];
         let mut callers: Vec<Vec<usize>> = vec![Vec::new(); funcs.len()];
         for (i, f) in funcs.iter().enumerate() {
             for t in &f.targets {
@@ -361,17 +363,17 @@ impl Program {
                 }
             }
         }
-        let mut results: Vec<(Sig, Vec<bool>)> = sigs.iter().map(|&s| (s, Vec::new())).collect();
+        let mut results: Vec<(Sig, Vec<u8>)> = sigs.iter().map(|&s| (s, Vec::new())).collect();
         let mut dirty = vec![true; funcs.len()];
         for _round in 0..MAX_ROUNDS {
-            let next: Vec<Option<(Sig, Vec<bool>)>> = funcs
+            let next: Vec<Option<(Sig, Vec<u8>)>> = funcs
                 .par_iter()
                 .enumerate()
                 .map(|(i, f)| match &f.ir {
                     Ok(ir) if dirty[i] => {
                         let callee = |k: usize| site_sig(&f.targets[k], f.guesses[k], &sigs, &guessed);
-                        let r = abi::infer(ir, &f.sites, &callee, sigs[i], rdx_wanted[i]);
-                        Some((Sig { stack_args: stack_args[i], ..r.sig }, r.rdx_read))
+                        let r = abi::infer(ir, &f.sites, &callee, sigs[i], wanted_by[i]);
+                        Some((Sig { stack_args: stack_args[i], ..r.sig }, r.reads))
                     }
                     _ => None,
                 })
@@ -381,11 +383,11 @@ impl Program {
                     results[i] = r;
                 }
             }
-            let mut wanted = vec![false; funcs.len()];
+            let mut wanted = vec![0u8; funcs.len()];
             for (f, (_, read)) in funcs.iter().zip(&results) {
                 for (t, &r) in f.targets.iter().zip(read) {
-                    if let (Target::Func(j), true) = (t, r) {
-                        wanted[*j] = true;
+                    if let Target::Func(j) = t {
+                        wanted[*j] |= r;
                     }
                 }
             }
@@ -399,7 +401,7 @@ impl Program {
                         dirty[c] = true;
                     }
                 }
-                if wanted[i] != rdx_wanted[i] {
+                if wanted[i] != wanted_by[i] {
                     changed = true;
                     dirty[i] = true;
                 }
@@ -408,7 +410,7 @@ impl Program {
                 break;
             }
             sigs = results.iter().map(|r| r.0).collect();
-            rdx_wanted = wanted;
+            wanted_by = wanted;
         }
 
         // 4. Rewrite each function to its signature.
@@ -418,8 +420,8 @@ impl Program {
             let shapes: Vec<CallShape> = (0..f.sites.len())
                 .map(|k| {
                     let s = site_sig(&f.targets[k], f.guesses[k], &sigs, &guessed);
-                    let args = if s.variadic { s.args.max(f.guesses[k]) } else { s.args };
-                    CallShape { args, ..s }
+                    let (args, fargs) = if s.variadic { (s.args.max(f.guesses[k].0), s.fargs.max(f.guesses[k].1)) } else { (s.args, s.fargs) };
+                    CallShape { args, fargs, ..s }
                 })
                 .collect();
             f.sites = abi::apply(ir, sigs[i], &f.sites, &|k| shapes[k]);
@@ -459,7 +461,7 @@ impl Program {
                         let s = if funcs[*j].ir.is_ok() { sigs[*j] } else { guessed[&Target::Func(*j)] };
                         (funcs[*j].name.clone(), s)
                     }
-                    Target::Import(n) => (n.clone(), site_sig(&funcs[fi].targets[k], 0, &sigs, &guessed)),
+                    Target::Import(n) => (n.clone(), site_sig(&funcs[fi].targets[k], (0, 0), &sigs, &guessed)),
                     _ => continue,
                 };
                 if extern_of.contains_key(&name) {
@@ -489,7 +491,15 @@ impl Program {
         let k = f.sites.iter().position(|&s| s == site)?;
         let ext = |name: &str| {
             let e = &self.externs[*self.extern_of.get(name)?];
-            Some(CallInfo { path: Some(format!("ffi::{}", e.ident)), ret: e.sig.ret, ret2: e.sig.ret2, foreign: true, ..CallInfo::default() })
+            Some(CallInfo {
+                path: Some(format!("ffi::{}", e.ident)),
+                ret: e.sig.ret,
+                ret2: e.sig.ret2,
+                foreign: true,
+                arg_tys: arg_tys(e.sig, &[]),
+                ret_ty: e.sig.fret.then_some(TyId::F64),
+                ..CallInfo::default()
+            })
         };
         let plain = match &f.targets[k] {
             Target::Func(j) => {
@@ -501,8 +511,8 @@ impl Program {
                         ret: g.sig.ret,
                         ret2: g.sig.ret2,
                         foreign: false,
-                        arg_tys: t.map(|t| t.args.iter().map(|a| a.ty).collect()).unwrap_or_default(),
-                        ret_ty: t.and_then(|t| t.ret),
+                        arg_tys: arg_tys(g.sig, &t.map(|t| t.args.iter().map(|a| a.ty).collect::<Vec<_>>()).unwrap_or_default()),
+                        ret_ty: if g.sig.fret { Some(TyId::F64) } else { t.and_then(|t| t.ret) },
                         ..CallInfo::default()
                     })
                 } else {
@@ -510,7 +520,12 @@ impl Program {
                 }
             }
             Target::Import(n) => ext(n),
-            Target::Indirect => None,
+            // through a pointer: integers and the float arguments the call sets up
+            Target::Indirect => {
+                let (args, fargs) = f.guesses[k];
+                let sig = Sig { args, fargs, ..Sig::default() };
+                Some(CallInfo { path: None, ret: true, foreign: true, arg_tys: arg_tys(sig, &[]), ..CallInfo::default() })
+            }
         };
         let Some(s) = safe else { return plain };
         let plain = plain?;
@@ -822,15 +837,18 @@ impl Program {
         for e in ext {
             let mut params: Vec<String> = (0..e.sig.args).map(|k| format!("a{k}: u64")).collect();
             params.extend((0..e.sig.stack_args).map(|k| format!("a{}: u64", 6 + k as usize)));
+            // an f32 argument or result travels in the same register as an f64
+            params.extend((0..e.sig.fargs).map(|j| format!("x{j}: f64")));
             if e.sig.variadic {
                 params.push("...".into());
             }
             if e.ident != e.name {
                 let _ = writeln!(s, "        #[link_name = {:?}]", e.name);
             }
-            let ret = match (e.sig.ret, e.sig.ret2) {
-                (_, true) => " -> Pair",
-                (true, _) => " -> u64",
+            let ret = match (e.sig.ret, e.sig.ret2, e.sig.fret) {
+                (_, true, _) => " -> Pair",
+                (true, _, true) => " -> f64",
+                (true, _, _) => " -> u64",
                 _ => "",
             };
             let _ = writeln!(s, "        pub fn {}({}){ret};", e.ident, params.join(", "));
@@ -991,11 +1009,21 @@ fn used_only_as_callee(f: &Function, v: ValueId, callees: &std::collections::Has
     ok
 }
 
-fn site_sig(t: &Target, guess: u8, sigs: &[Sig], guessed: &HashMap<Target, Sig>) -> Sig {
+/// The Rust types of a call's arguments, as `emit` wants them: `int` for the
+/// integer ones (register, then stack; `None` for `u64`), then `f64` for each
+/// float argument.
+fn arg_tys(sig: Sig, int: &[Option<TyId>]) -> Vec<Option<TyId>> {
+    let n = sig.args as usize + sig.stack_args as usize;
+    let mut v: Vec<Option<TyId>> = int.iter().copied().chain(std::iter::repeat(None)).take(n).collect();
+    v.extend(std::iter::repeat_n(Some(TyId::F64), sig.fargs as usize));
+    v
+}
+
+fn site_sig(t: &Target, (args, fargs): (u8, u8), sigs: &[Sig], guessed: &HashMap<Target, Sig>) -> Sig {
     match t {
         Target::Func(j) => guessed.get(t).copied().unwrap_or(sigs[*j]),
         Target::Import(n) => crate::libc::lookup(n).or_else(|| guessed.get(t).copied()).unwrap_or_default(),
-        Target::Indirect => Sig { args: guess, ret: true, ..Sig::default() },
+        Target::Indirect => Sig { args, fargs, ret: true, ..Sig::default() },
     }
 }
 
@@ -1007,6 +1035,5 @@ pub fn describe(e: &crate::lift::LiftError) -> String {
         LiftError::FlagsNotInBlock { ip } => format!("branch at {ip:#x} reads flags set in another block"),
         LiftError::BranchOutOfRange { ip, target } => format!("branch at {ip:#x} leaves the function (to {target:#x})"),
         LiftError::TargetInsideInstruction { target } => format!("branch into the middle of an instruction at {target:#x}"),
-        LiftError::XmmNotSet { ip } => format!("xmm register read at {ip:#x} holds an argument or a call's result"),
     }
 }

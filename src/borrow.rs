@@ -202,6 +202,10 @@ pub enum FactKind {
     Borrow { mutbl: bool },
     /// Passed to `free`.
     Free,
+    /// Passed as an address to the raw twin of a callee that takes a slice: it
+    /// is accessed during the call only, through a pointer made from the root's
+    /// slice at the call (`frame.0[..].as_mut_ptr()`).
+    RawLend { mutbl: bool },
     /// Stored into the frame or an allocation (root `.0`), where loads find it.
     Stash(u8),
     /// The contents of this root (a frame or an allocation) are copied into root
@@ -468,7 +472,7 @@ fn fact_len(f: &Function, x: &Fact, callee: impl Fn(Site) -> Option<Callee>) -> 
             konst(f, *args.get(&f.value_pool).get(2)?).filter(|&n| n >= 0)
         }
         // lent, to a slice-taking callee or its raw twin
-        (FactKind::Borrow { .. } | FactKind::Escape, _) => {
+        (FactKind::Borrow { .. } | FactKind::RawLend { .. } | FactKind::Escape, _) => {
             let (site, k) = x.site?;
             match callee(site)?.args.get(k as usize)? {
                 Pass::Borrow { len, .. } => len.map(i64::from),
@@ -877,8 +881,10 @@ impl FactSink<'_> {
             let og = self.o[a.index()];
             let k = k.min(255) as u8;
             if c.is_some_and(|c| c.raw) {
-                if matches!(pass, Pass::Borrow { .. }) {
-                    self.add_site(a, FactKind::Escape, Some((site, k)));
+                match pass {
+                    Pass::Borrow { mutbl, .. } if og.single().is_some() => self.add_site(a, FactKind::RawLend { mutbl }, Some((site, k))),
+                    Pass::Borrow { .. } => self.add_site(a, FactKind::Escape, Some((site, k))),
+                    _ => {}
                 }
                 continue;
             }
@@ -956,10 +962,17 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
                 r.freed = true;
                 r.bad_free |= x.off != Off::Known(0);
             }
+            // like a borrow (what is stored in it may be read), but through a
+            // raw pointer, which the loan rules don't constrain
+            FactKind::RawLend { mutbl } => {
+                r.read = true;
+                r.write |= mutbl;
+                r.borrowed = true;
+            }
             FactKind::Spill => r.spill = true,
             FactKind::Stash(_) | FactKind::CopyTo(_) => {}
         }
-        if matches!(x.kind, FactKind::Read | FactKind::Write | FactKind::Borrow { .. }) {
+        if matches!(x.kind, FactKind::Read | FactKind::Write | FactKind::Borrow { .. } | FactKind::RawLend { .. }) {
             r.negative |= matches!(x.off, Off::Known(o) if o < 0);
         }
     }
@@ -1001,7 +1014,11 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
             match x.kind {
                 FactKind::Stash(c) if c as usize >= n || contents_escape[c as usize] => escape[r] = true,
                 FactKind::Borrow { .. } | FactKind::Free if bad_loans.contains(&x.site.unwrap()) => escape[r] = true,
-                FactKind::Read | FactKind::Write if x.site.is_some_and(|(s, _)| a.raw_calls.contains(&s)) => escape[r] = true,
+                // a call like `memcpy` that isn't inlined gets a pointer made from
+                // the root's slice, except to write a read-only global
+                FactKind::Write if matches!(a.roots[r], Root::Global(_)) && x.site.is_some_and(|(s, _)| a.raw_calls.contains(&s)) => escape[r] = true,
+                // a nullable argument may be null at the call
+                FactKind::RawLend { .. } if matches!(a.roots[r], Root::Param(_)) && u[r].nullable => escape[r] = true,
                 _ => {}
             }
         }

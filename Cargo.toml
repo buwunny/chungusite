@@ -49,3 +49,9 @@ required-features = ["ml"]
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# iced-x86 subtracts pointers truncated to u32 (`decode_out_ptr`), which
+# overflows when the bytes it decodes straddle a 4 GiB address boundary: a
+# panic in debug builds only, depending on where the binary's bytes land.
+[profile.dev.package.iced-x86]
+overflow-checks = false

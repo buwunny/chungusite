@@ -1939,7 +1939,12 @@ impl Emitter<'_> {
                 let i = self.elem_index(ptr, len).unwrap_or_else(|| format!("({pr}.wrapping_sub({base}) / {len}) as usize"));
                 return self.conv(&format!("{s}[{i}]"), et, self.vt[id.index()]);
             }
-            return format!("{t}::from_le_bytes({s}[{pr}.wrapping_sub({base}) as usize..][..{len}].try_into().unwrap())");
+            let bytes = format!("{s}[{pr}.wrapping_sub({base}) as usize..][..{len}].try_into().unwrap()");
+            return match self.table.tys[self.vt[id.index()]] {
+                // a typed pointer is stored as its address
+                Ty::RawPtr { .. } => format!("(u64::from_le_bytes({bytes}) as {t})"),
+                _ => format!("{t}::from_le_bytes({bytes})"),
+            };
         }
         self.stats.raw += 1;
         self.stats.raw_by[bucket(self.src[ptr.index()])] += 1;

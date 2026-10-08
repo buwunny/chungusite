@@ -19,10 +19,12 @@ object = { version = "0.40.0", default-features = false, features = ["read_core"
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-24"], optional = true }
 rayon = "1.12.0"
 rustc-demangle = "0.1.28"
+# --refine: the type model's labels from config.json.
+serde_json = { version = "1", optional = true }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 
 [features]
-ml = ["dep:ort", "dep:tokenizers"]
+ml = ["dep:ort", "dep:tokenizers", "dep:serde_json"]
 
 [dev-dependencies]
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "code_asm"] }
@@ -38,6 +40,10 @@ required-features = ["ml"]
 
 [[test]]
 name = "refine_ort"
+required-features = ["ml"]
+
+[[test]]
+name = "refine_model"
 required-features = ["ml"]
 
 [profile.release]

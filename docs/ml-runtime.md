@@ -43,9 +43,24 @@ Variables are SSA values (`vN`), not registers. `rax` holds unrelated things at 
 - A run of punctuation is a single piece, so `);` is never `)` followed by `;`.
 - `TokenCache::from_tokenizer_file` switches off any truncation or padding saved in `tokenizer.json`, because a saved limit would otherwise be applied to each piece. The fixture's tokenizer has one: left truncation at 192 tokens.
 
+## `--refine`
+
+`chungusite <binary> --refine <dir>` (built with `--features ml`) asks a trained type classifier about every argument and return value of each function without a usable prototype, through `types::TypeModel` ([types.md](types.md#the-model-hook)). `refine::model::TypeClassifier` is the implementation. `<dir>` holds what `train_types.py` saves, exported to ONNX:
+
+- `model.onnx`: inputs `input_ids` and `attention_mask`, output `logits` (`[batch, classes]`).
+- `tokenizer.json`: the model's own tokenizer. Its saved truncation length is the sequence length (256 if it has none), and its post-processor's special tokens (`<s>`, `</s>`) go around each row.
+- The labels, class 0 first: `labels.txt` (one per line), or else `config.json`'s `id2label`. Labels are C type names as DWARF spells them (`int`, `unsigned char`, `char *`). A label `parse_label` doesn't know (`other`, a struct name) is never proposed, so set `id2label` when training: the default `LABEL_0` names nothing.
+
+Each question is one row: the function's text, then `var vN` for the value asked about (`refine::to_var_text`; the text already ends in a newline). That is the format `train_types.py` documents for its JSONL: `{"text": "<function>\nvar v7", "label": 12}`. Like training, a row longer than the model takes is cut from the left, so the marker always survives. The highest-probability class is proposed if its softmax probability is at least `--refine-threshold` (default 0.5), and the gate then accepts or rejects it against the facts. The summary on stderr counts both.
+
+Loading checks that the library loads (a clear error naming `ORT_DYLIB_PATH` rather than a panic inside `ort`) and that the model has one class per label. Questions are asked in parallel: each worker thread makes its own session (one intra-op thread) on first use, so memory grows with `-j`. If inference fails partway, a warning is printed once and decompilation continues without the model.
+
+The cost is one row per question. On chungusite's own debug build with `--no-dwarf` that is 89,258 rows; with the 550 KB fixture model the run takes 74 s on 4 shared cores instead of 6 s, and a real model will cost more per row. With debug info, only functions without a prototype are asked.
+
 ## Tests
 
 - `tests/refine_exact.rs` (with `--features ml`) checks that cached ids equal `tokenizer.encode(full_text)` for 1,500 random lifted programs. Run the same check whenever you change the serializer or swap tokenizers.
+- `tests/refine_model.rs` checks the `var vN` row format, and (ignored, needs `ORT_DYLIB_PATH`) that `TypeClassifier`'s proposals and probabilities match the same rows run through `tokenizers` and `onnxruntime` in Python, including one cut from 1,162 tokens to the fixture's 192, and that the threshold holds back proposals below it. The fixture's `labels.txt` names its two classes `int` and `char *`.
 - `tests/refine_ort.rs` is marked `#[ignore]` because it needs `ORT_DYLIB_PATH`. It runs the fixture model through `ort` and compares ids and logits against values computed independently in Python (`tokenizers` and `onnxruntime` 1.30). Run it with `cargo test --features ml -- --include-ignored`.
 
 `tests/fixtures/tiny-types` is a 550 KB stand-in: a 2-layer random-initialised RoBERTa classifier briefly trained on synthetic labels, with a 2,000-token byte-level BPE. It exists to test the plumbing, and its predictions mean nothing. Real models are trained with the scripts and recipe described in the project's fine-tuning notes.

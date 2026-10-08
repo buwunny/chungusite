@@ -77,6 +77,17 @@ struct Cli {
     /// Worker threads (default: one per CPU, or RAYON_NUM_THREADS).
     #[arg(short, long)]
     jobs: Option<usize>,
+
+    /// Ask the type model in this directory (model.onnx, tokenizer.json, labels)
+    /// for the types debug info doesn't give; the facts accept or reject each one.
+    #[cfg(feature = "ml")]
+    #[arg(long, value_name = "DIR")]
+    refine: Option<PathBuf>,
+
+    /// --refine: the lowest probability a proposal needs to be considered.
+    #[cfg(feature = "ml")]
+    #[arg(long, value_name = "P", default_value_t = 0.5, requires = "refine")]
+    refine_threshold: f32,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -201,7 +212,19 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         }
     }
     let file = data.as_deref();
-    let build = BuildOptions { dwarf: !cli.no_dwarf, model: None };
+    #[cfg(feature = "ml")]
+    let model = match &cli.refine {
+        Some(dir) => Some(
+            chungusite::refine::model::TypeClassifier::load(dir, cli.refine_threshold, rayon::current_num_threads())
+                .map_err(|e| format!("--refine {}: {e}", dir.display()))?,
+        ),
+        None => None,
+    };
+    #[cfg(feature = "ml")]
+    let model = model.as_ref().map(|m| m as &dyn chungusite::types::TypeModel);
+    #[cfg(not(feature = "ml"))]
+    let model = None;
+    let build = BuildOptions { dwarf: !cli.no_dwarf, model };
     let program = Program::build_with(inputs, file, cli.emit == Emit::RawIr, build);
     // Function pointers in data are named by their identifier in the output; a
     // function --skip-failed leaves out keeps its slot's bytes from the file.
@@ -398,6 +421,9 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             "  types: {} of {} arguments typed, {} structs inferred from field accesses{from}",
             ts.typed_args, ts.args, ts.inferred_structs
         );
+    }
+    if ts.accepted + ts.rejected > 0 {
+        eprintln!("  type model: {} proposals used, {} turned down by the facts", ts.accepted, ts.rejected);
     }
     if emitted_fns > 0 {
         eprintln!("  {no_raw} of {emitted_fns} functions have no raw pointer; {safe_fns} are safe `fn`s");

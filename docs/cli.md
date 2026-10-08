@@ -13,6 +13,7 @@ chungusite ./prog --list                   # which functions lift, and why the o
 chungusite --hex "48 8b 47 08 c3"          # raw bytes, loaded at 0x1000, no file needed
 chungusite ./prog -j 1                     # one worker thread (default: one per CPU)
 chungusite ./prog --no-dwarf               # ignore debug info: infer every type
+chungusite ./prog --refine models/types     # ask a trained type model (--features ml)
 ```
 
 Input is any x86_64 ELF, Mach-O or PE file (`object` crate). Functions come from the symbol table. A stripped binary (no function in the static symbol table) works the same way: functions are discovered instead (`src/discover.rs`), see [Stripped binaries](#stripped-binaries). `--addr` with `--size` lifts bytes that nothing finds.

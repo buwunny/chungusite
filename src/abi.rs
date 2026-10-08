@@ -801,7 +801,7 @@ fn append(f: &mut Function, b: BlockId, vals: &[ValueId]) {
 /// instruction is a loop head): add a new entry that jumps to the old one.
 fn split_entry(f: &mut Function) {
     let old = f.entry;
-    let has_preds = f.blocks.iter().any(|(_, b)| b.term.successors().contains(&Some(old)));
+    let has_preds = f.blocks.iter().any(|(_, b)| b.term.successors(&f.value_pool).any(|s| s == old));
     if !has_preds {
         return;
     }

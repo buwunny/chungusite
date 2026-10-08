@@ -20,7 +20,7 @@ use crate::ir::*;
 use crate::lift::Lifter;
 use crate::opt::clean;
 use crate::verify::verify;
-use object::{Object, ObjectKind, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationTarget, SectionKind};
+use object::{Object, ObjectKind, ObjectSection, ObjectSymbol, RelocationTarget, SectionKind};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -131,43 +131,16 @@ impl Symbols {
             }
             return s;
         }
-        // GOT slots filled by the dynamic loader, by symbol.
-        let dynsyms = file.dynamic_symbol_table();
+        // GOT slots filled by the dynamic loader, and the PLT stubs that jump through them.
+        s.got = crate::discover::got_names(&file);
+        s.plt = crate::discover::plt_names(&file, &s.got);
+        // GOT slots the loader fills with an address in the binary itself
+        // (`R_X86_64_RELATIVE`): calls through them reach a decompiled function.
         for (at, r) in file.dynamic_relocations().into_iter().flatten() {
             if let RelocationTarget::Absolute = r.target() {
                 if r.size() == 64 || r.size() == 0 {
                     s.got_addr.insert(at, r.addend() as u64);
                 }
-                continue;
-            }
-            let RelocationTarget::Symbol(i) = r.target() else { continue };
-            let Some(sym) = dynsyms.as_ref().and_then(|t| t.symbol_by_index(i).ok()) else { continue };
-            if let Ok(n) = sym.name() {
-                if !n.is_empty() {
-                    s.got.insert(at, n.to_string());
-                }
-            }
-        }
-        // PLT stubs: `[endbr64;] jmp [rip+slot]`, one per entry.
-        for sec in file.sections() {
-            let name = sec.name().unwrap_or("");
-            if !matches!(name, ".plt" | ".plt.sec" | ".plt.got") {
-                continue;
-            }
-            let Ok(code) = sec.data() else { continue };
-            let mut dec = iced_x86::Decoder::with_ip(64, code, sec.address(), iced_x86::DecoderOptions::NONE);
-            let mut entry = None;
-            for i in &mut dec {
-                if i.mnemonic() == iced_x86::Mnemonic::Endbr64 {
-                    entry = Some(i.ip());
-                    continue;
-                }
-                if i.flow_control() == iced_x86::FlowControl::IndirectBranch && i.is_ip_rel_memory_operand() {
-                    if let Some(n) = s.got.get(&i.ip_rel_memory_address()) {
-                        s.plt.insert(entry.unwrap_or(i.ip()), n.clone());
-                    }
-                }
-                entry = None;
             }
         }
         s
@@ -178,6 +151,19 @@ impl Symbols {
     fn reloc_at(&self, ip: u64) -> Option<&Reloc> {
         self.relocs.range(ip + 1..=ip + 4).next().map(|(_, r)| r)
     }
+}
+
+/// The sections a linked binary loads, as (address, bytes), for reading jump
+/// tables. Empty for relocatable objects, whose tables are relocations.
+fn loaded_sections(data: &[u8]) -> Vec<(u64, &[u8])> {
+    let Ok(file) = object::File::parse(data) else { return Vec::new() };
+    if file.kind() == ObjectKind::Relocatable {
+        return Vec::new();
+    }
+    file.sections()
+        .filter(|s| s.address() != 0 && s.kind() != SectionKind::UninitializedData)
+        .filter_map(|s| Some((s.address(), s.data().ok().filter(|d| !d.is_empty())?)))
+        .collect()
 }
 
 fn konst(f: &Function, v: ValueId) -> Option<u64> {
@@ -192,6 +178,7 @@ impl Program {
     /// whole binary, for relocations and import names (`None` for raw bytes).
     pub fn build(inputs: Vec<Input>, file: Option<&[u8]>, keep_raw_ir: bool) -> Program {
         let syms = file.map(Symbols::parse).unwrap_or_default();
+        let sections = file.map(loaded_sections).unwrap_or_default();
         let by_addr: HashMap<u64, usize> = inputs.iter().enumerate().map(|(i, x)| (x.addr, i)).rev().collect();
         let mut by_name: HashMap<String, usize> = HashMap::new();
         for (i, x) in inputs.iter().enumerate() {
@@ -210,8 +197,12 @@ impl Program {
                 |lifter, x| {
                 let mut f = Function::with_capacity(256, 16);
                 let mut raw = None;
-                let r = lifter
-                    .lift(x.bytes, x.addr, &mut f)
+                let r = if sections.is_empty() {
+                    lifter.lift(x.bytes, x.addr, &mut f)
+                } else {
+                    lifter.lift_with_data(x.bytes, x.addr, &sections, &mut f)
+                };
+                let r = r
                     .map_err(|e| describe(&e))
                     .and_then(|()| verify(&f).map_err(|e| format!("lifted IR failed verification: {e:?}")))
                     .and_then(|()| {

@@ -488,6 +488,16 @@ fn mem2reg(f: &mut Function, cfg: &Cfg, o: &Offsets, accesses: &[Access], slots:
     let mut entry_head: Vec<ValueId> = Vec::new();
     let mut entry_params: Vec<ValueId> = Vec::new();
 
+    // A stack argument (a whole word) as the value of slot `s`, which may be narrower.
+    let narrow = |f: &mut Function, p: ValueId, s: usize, entry_head: &mut Vec<ValueId>| -> ValueId {
+        let size = slots[promoted[s]].size as usize;
+        if size >= 8 {
+            return p;
+        }
+        let t = new_inst(f, InstKind::Cast { kind: CastKind::Trunc, v: p }, TyId::unknown(size), at);
+        entry_head.push(t);
+        t
+    };
     // A slot's value on entry to block `b`.
     let live_in_value = |f: &mut Function, b: BlockId, s: usize, entry_head: &mut Vec<ValueId>, entry_params: &mut Vec<ValueId>| -> ValueId {
         let slot = slots[promoted[s]];
@@ -495,7 +505,7 @@ fn mem2reg(f: &mut Function, cfg: &Cfg, o: &Offsets, accesses: &[Access], slots:
             if b == entry && slot.off >= 8 {
                 let p = new_inst(f, InstKind::BlockParam(STACK_ARG_BASE + ((slot.off - 8) / 8) as u8), TyId::B8, at);
                 entry_params.push(p);
-                p
+                narrow(f, p, s, entry_head)
             } else {
                 let u = new_inst(f, InstKind::Undef, TyId::unknown(slot.size as usize), at);
                 entry_head.push(u);
@@ -526,7 +536,7 @@ fn mem2reg(f: &mut Function, cfg: &Cfg, o: &Offsets, accesses: &[Access], slots:
                             let v = if b == entry && slots[promoted[s]].off >= 8 {
                                 let reg = STACK_ARG_BASE + ((slots[promoted[s]].off - 8) / 8) as u8;
                                 match entry_params.iter().copied().find(|&p| matches!(f.insts[p].kind, InstKind::BlockParam(r) if r == reg)) {
-                                    Some(p) => p,
+                                    Some(p) => narrow(f, p, s, &mut entry_head),
                                     None => live_in_value(f, b, s, &mut entry_head, &mut entry_params),
                                 }
                             } else {
@@ -574,7 +584,7 @@ fn mem2reg(f: &mut Function, cfg: &Cfg, o: &Offsets, accesses: &[Access], slots:
                                 None
                             };
                             match existing {
-                                Some(q) => q,
+                                Some(q) => narrow(f, q, s, &mut entry_head),
                                 None => live_in_value(f, p, s, &mut entry_head, &mut entry_params),
                             }
                         } else {
@@ -596,6 +606,31 @@ fn mem2reg(f: &mut Function, cfg: &Cfg, o: &Offsets, accesses: &[Access], slots:
     let has_param = |bi: usize, s: usize, live_in: &Vec<Vec<Option<ValueId>>>, f: &Function| -> bool {
         live_in[bi][s].is_some_and(|v| matches!(f.insts[v].kind, InstKind::BlockParam(SLOT_PARAM)))
     };
+    // A `Switch` passes no arguments, so a block it enters takes the slot's value
+    // at the switch directly (the switch is its only predecessor).
+    for bi in 0..n {
+        let b = BlockId::new(bi);
+        let switch = cfg.preds(b).first().filter(|p| matches!(f.blocks[**p].term, Terminator::Switch { .. }));
+        let Some(&p) = switch else { continue };
+        let mut casts = Vec::new();
+        for s in 0..ns {
+            if has_param(bi, s, &live_in, f) {
+                let (param, val) = (live_in[bi][s].unwrap(), out[p.index()][s].expect("filled above"));
+                let (pt, vt) = (bytes(f.insts[param].ty), bytes(f.insts[val].ty));
+                if pt == vt {
+                    repl.resize(f.insts.len(), None);
+                    repl[param.index()] = Some(val);
+                } else {
+                    // the parameter becomes the conversion, at the top of the block
+                    let kind = if pt < vt { CastKind::Trunc } else { CastKind::ZExt };
+                    f.insts[param].kind = InstKind::Cast { kind, v: val };
+                    casts.push(param);
+                }
+                live_in[bi][s] = None;
+            }
+        }
+        prepend(f, b, &casts);
+    }
     for bi in 0..n {
         let b = BlockId::new(bi);
         let new: Vec<ValueId> = (0..ns).filter(|&s| has_param(bi, s, &live_in, f)).map(|s| live_in[bi][s].unwrap()).collect();

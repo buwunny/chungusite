@@ -205,6 +205,7 @@ impl Program {
     pub fn build_with(inputs: Vec<Input>, file: Option<&[u8]>, keep_raw_ir: bool, opts: BuildOptions) -> Program {
         let syms = file.map(Symbols::parse).unwrap_or_default();
         let sections = file.map(loaded_sections).unwrap_or_default();
+        let thread_pointer = file.and_then(|d| crate::load::tls(&object::File::parse(d).ok()?)).map(|t| t.thread_pointer);
         // A call to an import that never returns (by relocation in an object
         // file, or through the PLT) ends its block.
         let noreturn = |ip: u64, target: Option<u64>| {
@@ -235,6 +236,7 @@ impl Program {
                     || {
                         let mut l = Lifter::new();
                         l.track_exits = true;
+                        l.thread_pointer = thread_pointer;
                         l
                     },
                     |lifter, x| {

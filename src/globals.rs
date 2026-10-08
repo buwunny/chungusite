@@ -20,7 +20,7 @@
 //! null if it is an import, and keeps its bytes from the file if it is a function
 //! of the binary that isn't emitted (not selected, or skipped by `--skip-failed`).
 use crate::ir::{Function, Idx, InstKind};
-use crate::load::Binary;
+use crate::load::{Binary, TLS_SECTION};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
@@ -89,6 +89,11 @@ impl<'b, 'a> Globals<'b, 'a> {
                 return Some(Item { start: s.addr, len: s.size, section, sym: Some(k) });
             }
         }
+        // code reaches every thread-local from the thread pointer, so the block
+        // can't be split
+        if sec.name == TLS_SECTION {
+            return Some(Item { start: sec.addr, len: sec.size, section, sym: None });
+        }
         if matches!(sec.name.as_str(), ".got" | ".got.plt" | "__got") {
             let start = sec.addr + (addr - sec.addr) / 8 * 8;
             return Some(Item { start, len: 8.min(sec.addr + sec.size - start), section, sym: None });
@@ -102,8 +107,11 @@ impl<'b, 'a> Globals<'b, 'a> {
         match item.sym {
             Some(k) => self.sym_idents[k].clone(),
             None => {
-                let got = matches!(self.bin.data[item.section].name.as_str(), ".got" | ".got.plt" | "__got");
-                let mut s = format!("{}_{:x}", if got { "GOT" } else { "ANON" }, item.start);
+                let mut s = match self.bin.data[item.section].name.as_str() {
+                    TLS_SECTION => "THREAD_LOCALS".to_string(),
+                    ".got" | ".got.plt" | "__got" => format!("GOT_{:x}", item.start),
+                    _ => format!("ANON_{:x}", item.start),
+                };
                 while self.used.contains(&s) {
                     s.push('_');
                 }
@@ -200,7 +208,7 @@ impl<'b, 'a> Globals<'b, 'a> {
             None => "no symbol".to_string(),
         };
         let _ = write!(out, "\n// {} {:#x}, {n} bytes ({what})", sec.name, item.start);
-        let bytes = sec.bytes.map(|b| &b[(item.start - sec.addr) as usize..][..n as usize]);
+        let bytes = sec.bytes.as_deref().map(|b| &b[(item.start - sec.addr) as usize..][..n as usize]);
         if let Some(text) = bytes.and_then(preview) {
             let _ = write!(out, ": {text:?}");
         }

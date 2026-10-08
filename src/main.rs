@@ -225,7 +225,20 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     #[cfg(not(feature = "ml"))]
     let model = None;
     let build = BuildOptions { dwarf: !cli.no_dwarf, model };
-    let program = Program::build_with(inputs, file, cli.emit == Emit::RawIr, build);
+    let mut program = Program::build_with(inputs, file, cli.emit == Emit::RawIr, build);
+    // Parameters named from debug info can't shadow a static (E0530): the data
+    // symbols get these identifiers below (`Globals::new`).
+    if let Some(b) = bin {
+        let mut taken = used.clone();
+        let statics: HashSet<String> = b.data_syms.iter().map(|s| rust_ident(s.pretty(), s.addr, &mut taken)).collect();
+        for t in program.funcs.iter_mut().filter_map(|f| f.types.as_mut()) {
+            for n in t.args.iter_mut().filter_map(|a| a.name.as_mut()) {
+                while statics.contains(n.as_str()) {
+                    n.push('_');
+                }
+            }
+        }
+    }
     // Function pointers in data are named by their identifier in the output; a
     // function --skip-failed leaves out keeps its slot's bytes from the file.
     let kept = |i: usize| !cli.skip_failed || program.funcs[i].ir.is_ok();

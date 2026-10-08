@@ -133,6 +133,44 @@ void rev(uint32_t *a, long n) { for (long i = 0, j = n - 1; i < j; i++, j--) { u
 long mixed(long *a) { return a[0] + ((char *)a)[3]; }
 ";
 
+const LOADED: &str = "
+struct node { int key; long count; struct node *next; };
+long total(struct node **arr, int i) { struct node *p = arr[i]; long s = 0; while (p) { s += p->count; p = p->next; } return s; }
+";
+
+#[test]
+fn typed_pointers_load_from_slices() {
+    let Some(out) = decompile_units(&[(LOADED, true)], &["--mode", "safe"]) else { return };
+    // a struct pointer read out of a byte slice is its address, then cast
+    has(&out, "(u64::from_le_bytes(arr[");
+    has(&out, "as *mut S1);");
+}
+
+const STATICS: &str = "
+int verbosity = 3;
+__attribute__((noinline)) int level(void) { return verbosity; }
+__attribute__((noinline)) int scale(int a, int verbosity) { return a * verbosity + 1; }
+int main(int argc, char **argv) { return level() + scale(argc, argc); }
+";
+
+#[test]
+fn debug_names_dont_shadow_statics() {
+    // a program, so that `verbosity` is a static in the output
+    let dir = std::env::temp_dir().join(format!("chungusite-types-{}-statics", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (c, exe) = (dir.join("s.c"), dir.join("s"));
+    std::fs::write(&c, STATICS).unwrap();
+    if !Command::new("gcc").args(["-O2", "-g"]).arg(&c).arg("-o").arg(&exe).status().is_ok_and(|s| s.success()) {
+        eprintln!("skipping: no gcc");
+        return;
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_chungusite")).args(["-f", "level", "-f", "scale"]).arg(&exe).output().unwrap();
+    let out = String::from_utf8(out.stdout).unwrap();
+    has(&out, "pub static mut verbosity");
+    // E0530: function parameters cannot shadow statics
+    has(&out, "pub fn scale(a: i32, verbosity_: i32) -> i32 {");
+}
+
 #[test]
 fn indexed_arguments_are_slices_of_their_elements() {
     let Some(out) = decompile_units(&[(SLICES, false)], &["--mode", "safe"]) else { return };

@@ -133,7 +133,11 @@ frame.0[v8.wrapping_sub(frame_base) as usize..][..8].copy_from_slice(&rdi.to_le_
 
 Frames over 4 KiB are a `Vec<u8>` instead. A slot whose address is passed to a callee is lent as `&mut frame.0[off..]` (stage 5). A frame that isn't safe keeps the fast-mode `[0u128; N]` array and raw accesses.
 
-The frame is still one object. Splitting it into one local per object (roadmap step 3) would let one escaping object stay raw without taking the rest of the frame with it.
+**Splitting.** The frame is one byte array, but the analysis splits it into objects, so one escaping object doesn't take the rest of the frame with it. Every fact about the frame covers a range of offsets: a load or store its width, a constant-length `memcpy`/`memset` its length, and a slot lent to a callee as much of it as the callee's summary says it reaches (`Pass::Borrow { len }`, the callee's `ParamBorrow::extent`). An access whose offset is unknown, or a callee whose reach is, covers everything from the lowest offset the pointer can have (`Origin::lo`) to the end of the frame. Overlapping ranges are one object, and each object is its own root, `Root::Frame(start)`, classified on its own. In `--emit borrows` the objects past the first one show up as `frame from N`. All the safe ones are still reached through `frame.0`. Lending several of them to one call groups them like slots of one object, splitting them in order of offset. An access to a raw object goes through `frame_base` as a raw pointer.
+
+A call that lends a slice evaluates its other arguments first, into temporaries (`f(&mut s[..], s[8])` is E0502 otherwise).
+
+On chungusite's own debug build (29,724 functions), splitting took bounds-checked accesses from 101,687 to 158,072, functions with no raw pointer from 18,713 to 19,780, and raw twins from 16,734 to 18,385 (more callers now lend a slice), with `--check` finding nothing to send back to fast mode.
 
 ## 5. Calls: summaries, twins, moves
 

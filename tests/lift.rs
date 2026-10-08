@@ -442,3 +442,13 @@ fn rep_stos_is_a_fill() {
     });
     assert!(out.contains("MemFill") || out.contains("fill"), "{out}");
 }
+
+#[test]
+fn string_cmpsd_and_movsd_are_not_the_sse_ones() {
+    for code in [[0xA7u8, 0xC3], [0xA5, 0xC3]] {
+        // cmpsd / movsd dword [rsi], [rdi] ; ret
+        let mut f = Function::with_capacity(8, 2);
+        let err = Lifter::new().lift(&code, 0, &mut f).unwrap_err();
+        assert!(matches!(err, LiftError::Unsupported { ip: 0, .. }), "{err:?}");
+    }
+}

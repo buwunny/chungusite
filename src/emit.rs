@@ -1552,11 +1552,11 @@ impl Emitter<'_> {
     }
 
     /// `v` reinterpreted as the signed integer of its width: `v as i32`, where
-    /// casts inside `v` that don't change its low bits are dropped. Just `v` if
-    /// it is signed already.
+    /// casts inside `v` that don't change its low bits are dropped. Just `v`
+    /// (ready for an `as`) if it is signed already.
     fn signed(&self, mut v: ValueId) -> String {
         if self.is_signed(v) {
-            return self.name(v);
+            return expr::cast(self.name(v));
         }
         let width = bytes(self.ty(v));
         let s = signed(self.ty(v));

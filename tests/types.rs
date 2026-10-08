@@ -63,6 +63,9 @@ fn prototypes_and_structs_come_from_debug_info() {
     has(&out, "pub fn sgn(x: i32) -> i32 {");
     has(&out, "pub fn div3(x: u32) -> u32 {");
     has(&out, "pub unsafe fn length(p: *mut Node) -> i32 {");
+    // a pointer in the body is typed, and so are its field reads
+    has(&out, "let v7: *mut Node = unsafe { (*v5).next };");
+    has(&out, "if v7.is_null() {");
 }
 
 #[test]
@@ -70,6 +73,9 @@ fn safe_mode_borrows_struct_arguments() {
     let Some(out) = decompile(&["--mode", "safe"]) else { return };
     has(&out, "pub fn bump(p: &mut Node, d: i32) -> i64 {");
     has(&out, "p.count = ");
+    // an indexed argument is a slice of its elements
+    has(&out, "pub fn sum(a: &[i32], n: i32) -> i32 {");
+    has(&out, "a[(v13.wrapping_sub(rdi_base) / 4) as usize]");
 }
 
 #[test]
@@ -119,6 +125,21 @@ fn a_callees_prototype_types_its_callers() {
     has(&out, "pub unsafe fn caller(rdi_p: *const Node) -> u64 {");
     has(&out, "(*rdi_p).next");
     has(&out, "pub unsafe fn walk(rdi_p: *const Node) -> u64 {");
+}
+
+const SLICES: &str = "
+#include <stdint.h>
+void rev(uint32_t *a, long n) { for (long i = 0, j = n - 1; i < j; i++, j--) { uint32_t t = a[i]; a[i] = a[j]; a[j] = t; } }
+long mixed(long *a) { return a[0] + ((char *)a)[3]; }
+";
+
+#[test]
+fn indexed_arguments_are_slices_of_their_elements() {
+    let Some(out) = decompile_units(&[(SLICES, false)], &["--mode", "safe"]) else { return };
+    has(&out, "pub fn rev(rdi_ref: &mut [u32], rsi: i64) {");
+    has(&out, "rdi_ref[v8 as usize] = v14;");
+    // a byte read inside an 8-byte element: bytes
+    has(&out, "pub fn mixed(rdi_ref: &[u8]) -> i64 {");
 }
 
 #[test]

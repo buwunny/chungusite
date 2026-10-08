@@ -79,7 +79,9 @@ const REG: [&str; 16] = [
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum ArgKind {
     Int,
-    Slice { mutbl: bool, nullable: bool },
+    /// `&[u8]`, or `&[T]` for an element type `elem` that every access reads or
+    /// writes whole, at an offset that is a multiple of its size.
+    Slice { mutbl: bool, nullable: bool, elem: Option<TyId> },
     /// `&S` / `&mut S` for a recovered struct `S`: every access through it is a
     /// field access.
     Struct { mutbl: bool, nullable: bool, ty: TyId },
@@ -153,6 +155,8 @@ struct Place {
     write: Option<String>,
     /// The root's address, as a `u64`.
     base: String,
+    /// A slice of this element type rather than bytes (`ArgKind::Slice`).
+    elem: Option<TyId>,
 }
 
 struct Emitter<'a> {
@@ -271,10 +275,13 @@ pub fn emit_function_in(f: &Function, name: &str, mode: Mode, env: &Env, out: &m
         }
     };
     let int = |w: u8| table.get(&Ty::Int { bits: w * 8, signed: false }).expect("integer types are interned");
-    let vt: Vec<TyId> = match types {
+    let mut vt: Vec<TyId> = match types {
         Some(t) => t.vals.clone(),
         None => f.insts.iter().map(|(_, i)| width(i.ty).map_or(i.ty, int)).collect(),
     };
+    if let Some(t) = types {
+        pointer_locals(f, &cfg, t, table, &mut vt);
+    }
     let alias = crate::types::aliases(f);
 
     let args: Vec<ArgKind> = entry_params
@@ -285,10 +292,15 @@ pub fn emit_function_in(f: &Function, name: &str, mode: Mode, env: &Env, out: &m
                 let kind = arg_kind(&a.params[k]);
                 let pointee = types.and_then(|t| t.pointee[p.index()]).filter(|_| env.struct_args);
                 match (kind, pointee) {
-                    (ArgKind::Slice { mutbl, nullable }, Some(s))
+                    (ArgKind::Slice { mutbl, nullable, .. }, Some(s))
                         if matches!(table.tys[s], Ty::Struct(_)) && struct_arg(f, &cfg, a, env.call, &alias, table, k, p, s) =>
                     {
                         ArgKind::Struct { mutbl, nullable, ty: s }
+                    }
+                    (ArgKind::Slice { mutbl, nullable, .. }, Some(s))
+                        if matches!(table.tys[s], Ty::Int { bits: 16 | 32 | 64, .. }) && elems_arg(f, &cfg, a, k, p, table.size_of(s) as u8) =>
+                    {
+                        ArgKind::Slice { mutbl, nullable, elem: Some(s) }
                     }
                     _ => kind,
                 }
@@ -396,11 +408,201 @@ fn struct_arg(
     any
 }
 
+/// Can safe-mode argument `k` (entry parameter `p`), a slice, be a `&[T]` for an
+/// element of `w` bytes? Only if its root is safe, every access through it is
+/// `w` bytes at an offset from `p` that is a multiple of `w`, and nothing copies
+/// or fills it or is passed it (callees take byte slices, `memcpy` copies bytes).
+fn elems_arg(f: &Function, cfg: &Cfg, a: &Analysis, k: usize, p: ValueId, w: u8) -> bool {
+    let Some(r) = a.roots.iter().position(|&x| x == Root::Param(k as u8)) else { return false };
+    if !a.safe[r] {
+        return false;
+    }
+    let through = |v: ValueId| a.origin[v.index()].roots & (1 << r) != 0;
+    let res = residues(f, cfg, p, w as u64);
+    let lent = |args: ListRef| args.get(&f.value_pool).iter().any(|&v| through(v));
+    let mut any = false;
+    for &b in &cfg.rpo {
+        for &id in f.blocks[b].insts.get(&f.value_pool) {
+            let (ptr, bytes) = match f.insts[id].kind {
+                InstKind::Load { ptr, .. } => (ptr, width(f.insts[id].ty)),
+                InstKind::Store { ptr, val, .. } => (ptr, width(f.insts[val].ty)),
+                InstKind::MemCopy { dst, src, .. } if through(dst) || through(src) => return false,
+                InstKind::MemFill { dst, .. } if through(dst) => return false,
+                InstKind::Call { args, .. } if lent(args) => return false,
+                _ => continue,
+            };
+            if !through(ptr) {
+                continue;
+            }
+            if bytes != Some(w) || res[ptr.index()] != Some(0) {
+                return false;
+            }
+            any = true;
+        }
+        if let Terminator::TailCall { args, .. } = f.blocks[b].term {
+            if lent(args) {
+                return false;
+            }
+        }
+    }
+    any
+}
+
+/// Each value modulo `w` (a power of two), counting `p` as 0: a pointer with
+/// residue 0 is a multiple of `w` bytes away from `p`. `None` where that isn't
+/// known.
+fn residues(f: &Function, cfg: &Cfg, p: ValueId, w: u64) -> Vec<Option<u64>> {
+    #[derive(Copy, Clone, PartialEq)]
+    enum R {
+        Top,
+        K(u64),
+        Bot,
+    }
+    let mask = w - 1;
+    let n = f.insts.len();
+    let mut r = vec![R::Top; n];
+    let meet = |a: R, b: R| match (a, b) {
+        (R::Top, x) | (x, R::Top) => x,
+        (R::K(x), R::K(y)) if x == y => R::K(x),
+        _ => R::Bot,
+    };
+    // (block parameter, value passed to it) on every edge
+    let mut incoming: Vec<(ValueId, ValueId)> = Vec::new();
+    for &b in &cfg.rpo {
+        let pool = &f.value_pool;
+        match f.blocks[b].term {
+            Terminator::Jump { to, args } => incoming.extend(f.blocks[to].params.get(pool).iter().copied().zip(args.get(pool).iter().copied())),
+            Terminator::Branch { t, f: e, args, .. } => {
+                let tp = f.blocks[t].params.get(pool);
+                let ep = f.blocks[e].params.get(pool);
+                let a = args.get(pool);
+                incoming.extend(tp.iter().copied().zip(a.iter().copied()));
+                incoming.extend(ep.iter().copied().zip(a[tp.len().min(a.len())..].iter().copied()));
+            }
+            _ => {}
+        }
+    }
+    for &q in f.blocks[f.entry].params.get(&f.value_pool) {
+        r[q.index()] = if q == p { R::K(0) } else { R::Bot };
+    }
+    let two = |a: R, b: R, op: &dyn Fn(u64, u64) -> u64| match (a, b) {
+        (R::Bot, _) | (_, R::Bot) => R::Bot,
+        (R::Top, _) | (_, R::Top) => R::Top,
+        (R::K(x), R::K(y)) => R::K(op(x, y) & mask),
+    };
+    loop {
+        let mut changed = false;
+        let mut set = |r: &mut Vec<R>, v: ValueId, x: R| {
+            if r[v.index()] != x {
+                r[v.index()] = x;
+                changed = true;
+            }
+        };
+        for &(q, a) in &incoming {
+            let x = meet(r[q.index()], r[a.index()]);
+            set(&mut r, q, x);
+        }
+        for &b in &cfg.rpo {
+            for &id in f.blocks[b].insts.get(&f.value_pool) {
+                use InstKind::*;
+                let x = match f.insts[id].kind {
+                    Const(c) => R::K(f.consts[c.index()] as u64 & mask),
+                    Bin { op, lhs, rhs } => {
+                        let (a, c) = (r[lhs.index()], r[rhs.index()]);
+                        match op {
+                            BinOp::Add => two(a, c, &|x, y| x.wrapping_add(y)),
+                            BinOp::Sub => two(a, c, &|x, y| x.wrapping_sub(y)),
+                            BinOp::Mul if a == R::K(0) || c == R::K(0) => R::K(0),
+                            BinOp::Mul => two(a, c, &|x, y| x.wrapping_mul(y)),
+                            BinOp::And if a == R::K(0) || c == R::K(0) => R::K(0),
+                            BinOp::And => two(a, c, &|x, y| x & y),
+                            BinOp::Or => two(a, c, &|x, y| x | y),
+                            BinOp::Xor => two(a, c, &|x, y| x ^ y),
+                            BinOp::Shl => match f.insts[rhs].kind {
+                                Const(k) => {
+                                    let k = f.consts[k.index()] as u64 & 63;
+                                    if (1u64 << k) & mask == 0 { R::K(0) } else { two(a, R::K(0), &|x, _| x << k) }
+                                }
+                                _ => R::Bot,
+                            },
+                            _ => R::Bot,
+                        }
+                    }
+                    Cast { kind: CastKind::Trunc | CastKind::ZExt | CastKind::SExt | CastKind::Bitcast, v } | IntToPtr(v) | PtrToInt(v) => r[v.index()],
+                    PtrOffset { base, index, scale, disp } => {
+                        let i = match index {
+                            None => R::K(0),
+                            Some(_) if scale as u64 & mask == 0 => R::K(0),
+                            Some(i) => two(r[i.index()], R::K(scale as u64), &|x, y| x.wrapping_mul(y)),
+                        };
+                        two(two(r[base.index()], i, &|x, y| x.wrapping_add(y)), R::K(disp as i64 as u64), &|x, y| x.wrapping_add(y))
+                    }
+                    Select { t, f: e, .. } => meet(r[t.index()], r[e.index()]),
+                    _ => R::Bot,
+                };
+                set(&mut r, id, x);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    r.into_iter().map(|x| if let R::K(k) = x { Some(k) } else { None }).collect()
+}
+
+/// Types the values in the body that point at a struct `*mut S` instead of
+/// `u64`: values loaded from memory or carried by block parameters, whose every
+/// use the emitter converts (an access through it, an address computed from it,
+/// a compare, a call argument, an edge copy, a return).
+fn pointer_locals(f: &Function, cfg: &Cfg, t: &FnTypes, table: &TyTable, vt: &mut [TyId]) {
+    use InstKind::*;
+    let n = f.insts.len();
+    let mut ok = vec![false; n];
+    let entry: Vec<ValueId> = f.blocks[f.entry].params.get(&f.value_pool).to_vec();
+    for &b in &cfg.rpo {
+        let blk = &f.blocks[b];
+        for &v in blk.params.get(&f.value_pool).iter().chain(blk.insts.get(&f.value_pool)) {
+            let def = matches!(f.insts[v].kind, Load { .. }) || (matches!(f.insts[v].kind, BlockParam(_)) && !entry.contains(&v));
+            let s = t.pointee[v.index()].filter(|&s| matches!(table.tys[s], Ty::Struct(_)));
+            ok[v.index()] = def && width(f.insts[v].ty) == Some(8) && s.is_some_and(|s| table.get(&Ty::RawPtr { pointee: s, mutbl: Mutbl::Mut }).is_some());
+        }
+    }
+    let bad = |ok: &mut Vec<bool>, v: ValueId| ok[v.index()] = false;
+    for &b in &cfg.rpo {
+        let blk = &f.blocks[b];
+        for &id in blk.insts.get(&f.value_pool) {
+            match f.insts[id].kind {
+                Load { .. } | Bin { op: BinOp::Add | BinOp::Sub, .. } | PtrOffset { .. } => {}
+                Call { callee, .. } => bad(&mut ok, callee),
+                Store { val, .. } if width(f.insts[val].ty) != Some(8) => bad(&mut ok, val),
+                Store { .. } => {}
+                Cmp { lhs, rhs, .. } if width(f.insts[lhs].ty) == Some(8) && width(f.insts[rhs].ty) == Some(8) => {}
+                k => for_each_operand(k, f, |v| bad(&mut ok, v)),
+            }
+            if let Bin { op: BinOp::Add | BinOp::Sub, rhs, .. } = f.insts[id].kind {
+                bad(&mut ok, rhs);
+            }
+            if let PtrOffset { index: Some(i), .. } = f.insts[id].kind {
+                bad(&mut ok, i);
+            }
+        }
+        if let Terminator::Switch { v, .. } | Terminator::Branch { c: v, .. } | Terminator::TailCall { callee: v, .. } = blk.term {
+            bad(&mut ok, v);
+        }
+    }
+    for v in 0..n {
+        if ok[v] {
+            let s = t.pointee[v].expect("checked above");
+            vt[v] = table.get(&Ty::RawPtr { pointee: s, mutbl: Mutbl::Mut }).expect("checked above");
+        }
+    }
+}
+
 fn arg_kind(p: &ParamBorrow) -> ArgKind {
     match p.class {
         _ if p.reg == RSP => ArgKind::Int,
-        Class::Shared => ArgKind::Slice { mutbl: false, nullable: p.nullable },
-        Class::Mut => ArgKind::Slice { mutbl: true, nullable: p.nullable },
+        Class::Shared => ArgKind::Slice { mutbl: false, nullable: p.nullable, elem: None },
+        Class::Mut => ArgKind::Slice { mutbl: true, nullable: p.nullable, elem: None },
         Class::NotPointer | Class::Raw => ArgKind::Int,
     }
 }
@@ -786,6 +988,7 @@ impl Emitter<'_> {
         match (t.tys[from], t.tys[to]) {
             (Ty::Bool, _) if self.int_of(to).is_some() => format!("{} as {to_s}", c()),
             (_, Ty::Bool) => format!("{} != 0", expr::lhs(e.to_string(), "!=")),
+            (Ty::RawPtr { .. }, Ty::F32 | Ty::F64) => self.conv(&format!("{} as u64", c()), self.u64_ty, to),
             (Ty::RawPtr { .. }, _) => format!("{} as {to_s}", c()),
             (_, Ty::RawPtr { .. }) => match self.int_of(from) {
                 Some((bits, true)) if bits < 64 => format!("{} as u{bits} as {to_s}", c()),
@@ -926,10 +1129,11 @@ impl Emitter<'_> {
                         let _ = writeln!(prologue, "    let mut {n}: {pt} = {b};");
                     }
                 },
-                ArgKind::Slice { mutbl, nullable } => {
+                ArgKind::Slice { mutbl, nullable, elem } => {
                     let b = bind.unwrap_or_else(|| format!("{n}_ref"));
-                    let r = if mutbl { "&mut [u8]" } else { "&[u8]" };
-                    let (m, t) = if nullable { (if mutbl { "mut " } else { "" }, format!("Option<{r}>")) } else { ("", r.to_string()) };
+                    let et = elem.map_or("u8".to_string(), |t| self.rs(t));
+                    let r = if mutbl { format!("&mut [{et}]") } else { format!("&[{et}]") };
+                    let (m, t) = if nullable { (if mutbl { "mut " } else { "" }, format!("Option<{r}>")) } else { ("", r) };
                     sig.push(format!("{m}{b}: {t}"));
                     let addr = if nullable {
                         format!("{b}.as_deref().map_or(0, |s| s.as_ptr() as u64)")
@@ -1005,6 +1209,7 @@ impl Emitter<'_> {
                     let zero = match self.ty(v) {
                         TyId::BOOL => "false",
                         TyId::PAIR => "(0, 0)",
+                        _ if matches!(self.table.tys[self.vt[v.index()]], Ty::RawPtr { .. }) => "core::ptr::null_mut()",
                         _ => "0",
                     };
                     let _ = writeln!(out, "    let mut {}: {} = {zero};", self.name(v), self.rt(v));
@@ -1478,7 +1683,7 @@ impl Emitter<'_> {
                 }
                 Some(match root {
                     Root::Param(k) => {
-                        let ArgKind::Slice { mutbl, nullable } = self.args[k as usize] else { return None };
+                        let ArgKind::Slice { mutbl, nullable, elem } = self.args[k as usize] else { return None };
                         let n = self.name(params[k as usize]);
                         let b = self.bind[k as usize].clone().unwrap_or_else(|| format!("{n}_ref"));
                         let read = match (nullable, mutbl) {
@@ -1490,16 +1695,16 @@ impl Emitter<'_> {
                             false => b.clone(),
                             true => format!("{b}.as_deref_mut().unwrap()"),
                         };
-                        Place { read, write: mutbl.then_some(write), base: format!("{n}_base") }
+                        Place { read, write: mutbl.then_some(write), base: format!("{n}_base"), elem }
                     }
-                    Root::Frame => Place { read: "frame.0".into(), write: Some("frame.0".into()), base: "frame_base".into() },
+                    Root::Frame => Place { read: "frame.0".into(), write: Some("frame.0".into()), base: "frame_base".into(), elem: None },
                     Root::Global(c) => {
                         let g = global_slice(c)?;
-                        Place { read: format!("{g}.b"), write: None, base: format!("(core::ptr::addr_of!({g}) as u64)") }
+                        Place { read: format!("{g}.b"), write: None, base: format!("(core::ptr::addr_of!({g}) as u64)"), elem: None }
                     }
                     Root::Alloc(id) => {
                         let h = format!("heap{}", id.index());
-                        Place { read: h.clone(), write: Some(h.clone()), base: format!("{h}_base") }
+                        Place { read: h.clone(), write: Some(h.clone()), base: format!("{h}_base"), elem: None }
                     }
                 })
             })
@@ -1508,6 +1713,28 @@ impl Emitter<'_> {
 
     fn cmp(&self, cc: Cond, lhs: ValueId, rhs: ValueId) -> String {
         let ty = self.ty(lhs);
+        let ptr = |v: ValueId| matches!(self.table.tys[self.vt[v.index()]], Ty::RawPtr { .. });
+        if ptr(lhs) || ptr(rhs) {
+            let null = |p: ValueId, z: ValueId| (ptr(p) && self.konst(z) == Some(0)).then(|| expr::recv(self.name(p)));
+            if let (Some(p), Cond::Eq | Cond::Ne) = (null(lhs, rhs).or_else(|| null(rhs, lhs)), cc) {
+                return format!("{}{p}.is_null()", if matches!(cc, Cond::Ne) { "!" } else { "" });
+            }
+            // as the integers the machine code compares
+            let (a, b) = (self.as_u64(lhs), self.as_u64(rhs));
+            let op = match cc {
+                Cond::Eq => "==",
+                Cond::Ne => "!=",
+                Cond::Ult => "<",
+                Cond::Ule => "<=",
+                Cond::Ugt => ">",
+                Cond::Uge => ">=",
+                Cond::Slt => return format!("({a} as i64) < ({b} as i64)"),
+                Cond::Sle => return format!("({a} as i64) <= ({b} as i64)"),
+                Cond::Sgt => return format!("({a} as i64) > ({b} as i64)"),
+                Cond::Sge => return format!("({a} as i64) >= ({b} as i64)"),
+            };
+            return format!("{} {op} {}", expr::lhs(a, op), expr::rhs(b));
+        }
         let (op, sign) = match cc {
             Cond::Eq => ("==", None),
             Cond::Ne => ("!=", None),
@@ -1616,12 +1843,12 @@ impl Emitter<'_> {
 
     /// The place an access through `ptr` can bounds-check against, if `ptr`
     /// derives from exactly one safe root (that can be written, for a store).
-    fn slice_root(&self, ptr: ValueId, write: bool) -> Option<(String, String)> {
+    fn slice_root(&self, ptr: ValueId, write: bool) -> Option<(String, String, Option<TyId>)> {
         let r = self.borrow?.safe_root(ptr)?;
         let p = self.places.get(r as usize)?.as_ref()?;
         match write {
-            false => Some((p.read.clone(), p.base.clone())),
-            true => Some((p.write.clone()?, p.base.clone())),
+            false => Some((p.read.clone(), p.base.clone(), p.elem)),
+            true => Some((p.write.clone()?, p.base.clone(), p.elem)),
         }
     }
 
@@ -1664,6 +1891,12 @@ impl Emitter<'_> {
                 _ => {}
             }
         }
+        // a pointer variable this address is computed from, directly
+        if let Ty::RawPtr { pointee, .. } = self.table.tys[self.vt[r.index()]] {
+            if pointee == s && !self.inline[r.index()] && crate::types::decompose(self.f, ptr) == (r, d) {
+                return Some((format!("(*{}){path}", self.name(r)), true, lt));
+            }
+        }
         let m = if write { "mut" } else { "const" };
         // The struct's address: `r` may be a value from another block that only an
         // alias reaches, so go from `ptr`, which this access has in scope.
@@ -1699,8 +1932,13 @@ impl Emitter<'_> {
         }
         let p = self.as_u64(ptr);
         let (pr, pc) = (expr::recv(p.clone()), expr::cast(p));
-        if let Some((s, base)) = slice {
+        if let Some((s, base, elem)) = slice {
             self.stats.checked += 1;
+            if let Some(et) = elem {
+                // `elems_arg`: a whole element at a multiple of its size
+                let i = self.elem_index(ptr, len).unwrap_or_else(|| format!("({pr}.wrapping_sub({base}) / {len}) as usize"));
+                return self.conv(&format!("{s}[{i}]"), et, self.vt[id.index()]);
+            }
             return format!("{t}::from_le_bytes({s}[{pr}.wrapping_sub({base}) as usize..][..{len}].try_into().unwrap())");
         }
         self.stats.raw += 1;
@@ -1711,6 +1949,11 @@ impl Emitter<'_> {
     fn store(&mut self, ptr: ValueId, val: ValueId) -> String {
         let vt = self.ty(val);
         let (t, len, v) = (self.rt(val), bytes(vt), self.name(val));
+        // a pointer is stored as its address
+        let (t, v) = match self.table.tys[self.vt[val.index()]] {
+            Ty::RawPtr { .. } => ("u64".to_string(), self.as_u64(val)),
+            _ => (t, v),
+        };
         let slice = self.slice_root(ptr, true);
         if let Some((place, raw, lt)) = self.field(ptr, len, true).filter(|(_, raw, _)| !raw || slice.is_none()) {
             let e = match self.table.tys[lt] {
@@ -1728,13 +1971,58 @@ impl Emitter<'_> {
         }
         let p = self.as_u64(ptr);
         let (pr, pc, vr) = (expr::recv(p.clone()), expr::cast(p), expr::recv(v.clone()));
-        if let Some((s, base)) = slice {
+        if let Some((s, base, elem)) = slice {
             self.stats.checked += 1;
+            if let Some(et) = elem {
+                let i = self.elem_index(ptr, len).unwrap_or_else(|| format!("({pr}.wrapping_sub({base}) / {len}) as usize"));
+                return format!("{s}[{i}] = {}", self.val(val, et));
+            }
             return format!("{s}[{pr}.wrapping_sub({base}) as usize..][..{len}].copy_from_slice(&{vr}.to_le_bytes())");
         }
         self.stats.raw += 1;
         self.stats.raw_by[bucket(self.src[ptr.index()])] += 1;
         format!("unsafe {{ ({pc} as *mut {t}).write_unaligned({v}) }}")
+    }
+
+    /// The index of `ptr` in the `&[T]` argument it points into, with `w`-byte
+    /// elements, when the address is plainly that argument plus a constant and
+    /// maybe a scaled index (`rdi + 4 * v8 + 8` is `v8 as usize + 2`).
+    fn elem_index(&self, ptr: ValueId, w: usize) -> Option<String> {
+        use InstKind::*;
+        let elems = |v: ValueId| matches!(self.entry_param[v.index()].map(|k| self.args[k]), Some(ArgKind::Slice { elem: Some(_), .. }));
+        let (v, d) = crate::types::decompose(self.f, ptr);
+        if d < 0 || d % w as i64 != 0 {
+            return None;
+        }
+        let k = d as u64 / w as u64;
+        if elems(v) {
+            return Some(k.to_string());
+        }
+        // `i * w`
+        let scaled = |x: ValueId| -> Option<ValueId> {
+            let c = |y: ValueId| match self.f.insts[y].kind {
+                Const(c) => Some(self.f.consts[c.index()] as u64),
+                _ => None,
+            };
+            match self.f.insts[x].kind {
+                Bin { op: BinOp::Mul, lhs, rhs } if c(rhs) == Some(w as u64) => Some(lhs),
+                Bin { op: BinOp::Mul, lhs, rhs } if c(lhs) == Some(w as u64) => Some(rhs),
+                Bin { op: BinOp::Shl, lhs, rhs } if c(rhs).is_some_and(|s| s < 64 && 1u64 << s == w as u64) => Some(lhs),
+                _ => None,
+            }
+        };
+        let base = |x: ValueId| {
+            let (b, d) = crate::types::decompose(self.f, x);
+            (d == 0 && elems(b)).then_some(b)
+        };
+        let i = match self.f.insts[v].kind {
+            PtrOffset { base: b, index: Some(i), scale, disp: 0 } if scale as usize == w && base(b).is_some() => i,
+            Bin { op: BinOp::Add, lhs, rhs } if base(lhs).is_some() => scaled(rhs)?,
+            Bin { op: BinOp::Add, lhs, rhs } if base(rhs).is_some() => scaled(lhs)?,
+            _ => return None,
+        };
+        let i = format!("{} as usize", expr::cast(self.name(i)));
+        Some(if k == 0 { i } else { format!("({i}).wrapping_add({k})") })
     }
 
     /// The frame is a safe root: an array of bytes that accesses index.

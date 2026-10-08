@@ -653,6 +653,7 @@ fn facts(f: &Function) -> Facts {
                 addr_use.push(dst);
                 addr_use.push(src);
             }
+            MemFill { dst, .. } => addr_use.push(dst),
             _ => {}
         }
     }

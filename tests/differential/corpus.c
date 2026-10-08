@@ -24,6 +24,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <emmintrin.h>
 
 #define NOINLINE __attribute__((noinline))
 
@@ -645,4 +646,116 @@ uint64_t tls_bump(uint64_t x) {
     tls_counter += x;
     tls_zero ^= (uint32_t)x;
     return tls_counter * 3 + tls_zero;
+}
+
+/* ---- SSE2 vectors ---- */
+
+// @diff simd_count_eq: u32(buf:64, u8)
+uint32_t simd_count_eq(const uint8_t *p, uint8_t c) {
+    __m128i k = _mm_set1_epi8((char)c);
+    uint32_t n = 0;
+    for (int i = 0; i < 64; i += 16) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(p + i));
+        n += (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(v, k)) * (i + 1);
+    }
+    return n;
+}
+
+// @diff simd_add32: void(buf:64)
+void simd_add32(uint8_t *p) {
+    __m128i a = _mm_loadu_si128((const __m128i *)p);
+    __m128i b = _mm_loadu_si128((const __m128i *)(p + 16));
+    _mm_storeu_si128((__m128i *)(p + 32), _mm_add_epi32(a, b));
+    _mm_storeu_si128((__m128i *)(p + 48), _mm_sub_epi64(_mm_add_epi16(a, b), _mm_xor_si128(a, b)));
+}
+
+// @diff simd_saturate: void(buf:64)
+void simd_saturate(uint8_t *p) {
+    __m128i a = _mm_loadu_si128((const __m128i *)p);
+    __m128i b = _mm_loadu_si128((const __m128i *)(p + 16));
+    __m128i c = _mm_loadu_si128((const __m128i *)(p + 32));
+    __m128i r = _mm_subs_epu8(_mm_max_epu8(a, b), _mm_min_epu8(b, c));
+    r = _mm_xor_si128(r, _mm_adds_epi16(a, c));
+    r = _mm_or_si128(r, _mm_and_si128(_mm_avg_epu8(a, c), _mm_max_epi16(b, c)));
+    _mm_storeu_si128((__m128i *)(p + 48), _mm_andnot_si128(_mm_cmpgt_epi8(a, b), r));
+}
+
+// @diff simd_shuffle: void(buf:48)
+void simd_shuffle(uint8_t *p) {
+    __m128i a = _mm_loadu_si128((const __m128i *)p);
+    __m128i b = _mm_loadu_si128((const __m128i *)(p + 16));
+    __m128i r = _mm_shuffle_epi32(a, 0x1b);
+    r = _mm_add_epi8(r, _mm_shufflelo_epi16(b, 0x4e));
+    r = _mm_xor_si128(r, _mm_unpacklo_epi8(a, b));
+    r = _mm_add_epi16(r, _mm_srli_epi16(_mm_unpackhi_epi16(a, b), 3));
+    r = _mm_sub_epi32(r, _mm_slli_si128(_mm_srai_epi32(b, 5), 4));
+    _mm_storeu_si128((__m128i *)(p + 32), r);
+}
+
+// @diff simd_sad: u64(buf:32)
+uint64_t simd_sad(const uint8_t *p) {
+    __m128i a = _mm_loadu_si128((const __m128i *)p);
+    __m128i b = _mm_loadu_si128((const __m128i *)(p + 16));
+    __m128i s = _mm_sad_epu8(a, b);
+    __m128i m = _mm_mul_epu32(a, b);
+    __m128i w = _mm_mullo_epi16(a, b);
+    s = _mm_add_epi64(_mm_add_epi64(s, m), _mm_srli_si128(w, 8));
+    return (uint64_t)_mm_cvtsi128_si64(s) ^ ((uint64_t)_mm_extract_epi16(s, 5) << 7);
+}
+
+/* ---- floating point ---- */
+
+// @diff f_mix: i64(i32, i32)
+int64_t f_mix(int32_t a, int32_t b) {
+    double x = a, y = b;
+    double m = x > y ? x : y;
+    return (int64_t)(x * 0.75 + y / 3.0 - m);
+}
+
+// @diff f_mix32: i32(i32:-1000..1000, i32:1..1000)
+int32_t f_mix32(int32_t a, int32_t b) {
+    float x = (float)a, y = (float)b;
+    return (int32_t)((x / y) * 100.0f + (double)x * 0.5);
+}
+
+// Random bytes: NaNs and infinities come up among the f32 bit patterns.
+// @diff f_order32: u32(buf:8)
+uint32_t f_order32(const uint8_t *p) {
+    float a, b;
+    memcpy(&a, p, 4);
+    memcpy(&b, p + 4, 4);
+    return (a < b) | (a <= b) << 1 | (a == b) << 2 | (a != b) << 3 | (a > b) << 4 | (a >= b) << 5
+        | __builtin_isunordered(a, b) << 6;
+}
+
+// @diff f_order64: u32(buf:16)
+uint32_t f_order64(uint8_t *p) {
+    double a, b;
+    if (p[0] & 1) { // b: NaN half the time (random f64 bits almost never are)
+        p[15] |= 0x7f;
+        p[14] |= 0xf8;
+    }
+    memcpy(&a, p, 8);
+    memcpy(&b, p + 8, 8);
+    return (a < b) | (a <= b) << 1 | (a == b) << 2 | (a != b) << 3 | (a > b) << 4 | (a >= b) << 5;
+}
+
+// @diff f_trunc: i64(buf:8)
+int64_t f_trunc(const uint8_t *p) {
+    float a;
+    memcpy(&a, p, 4);
+    __m128 v = _mm_set_ss(a);
+    return (int64_t)_mm_cvttss_si32(v) + _mm_cvttsd_si64(_mm_cvtss_sd(_mm_setzero_pd(), v));
+}
+
+// @diff f_vec: void(buf:48)
+void f_vec(uint8_t *p) {
+    __m128d a = _mm_loadu_pd((const double *)p);
+    __m128d b = _mm_loadu_pd((const double *)(p + 16));
+    __m128d r = _mm_add_pd(_mm_mul_pd(a, b), _mm_min_pd(a, b));
+    r = _mm_and_pd(r, _mm_cmplt_pd(a, b));
+    __m128 c = _mm_max_ps(_mm_castpd_ps(a), _mm_castpd_ps(b));
+    r = _mm_xor_pd(r, _mm_castps_pd(_mm_sqrt_ps(c)));
+    r = _mm_unpackhi_pd(r, _mm_div_pd(_mm_sqrt_pd(a), b));
+    _mm_storeu_pd((double *)(p + 32), r);
 }

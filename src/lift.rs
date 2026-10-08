@@ -21,8 +21,16 @@
 use crate::ir::*;
 use iced_x86::{ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 
+mod sse;
+
 const NGPR: usize = 16;
-type RegFile = [Option<ValueId>; NGPR];
+/// The register file: the 16 GPRs, then xmm0-15 as (low, high) qword pairs.
+const NREG: usize = NGPR + 32;
+type RegFile = [Option<ValueId>; NREG];
+/// `BlockParam` register number of xmm register half `k` (2 * xmm + high).
+pub const XMM_PARAM: u8 = 0xc0;
+/// The xmm slots of the register file, as a bit mask.
+const XMM_SLOTS: u64 = ((1 << 32) - 1) << NGPR;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum LiftError {
@@ -34,6 +42,9 @@ pub enum LiftError {
     BranchOutOfRange { ip: u64, target: u64 },
     /// A branch targets the middle of another instruction (overlapping code).
     TargetInsideInstruction { target: u64 },
+    /// An xmm register read before anything set it: a float or vector argument,
+    /// or a value a call clobbered (a float result).
+    XmmNotSet { ip: u64 },
 }
 
 /// A call's arguments as the lifter records them: every register a callee could
@@ -82,6 +93,9 @@ enum Flags {
     Dec { lhs: ValueId, one: ValueId },
     /// inc: the flags of `lhs + one = res` except CF.
     Inc { lhs: ValueId, one: ValueId, res: ValueId },
+    /// ucomis / comis of the low `w`-byte floats `a` and `b`: ZF, PF and CF
+    /// (all set when unordered), with OF = SF = 0.
+    Float { a: ValueId, b: ValueId, w: u8 },
 }
 
 /// How many instructions before an indirect `jmp` pass 1 keeps, to recognize the
@@ -111,8 +125,13 @@ struct JumpTable {
 struct BlockState {
     /// Value of each GPR at block exit. Starts as the block's own live-ins.
     out: RegFile,
-    /// `BlockParam` created for each live-in GPR.
+    /// `BlockParam` created for each live-in register.
     params: RegFile,
+    /// Registers a call left undefined (xmm only: the GPRs it clobbers are
+    /// `CallOut`s), as a bit mask over the register file.
+    clobbered: u64,
+    /// The instruction that first read an xmm live-in, for errors.
+    xmm_read: u64,
     /// `BlockParam` created for each condition read before the block sets the flags.
     cparams: CondFile,
     /// Each condition's value at block exit, filled in `finalize` for the ones a
@@ -127,7 +146,7 @@ struct BlockState {
 }
 
 const EMPTY_STATE: BlockState =
-    BlockState { out: [None; NGPR], params: [None; NGPR], cparams: [None; NCC], cout: [None; NCC], flags: Flags::Unknown, exit_ip: 0, flags_read: 0 };
+    BlockState { out: [None; NREG], params: [None; NREG], clobbered: 0, xmm_read: 0, cparams: [None; NCC], cout: [None; NCC], flags: Flags::Unknown, exit_ip: 0, flags_read: 0 };
 
 /// Where an instruction's destination operand lives.
 #[derive(Copy, Clone)]
@@ -161,9 +180,6 @@ pub struct Lifter {
     switch_index: Option<ValueId>,
     /// Each block that ends in a `Switch`, and its table (index into `tables`).
     switches: Vec<(BlockId, usize)>,
-    /// xmm0-15 as (low, high) qword pairs. Only 16-byte copies and zeroing are
-    /// lifted, so these are tracked within a block, not across blocks.
-    xmm: [Option<(ValueId, ValueId)>; 16],
     /// Record the caller-saved registers at each return in an `Exit` instruction,
     /// for whole-program register summaries (`program.rs` sets this).
     pub track_exits: bool,
@@ -196,7 +212,6 @@ impl Lifter {
             starts: Vec::with_capacity(256),
             switch_index: None,
             switches: Vec::with_capacity(4),
-            xmm: [None; 16],
             track_exits: false,
             thread_pointer: None,
             cur: 0,
@@ -455,7 +470,6 @@ impl Lifter {
         self.cur = idx;
         self.flags = Flags::Entry;
         self.switch_index = None;
-        self.xmm = [None; 16];
         f.blocks[BlockId::new(idx)].insts.start = f.value_pool.len() as u32;
     }
 
@@ -612,50 +626,6 @@ impl Lifter {
                 self.write(f, dst, v)?;
                 self.flags = Flags::Mul { lhs, rhs, lo: v, signed: true };
             }
-            Mnemonic::Movups | Mnemonic::Movaps | Mnemonic::Movdqu | Mnemonic::Movdqa | Mnemonic::Movupd | Mnemonic::Movapd
-            | Mnemonic::Lddqu => self.mov128(f, i)?,
-            // bitwise ops, a qword at a time
-            Mnemonic::Andps | Mnemonic::Andpd | Mnemonic::Pand | Mnemonic::Orps | Mnemonic::Orpd | Mnemonic::Por => {
-                let a = self.xmm_of(i.op0_register())?;
-                let op = match i.mnemonic() {
-                    Mnemonic::Andps | Mnemonic::Andpd | Mnemonic::Pand => BinOp::And,
-                    _ => BinOp::Or,
-                };
-                let (lo, hi) = self.xmm_operand(f, i)?;
-                let (alo, ahi) = self.xmm_get(a)?;
-                let lo = self.emit(f, InstKind::Bin { op, lhs: alo, rhs: lo }, TyId::B8);
-                let hi = self.emit(f, InstKind::Bin { op, lhs: ahi, rhs: hi }, TyId::B8);
-                self.xmm[a] = Some((lo, hi));
-            }
-            // pcmpeqd xmm0, xmm0: all ones
-            Mnemonic::Pcmpeqb | Mnemonic::Pcmpeqw | Mnemonic::Pcmpeqd | Mnemonic::Pcmpeqq
-                if i.op1_kind() == OpKind::Register && i.op1_register() == i.op0_register() =>
-            {
-                let a = self.xmm_of(i.op0_register())?;
-                let ones = self.konst(f, u64::MAX, TyId::B8);
-                self.xmm[a] = Some((ones, ones));
-            }
-            Mnemonic::Xorps | Mnemonic::Xorpd | Mnemonic::Pxor => {
-                let a = self.xmm_of(i.op0_register())?;
-                let v = if i.op1_kind() == OpKind::Register && i.op1_register() == i.op0_register() {
-                    let z = self.konst(f, 0, TyId::B8);
-                    (z, z) // the zeroing idiom
-                } else {
-                    let (lo, hi) = self.xmm_operand(f, i)?;
-                    let (alo, ahi) = self.xmm_get(a)?;
-                    let lo = self.emit(f, InstKind::Bin { op: BinOp::Xor, lhs: alo, rhs: lo }, TyId::B8);
-                    let hi = self.emit(f, InstKind::Bin { op: BinOp::Xor, lhs: ahi, rhs: hi }, TyId::B8);
-                    (lo, hi)
-                };
-                self.xmm[a] = Some(v);
-            }
-            // punpcklqdq xmm0, xmm1: xmm0 = (xmm0.lo, xmm1.lo), how gcc pairs two qwords
-            Mnemonic::Punpcklqdq | Mnemonic::Movlhps => {
-                let a = self.xmm_of(i.op0_register())?;
-                let (lo, _) = self.xmm_get(a)?;
-                let (hi, _) = self.xmm_operand(f, i)?;
-                self.xmm[a] = Some((lo, hi));
-            }
             // rep movs: memcpy(rdi, rsi, rcx * size), with the direction flag clear
             // (before `movsd`, which is also the SSE move)
             Mnemonic::Movsb | Mnemonic::Movsw | Mnemonic::Movsd | Mnemonic::Movsq
@@ -681,7 +651,31 @@ impl Lifter {
                 self.write(f, Register::RSI, s2)?;
                 self.write(f, Register::RCX, zero)?;
             }
-            Mnemonic::Movq | Mnemonic::Movd | Mnemonic::Movsd => self.movq(f, i)?,
+            // rep stos: rcx copies of al / ax / eax / rax from rdi on
+            Mnemonic::Stosb | Mnemonic::Stosw | Mnemonic::Stosd | Mnemonic::Stosq if i.has_rep_prefix() => {
+                let size = i.memory_size().size() as u64;
+                let val = match size {
+                    1 => Register::AL,
+                    2 => Register::AX,
+                    4 => Register::EAX,
+                    _ => Register::RAX,
+                };
+                let val = self.read(f, val)?;
+                let count = self.read(f, Register::RCX)?;
+                let dst = self.read(f, Register::RDI)?;
+                let d = self.emit(f, InstKind::IntToPtr(dst), TyId::PTR);
+                self.emit(f, InstKind::MemFill { dst: d, val, count }, TyId::UNIT);
+                let len = if size == 1 {
+                    count
+                } else {
+                    let k = self.konst(f, size, TyId::B8);
+                    self.emit(f, InstKind::Bin { op: BinOp::Mul, lhs: count, rhs: k }, TyId::B8)
+                };
+                let d2 = self.emit(f, InstKind::Bin { op: BinOp::Add, lhs: dst, rhs: len }, TyId::B8);
+                let zero = self.konst(f, 0, TyId::B8);
+                self.write(f, Register::RDI, d2)?;
+                self.write(f, Register::RCX, zero)?;
+            }
             Mnemonic::Bswap => {
                 let r = i.op0_register();
                 let v = self.read(f, r)?;
@@ -887,6 +881,7 @@ impl Lifter {
                 let dst = self.dst(f, i)?;
                 self.put(f, dst, v)?;
             }
+            m if sse::handled(m) => self.sse(f, i)?,
             _ => return Err(self.unsupported()),
         }
         Ok(())
@@ -1176,100 +1171,6 @@ impl Lifter {
         self.emit(f, InstKind::Bin { op: BinOp::Mul, lhs: a, rhs: b }, TyId::B8)
     }
 
-    /// movups / movaps / movdqu / movdqa between xmm registers and memory: two
-    /// qword loads or stores.
-    fn mov128(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
-        match (i.op0_kind(), i.op1_kind()) {
-            (OpKind::Register, _) => {
-                let d = self.xmm_of(i.op0_register())?;
-                self.xmm[d] = Some(self.xmm_operand(f, i)?);
-            }
-            (OpKind::Memory, OpKind::Register) => {
-                let (lo, hi) = self.xmm_get(self.xmm_of(i.op1_register())?)?;
-                let p = self.ea(f, i)?;
-                let p8 = self.emit(f, InstKind::PtrOffset { base: p, index: None, scale: 1, disp: 8 }, TyId::PTR);
-                self.emit(f, InstKind::Store { ptr: p, val: lo, align: 1 }, TyId::UNIT);
-                self.emit(f, InstKind::Store { ptr: p8, val: hi, align: 1 }, TyId::UNIT);
-            }
-            _ => return Err(self.unsupported()),
-        }
-        Ok(())
-    }
-
-    /// movq / movd / movsd between an xmm register and a general register or
-    /// memory. Writing the xmm register zeroes the rest of it, except for
-    /// `movsd xmm, xmm`, which only replaces the low qword.
-    fn movq(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
-        let sz = match i.mnemonic() {
-            Mnemonic::Movd => 4,
-            _ => 8,
-        };
-        let xmm_dst = i.op0_kind() == OpKind::Register && i.op0_register().is_xmm();
-        let xmm_src = i.op1_kind() == OpKind::Register && i.op1_register().is_xmm();
-        if i.mnemonic() == Mnemonic::Movsd && !(xmm_dst || xmm_src) {
-            return Err(self.unsupported()); // the string instruction
-        }
-        match (xmm_dst, xmm_src) {
-            (true, true) => {
-                let d = self.xmm_of(i.op0_register())?;
-                let (lo, _) = self.xmm_get(self.xmm_of(i.op1_register())?)?;
-                let hi = if i.mnemonic() == Mnemonic::Movsd {
-                    self.xmm_get(d)?.1
-                } else {
-                    self.konst(f, 0, TyId::B8)
-                };
-                self.xmm[d] = Some((lo, hi));
-            }
-            (true, false) => {
-                let d = self.xmm_of(i.op0_register())?;
-                let mut lo = self.operand(f, i, 1, sz)?;
-                if sz == 4 {
-                    lo = self.emit(f, InstKind::Cast { kind: CastKind::ZExt, v: lo }, TyId::B8);
-                }
-                let hi = self.konst(f, 0, TyId::B8);
-                self.xmm[d] = Some((lo, hi));
-            }
-            (false, true) => {
-                let (mut lo, _) = self.xmm_get(self.xmm_of(i.op1_register())?)?;
-                if sz == 4 {
-                    lo = self.emit(f, InstKind::Cast { kind: CastKind::Trunc, v: lo }, TyId::B4);
-                }
-                if i.op0_kind() == OpKind::Register && i.op0_register().size() != sz {
-                    return Err(self.unsupported());
-                }
-                let dst = self.dst(f, i)?;
-                self.put(f, dst, lo)?;
-            }
-            (false, false) => return Err(self.unsupported()), // mmx
-        }
-        Ok(())
-    }
-
-    /// Source operand 1 as a 16-byte (low, high) pair: an xmm register or two loads.
-    fn xmm_operand(&mut self, f: &mut Function, i: &Instruction) -> Result<(ValueId, ValueId), LiftError> {
-        match i.op1_kind() {
-            OpKind::Register => self.xmm_get(self.xmm_of(i.op1_register())?),
-            OpKind::Memory if i.memory_size().size() == 16 => {
-                let p = self.ea(f, i)?;
-                let lo = self.emit(f, InstKind::Load { ptr: p, align: 1, volatile: false }, TyId::B8);
-                let p8 = self.emit(f, InstKind::PtrOffset { base: p, index: None, scale: 1, disp: 8 }, TyId::PTR);
-                let hi = self.emit(f, InstKind::Load { ptr: p8, align: 1, volatile: false }, TyId::B8);
-                Ok((lo, hi))
-            }
-            _ => Err(self.unsupported()),
-        }
-    }
-
-    fn xmm_of(&self, r: Register) -> Result<usize, LiftError> {
-        let n = (r as usize).wrapping_sub(Register::XMM0 as usize);
-        if n < 16 { Ok(n) } else { Err(self.unsupported()) }
-    }
-
-    /// The value of xmm register `n`, if this block has set it.
-    fn xmm_get(&self, n: usize) -> Result<(ValueId, ValueId), LiftError> {
-        self.xmm[n].ok_or_else(|| self.unsupported())
-    }
-
     /// pop r / pop [mem], and the pop half of `leave` (into rbp).
     fn pop(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
         let sp = self.read(f, Register::RSP)?;
@@ -1299,7 +1200,7 @@ impl Lifter {
         let args = self.call_regs(f);
         let call = self.emit(f, InstKind::Call { callee, args: ListRef::EMPTY }, TyId::B8);
         self.calls.push((call, args));
-        self.xmm = [None; 16];
+        self.state[self.cur].clobbered |= XMM_SLOTS;
         self.state[self.cur].out[Register::RAX.number()] = Some(call);
         for r in EXIT_REGS {
             let v = self.emit(f, InstKind::CallOut { call, reg: r.number() as u8 }, TyId::B8);
@@ -1528,6 +1429,27 @@ impl Lifter {
                     _ => return Err(self.unsupported()),
                 };
                 (cond, res, self.konst(f, 0, f.insts[res].ty))
+            }            Flags::Float { a, b, w } => {
+                // each condition is one lane compare, true or inverted
+                let (op, set) = match cc {
+                    C::a => (LaneOp::FCmpGt, true),
+                    C::ae => (LaneOp::FCmpGe, true),
+                    C::b => (LaneOp::FCmpGe, false),
+                    C::be => (LaneOp::FCmpGt, false),
+                    C::e | C::le => (LaneOp::FCmpLtGt, false),
+                    C::ne | C::g => (LaneOp::FCmpLtGt, true),
+                    C::p => (LaneOp::FCmpUnord, true),
+                    C::np => (LaneOp::FCmpUnord, false),
+                    C::l | C::s | C::o => return Ok(self.konst(f, 0, TyId::BOOL)),
+                    C::ge | C::ns | C::no => return Ok(self.konst(f, 1, TyId::BOOL)),
+                    _ => return Err(self.unsupported()),
+                };
+                let mut m = self.emit(f, InstKind::Bin { op: BinOp::Lane(op, w), lhs: a, rhs: b }, TyId::B8);
+                if w == 4 {
+                    let low = self.konst(f, 0xffff_ffff, TyId::B8);
+                    m = self.emit(f, InstKind::Bin { op: BinOp::And, lhs: m, rhs: low }, TyId::B8);
+                }
+                (if set { Cond::Ne } else { Cond::Eq }, m, self.konst(f, 0, TyId::B8))
             }
         };
         Ok(self.emit(f, InstKind::Cmp { cc: cond, lhs, rhs }, TyId::BOOL))
@@ -1649,7 +1571,8 @@ impl Lifter {
     /// Create a block parameter for GPR `n` in block `b`. Not part of the block's
     /// instruction list; `finalize` lists it in `Block::params`.
     fn live_in(&mut self, f: &mut Function, b: usize, n: usize) -> ValueId {
-        let id = f.insts.push(Inst { kind: InstKind::BlockParam(n as u8), ty: TyId::B8 });
+        let reg = if n < NGPR { n as u8 } else { XMM_PARAM + (n - NGPR) as u8 };
+        let id = f.insts.push(Inst { kind: InstKind::BlockParam(reg), ty: TyId::B8 });
         f.origin.push(self.leaders[b]);
         self.state[b].params[n] = Some(id);
         self.state[b].out[n] = Some(id);
@@ -1789,8 +1712,18 @@ impl Lifter {
             for b in 0..n {
                 for k in 0..self.succ_count(f, b) {
                     let s = self.succ_at(f, b, k);
-                    for r in 0..NGPR {
-                        if self.state[s].params[r].is_some() && self.state[b].out[r].is_none() {
+                    for r in 0..NREG {
+                        if self.state[s].params[r].is_none() {
+                            continue;
+                        }
+                        // an xmm register a call clobbered, or one read on entry
+                        if self.state[b].clobbered >> r & 1 != 0 {
+                            return Err(LiftError::XmmNotSet { ip: self.state[s].xmm_read });
+                        }
+                        if self.state[b].out[r].is_none() {
+                            if r >= NGPR && self.state[b].xmm_read == 0 {
+                                self.state[b].xmm_read = self.state[s].xmm_read;
+                            }
                             self.live_in(f, b, r);
                             changed = true;
                         }
@@ -1798,6 +1731,10 @@ impl Lifter {
                 }
             }
             if !changed { break; }
+        }
+        // xmm registers aren't arguments yet (floats and vectors)
+        if self.state[0].params[NGPR..].iter().any(Option::is_some) {
+            return Err(LiftError::XmmNotSet { ip: self.state[0].xmm_read });
         }
         // 1b. Switch edges carry no arguments: each case goes through a new block
         //     without parameters (one per target) that jumps on with them.
@@ -1811,8 +1748,8 @@ impl Lifter {
                     Some(j) => f.value_pool[table + j],
                     None => {
                         let to = self.block_at(target).expect("case targets are leaders");
-                        let BlockState { out, cout, .. } = self.state[b.index()];
-                        self.state.push(BlockState { out, cout, ..EMPTY_STATE });
+                        let BlockState { out, cout, clobbered, .. } = self.state[b.index()];
+                        self.state.push(BlockState { out, cout, clobbered, ..EMPTY_STATE });
                         let term = Terminator::Jump { to, args: ListRef::EMPTY };
                         f.blocks.push(Block { insts: ListRef::EMPTY, params: ListRef::EMPTY, term }).as_value()
                     }
@@ -1861,7 +1798,7 @@ impl Lifter {
         for b in 0..n {
             let start = f.value_pool.len();
             for s in succs(f.blocks[BlockId::new(b)].term).into_iter().flatten() {
-                for r in 0..NGPR {
+                for r in 0..NREG {
                     if self.state[s.index()].params[r].is_some() {
                         f.value_pool.push(self.state[b].out[r].expect("filled by step 1"));
                     }
@@ -1919,11 +1856,10 @@ fn handled(i: &Instruction) -> bool {
                 m,
                 Nop | Endbr64 | Mov | Lea | Add | Sub | And | Or | Xor | Cmp | Test | Inc | Dec | Neg | Not | Shl | Shr
                     | Sar | Mul | Imul | Movzx | Movsx | Movsxd | Div | Idiv | Cqo | Cdq | Cdqe | Cwde | Push | Pop
-                    | Leave | Movups | Movaps | Movdqu | Movdqa | Xorps | Xorpd | Pxor | Punpcklqdq | Movq | Movd
-                    | Movsd | Movupd | Movapd | Lddqu | Andps | Andpd | Pand | Orps | Orpd | Por | Pcmpeqb | Pcmpeqw
-                    | Pcmpeqd | Pcmpeqq | Movlhps | Movsb | Movsw | Movsq | Bswap | Tzcnt | Lzcnt | Popcnt | Bsf | Bsr
+                    | Leave | Movsb | Movsw | Movsd | Movsq | Stosb | Stosw | Stosd | Stosq | Bswap | Tzcnt | Lzcnt | Popcnt | Bsf | Bsr
                     | Shld | Shrd | Rol | Ror | Adc | Sbb | Bt | Bts | Btr | Btc | Xchg | Xadd | Cmpxchg | Pause
             ) || cmov_or_setcc(m).is_some()
+                || sse::handled(m)
         }
         FlowControl::ConditionalBranch => i.condition_code() != ConditionCode::None,
         FlowControl::UnconditionalBranch | FlowControl::IndirectBranch | FlowControl::Return | FlowControl::Call

@@ -164,9 +164,9 @@ fn transfer(f: &Function, k: InstKind, o: &mut Offsets, record: bool) -> S {
             }
             S::Not
         }
-        MemCopy { dst, src, len } => {
+        MemCopy { dst, src, len: count } | MemFill { dst, val: src, count } => {
             if record {
-                for v in [dst, src, len] {
+                for v in [dst, src, count] {
                     o.take(v);
                 }
             }

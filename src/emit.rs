@@ -361,6 +361,7 @@ fn struct_arg(
                 InstKind::Load { ptr, .. } => (ptr, width(f.insts[id].ty)),
                 InstKind::Store { ptr, val, .. } => (ptr, width(f.insts[val].ty)),
                 InstKind::MemCopy { dst, src, .. } if through(dst) || through(src) => return false,
+                InstKind::MemFill { dst, .. } if through(dst) => return false,
                 InstKind::Call { args, .. } => {
                     let pass = call(Site::Call(id)).map(|c| c.args).unwrap_or_default();
                     let lent = args.get(&f.value_pool).iter().zip(&pass).any(|(&v, x)| matches!(x, Pass::Borrow { .. }) && through(v));
@@ -1254,6 +1255,9 @@ impl Emitter<'_> {
                     UnOp::Popcnt => format!("{r}.count_ones() as {t}"),
                     UnOp::Ctz => format!("{r}.trailing_zeros() as {t}"),
                     UnOp::Clz => format!("{r}.leading_zeros() as {t}"),
+                    UnOp::Lane(op, w) => {
+                        self.conv(&format!("{}({})", crate::simd::un_name(op, w), self.as_u64(v)), self.u64_ty, vt)
+                    }
                 }
             }
             Cmp { cc, lhs, rhs } => self.cmp(cc, lhs, rhs),
@@ -1294,6 +1298,21 @@ impl Emitter<'_> {
                 );
                 self.stats.raw += 1;
                 self.stats.raw_by[bucket(self.src[dst.index()] | self.src[src.index()])] += 1;
+                return Stmt::Effect(s);
+            }
+            MemFill { dst, val, count } => {
+                let w = bytes(self.ty(val));
+                let (d, v, n) = (expr::cast(self.as_u(dst)), self.as_u(val), expr::cast(self.as_u(count)));
+                let s = if w == 1 {
+                    format!("unsafe {{ core::ptr::write_bytes({d} as *mut u8, {v}, {n} as usize) }}")
+                } else {
+                    let bits = w * 8;
+                    format!(
+                        "for fill_at in 0..{n} as usize {{ unsafe {{ ({d} as *mut u8).add(fill_at * {w}).cast::<u{bits}>().write_unaligned({v}) }} }}"
+                    )
+                };
+                self.stats.raw += 1;
+                self.stats.raw_by[bucket(self.src[dst.index()])] += 1;
                 return Stmt::Effect(s);
             }
             other => {
@@ -1360,6 +1379,10 @@ impl Emitter<'_> {
     }
 
     fn bin(&self, id: ValueId, op: BinOp, lhs: ValueId, rhs: ValueId) -> String {
+        if let BinOp::Lane(op, w) = op {
+            let call = format!("{}({}, {})", crate::simd::name(op, w), self.as_u64(lhs), self.as_u64(rhs));
+            return self.conv(&call, self.u64_ty, self.vt[id.index()]);
+        }
         let ty = self.ty(lhs);
         if ty == TyId::BOOL {
             let o = match op {
@@ -1423,6 +1446,7 @@ impl Emitter<'_> {
             BinOp::AShr => signed(format!("{sa}.wrapping_shr({amount})")),
             BinOp::RotL => format!("{a}.rotate_left({amount})"),
             BinOp::RotR => format!("{a}.rotate_right({amount})"),
+            BinOp::Lane(..) => unreachable!("handled above"),
         }
     }
 

@@ -395,12 +395,12 @@ impl Lifter {
     /// The bits of xmm register `n` that a scalar conversion or square root
     /// leaves alone. Compilers treat them as garbage (that's why they write
     /// `xorps` first when the false dependency matters), so a half this block
-    /// hasn't set is `Undef` rather than a live-in, which would fail at entry,
-    /// where the register holds an argument or nothing.
+    /// hasn't set is `Undef` rather than a live-in, which at entry would make
+    /// it look like a float argument.
     fn xmm_kept(&mut self, f: &mut Function, n: usize) -> Pair {
         let st = self.state[self.cur];
         let half = |l: &mut Self, f: &mut Function, r: usize| match st.out[r] {
-            Some(v) if st.clobbered >> r & 1 == 0 => v,
+            Some(v) => v,
             _ => l.emit(f, InstKind::Undef, TyId::B8),
         };
         (half(self, f, NGPR + 2 * n), half(self, f, NGPR + 2 * n + 1))
@@ -688,13 +688,6 @@ impl Lifter {
     /// The value of xmm register `n`: a live-in pair if this block hasn't set it.
     pub(super) fn xmm_get(&mut self, f: &mut Function, n: usize) -> Result<(ValueId, ValueId), LiftError> {
         let (lo, hi) = (NGPR + 2 * n, NGPR + 2 * n + 1);
-        if self.state[self.cur].clobbered >> lo & 1 != 0 {
-            return Err(LiftError::XmmNotSet { ip: self.ip });
-        }
-        let st = &mut self.state[self.cur];
-        if st.out[lo].is_none() && st.xmm_read == 0 {
-            st.xmm_read = self.ip;
-        }
         let lo = match self.state[self.cur].out[lo] {
             Some(v) => v,
             None => self.live_in(f, self.cur, lo),
@@ -710,7 +703,6 @@ impl Lifter {
         let st = &mut self.state[self.cur];
         st.out[NGPR + 2 * n] = Some(lo);
         st.out[NGPR + 2 * n + 1] = Some(hi);
-        st.clobbered &= !(3 << (NGPR + 2 * n));
     }
 
 }

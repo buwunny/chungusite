@@ -133,7 +133,7 @@ Lane arithmetic is `BinOp::Lane(op, w)` or `UnOp::Lane(op, w)` on one 64-bit hal
 
 `UCOMISD`/`COMISD` set `Flags::Float`. Each condition is one lane compare: `ja` is "greater, ordered", `jb` is "not greater-or-equal" (true when unordered, like CF), `je` is "neither less nor greater" (ZF is set when unordered), `jp` is "unordered".
 
-Which xmm values a function reads that it didn't write matters, since xmm registers carry float arguments and results, which signatures don't model yet ([calls.md](calls.md)). An xmm register read at entry, or after a call (which leaves them all undefined), is `LiftError::XmmNotSet`, also when the read is in a later block. The exception is the part of a register that a scalar conversion or square root leaves alone (`cvtsi2sd xmm0, edi` keeps xmm0's high half): compilers treat it as garbage, so when the block hasn't set it, it is `Undef`.
+xmm registers carry float arguments and results ([calls.md](calls.md)): one read at entry is an entry parameter, and one read after a call is a `CallOut` that signature recovery resolves to the call's result, the value from before the call (the callee preserves it), or `Undef`. The exception is the part of a register that a scalar conversion or square root leaves alone (`cvtsi2sd xmm0, edi` keeps xmm0's high half): compilers treat it as garbage, so when the block hasn't set it, it is `Undef`.
 
 ## Bit instructions, atomics and the rest
 
@@ -147,7 +147,7 @@ Which xmm values a function reads that it didn't write matters, since xmm regist
 
 ## Not handled yet
 
-- xmm arguments and return values (`LiftError::XmmNotSet`), AVX beyond the 16-byte VEX moves and bitwise ops (`ymm` registers), SSSE3 and later (`PSHUFB`, `PTEST`, ...), and the pack instructions.
+- AVX beyond the 16-byte VEX moves and bitwise ops (`ymm` registers), SSSE3 and later (`PSHUFB`, `PTEST`, ...), and the pack instructions.
 - `DIV` with a real 128-bit dividend.
 - Parity, the carry out of `adc`/`sbb`, the signed conditions after an `ADD` of two registers, and `CF|ZF` (`ja`/`jbe`) after `ADD`.
 - Thread-locals through a register, and `gs:`.

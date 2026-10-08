@@ -20,6 +20,21 @@
 //! * **Return value.** A function returns a value if rax is defined at every
 //!   return: not rax's entry value, not `Undef`, not the result of a `void` call,
 //!   and not a block parameter that merges one of those in.
+//! * **Float arguments and results.** Float argument `j` is xmm `j`'s low half
+//!   (`XMM_PARAM + 2j` on entry), a parameter if live, prefix-closed like the
+//!   integer ones. A function returns a float (in xmm0) if xmm0 is defined at
+//!   every return and either some caller reads xmm0 after calling it, or at every
+//!   return xmm0 holds a float the function computed (or got from a float call,
+//!   or a float argument), with a high half that isn't one (packed math is
+//!   vector code), that it didn't store (a `void` function that stores a float
+//!   it computed leaves it in xmm0 too), and that wins over rax if rax is
+//!   defined too: the one computed only to be returned, else the one written
+//!   last. Returns of a constant xmm0 don't count either way. `ret` is then set
+//!   too; `fret` says the value is in xmm0.
+//! * **Preserved xmm registers.** Like the general registers, per 64-bit half:
+//!   gcc keeps floats in xmm registers across calls to functions it knows
+//!   don't touch them. A function that names no xmm register keeps what all its
+//!   callees keep (the lifter doesn't track xmm registers through it).
 //! * **Two-register returns.** It also returns rdx (a 16-byte value, which Rust uses
 //!   for slices and pairs) if rdx is defined at every return and some caller reads
 //!   rdx after calling it.
@@ -37,7 +52,7 @@
 use crate::borrow::{analyze, Off, RSP};
 use crate::cfg::Cfg;
 use crate::ir::*;
-use crate::lift::{CALL_ARGS, CALL_REGS, EXIT_REGS};
+use crate::lift::{CALL_ARGS, CALL_REGS, CALL_XMM, EXIT_REGS, EXIT_XMM0, FLOAT_ARGS, XMM0, XMM_PARAM};
 use crate::opt::{clean, list_remove, rewrite_uses};
 use crate::verify::for_each_operand;
 
@@ -61,20 +76,34 @@ pub struct Sig {
     pub args: u8,
     /// 8-byte arguments on the stack, after the six in registers.
     pub stack_args: u8,
-    /// Returns a value in rax.
+    /// Returns a value: in rax, or in xmm0 if `fret`.
     pub ret: bool,
+    /// The value it returns is a float, in xmm0.
+    pub fret: bool,
+    /// Float arguments: the low halves of the first `fargs` of xmm0-7.
+    pub fargs: u8,
     /// Also returns a value in rdx: the result is 16 bytes, rax:rdx.
     pub ret2: bool,
     /// Takes more arguments than `args` (printf). Callers pass what they set up.
     pub variadic: bool,
     /// Caller-saved registers (bit = x86 number) the function leaves as it found them.
     pub preserves: u16,
+    /// xmm register halves (bit = 2 * xmm + high) it leaves as it found them.
+    pub xpreserves: u32,
 }
 
 impl Sig {
     /// Does the function leave register `reg` (x86 number) as it found it?
     pub fn keeps(self, reg: u8) -> bool {
-        self.preserves & (1 << reg) != 0
+        match reg {
+            0..16 => self.preserves & (1 << reg) != 0,
+            _ => reg.checked_sub(XMM_PARAM).is_some_and(|k| k < 32 && self.xpreserves & (1 << k) != 0),
+        }
+    }
+
+    /// Returns a value in rax.
+    pub fn rax(self) -> bool {
+        self.ret && !self.fret
     }
 }
 
@@ -112,7 +141,10 @@ impl Site {
     /// The value register `reg` held at the call, if the lifter recorded it.
     fn before(self, f: &Function, reg: u8) -> Option<ValueId> {
         let args = self.parts(f).1.get(&f.value_pool);
-        let k = CALL_REGS.iter().position(|r| r.number() as u8 == reg)?;
+        let k = match reg.checked_sub(XMM_PARAM) {
+            Some(x) if x < 32 => CALL_XMM + x as usize,
+            _ => CALL_REGS.iter().position(|r| r.number() as u8 == reg)?,
+        };
         (args.len() == CALL_ARGS).then(|| args[k])
     }
 }
@@ -158,16 +190,43 @@ pub fn guess_args(f: &Function, site: Site) -> u8 {
     n as u8
 }
 
-/// What `infer` found besides the signature: which call sites read rdx after the
-/// call (evidence that the callee returns 16 bytes).
+/// How many float arguments a call to unknown code passes: up to the last xmm
+/// register set in the call's own block, like `guess_args`.
+pub fn guess_fargs(f: &Function, site: Site) -> u8 {
+    let (_, args) = site.parts(f);
+    let args = args.get(&f.value_pool);
+    if args.len() != CALL_ARGS {
+        return 0;
+    }
+    let block = match site {
+        Site::Call(id) => f.blocks.iter().find(|(_, b)| b.insts.get(&f.value_pool).contains(&id)).map(|(b, _)| b),
+        Site::Tail(b) => Some(b),
+    };
+    let Some(block) = block else { return 0 };
+    let here = f.blocks[block].insts.get(&f.value_pool);
+    let mut n = 0;
+    for (j, &a) in args[CALL_XMM..].iter().step_by(2).take(FLOAT_ARGS).enumerate() {
+        if here.contains(&a) && !matches!(f.insts[a].kind, InstKind::Undef | InstKind::CallOut { .. }) {
+            n = j + 1;
+        }
+    }
+    n as u8
+}
+
+/// What `infer` found besides the signature: what each call site reads after
+/// the call that the callee may return (`READ_RDX`: evidence that it returns 16
+/// bytes, `READ_XMM0`: that it returns a float).
 pub struct Inferred {
     pub sig: Sig,
-    pub rdx_read: Vec<bool>,
+    pub reads: Vec<u8>,
 }
+
+pub const READ_RDX: u8 = 1;
+pub const READ_XMM0: u8 = 2;
 
 /// Where a function's control leaves it.
 enum Exit {
-    /// A return, with rax and the `Exit` registers if the lifter recorded them.
+    /// A return, with rax and the `Exit` registers (then xmm0) if the lifter recorded them.
     Return { rax: ValueId, regs: Option<ListRef> },
     /// A tail call: site index.
     Tail(usize),
@@ -276,8 +335,11 @@ fn exit_value(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, e: &E
     match *e {
         Exit::Return { rax, .. } if reg == RAX => Some(rax),
         Exit::Return { regs, .. } => {
-            let k = EXIT_REGS.iter().position(|r| r.number() as u8 == reg)?;
-            Some(regs?.get(&f.value_pool)[k])
+            let k = match reg.checked_sub(XMM_PARAM) {
+                Some(x) if x < 32 => EXIT_XMM0 + x as usize,
+                _ => EXIT_REGS.iter().position(|r| r.number() as u8 == reg)?,
+            };
+            regs?.get(&f.value_pool).get(k).copied()
         }
         Exit::Tail(k) => {
             // after `jmp g`, reg is what g leaves in it
@@ -288,9 +350,10 @@ fn exit_value(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, e: &E
 
 /// The signature of `f` (lifted with `track_exits`, cleaned, not yet `apply`d),
 /// given the signature of the callee at each call site (`callee(i)` for
-/// `sites[i]`), the function's own signature from the previous round, and whether
-/// any caller reads rdx after calling it. `stack_args` is left 0; see `stack_args`.
-pub fn infer(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, prev: Sig, rdx_wanted: bool) -> Inferred {
+/// `sites[i]`), the function's own signature from the previous round, and what
+/// its callers read after calling it (`READ_RDX | READ_XMM0`). `stack_args` is
+/// left 0; see `stack_args`.
+pub fn infer(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, prev: Sig, wanted: u8) -> Inferred {
     let cfg = Cfg::new(f);
     let ex = exits(f, &cfg, sites);
     let src = sources(f, &cfg, sites);
@@ -309,53 +372,195 @@ pub fn infer(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, prev: 
             preserves |= 1 << reg;
         }
     }
+    // the same for xmm registers (gcc keeps floats in them across calls too).
+    // A return that lists no xmm registers is in a function that doesn't touch
+    // them: it keeps what all its callees keep.
+    let mut xpreserves = 0u32;
+    for k in 0..32u8 {
+        let reg = XMM_PARAM + k;
+        let ok = ex.iter().all(|e| match e {
+            Exit::Tail(t) if !callee(*t).keeps(reg) => false,
+            Exit::Return { regs: Some(l), .. } if l.len as usize == EXIT_XMM0 => (0..sites.len()).all(|t| callee(t).keeps(reg)),
+            e => exit_value(f, sites, callee, e, reg).is_some_and(|v| traces_to_entry(f, &src, sites, callee, reg, v)),
+        });
+        if ok && !ex.is_empty() {
+            xpreserves |= 1 << k;
+        }
+    }
 
-    // ---- return value: is rax defined at every exit? ----
-    let undef = undefined_values(f, &cfg, sites, callee, false);
+    // ---- return value: is rax, or xmm0, defined at every exit? ----
+    let undef = undefined_values(f, &cfg, sites, callee, false, prev.fargs);
     let defined_at = |undef: &[bool], reg: u8, e: &Exit| match e {
         Exit::Tail(k) => {
             let c = callee(*k);
             match reg {
-                RAX if c.ret => true,
+                RAX if c.rax() => true,
                 RDX if c.ret2 => true,
+                XMM0 => c.fret,
                 _ => c.keeps(reg) && sites[*k].before(f, reg).is_some_and(|v| !undef[v.index()]),
             }
         }
         e => exit_value(f, sites, callee, e, reg).is_some_and(|v| !undef[v.index()]),
     };
-    let ret = !ex.is_empty() && ex.iter().all(|e| defined_at(&undef, RAX, e));
+    let rax = !ex.is_empty() && ex.iter().all(|e| defined_at(&undef, RAX, e));
+    let fret = !ex.is_empty() && ex.iter().all(|e| defined_at(&undef, XMM0, e)) && (wanted & READ_XMM0 != 0 || {
+        // No caller says. Each exit votes: a float, an integer, or nothing (xmm0
+        // is a constant, like the 0.0 of an empty sum).
+        let fl = floats(f, &cfg, sites, callee, prev.fargs);
+        let (stored, used) = (stored_values(f), used_values(f));
+        let votes: Vec<Option<bool>> = ex
+            .iter()
+            .map(|e| match *e {
+                Exit::Tail(k) => Some(callee(k).fret),
+                Exit::Return { rax: r, regs } => {
+                    let x = exit_value(f, sites, callee, e, XMM0)?;
+                    if matches!(f.insts[x].kind, InstKind::Const(_)) {
+                        return None;
+                    }
+                    let hi = regs.and_then(|l| l.get(&f.value_pool).get(EXIT_XMM0 + 1).copied());
+                    let packed = hi.is_some_and(|h| fl[h.index()]);
+                    let float = fl[x.index()] && !stored[x.index()] && !packed;
+                    // of two candidates, the one the function computes only to
+                    // return (the other also feeds a compare, an address, ...),
+                    // else the one written last, the float on a tie (two loop
+                    // carried values)
+                    let rax_too = !undef[r.index()];
+                    Some(float && (!rax_too || match (used[x.index()], used[r.index()]) {
+                        (false, true) => true,
+                        (true, false) => false,
+                        _ => f.origin[x.index()] >= f.origin[r.index()],
+                    }))
+                }
+            })
+            .collect();
+        votes.contains(&Some(true)) && !votes.contains(&Some(false))
+    });
+    let ret = rax || fret;
 
     // ---- arguments: which entry registers are live ----
-    let mut rdx_read = vec![false; sites.len()];
-    let live = live_values(f, sites, callee, ret, prev.ret2, &mut rdx_read);
-    let mut args = 0;
+    let mut reads = vec![0u8; sites.len()];
+    let live = live_values(f, sites, callee, ret && !fret, prev.ret2, fret, &mut reads);
+    let (mut args, mut fargs) = (0, 0);
     for &p in f.blocks[f.entry].params.get(&f.value_pool) {
         if let InstKind::BlockParam(r) = f.insts[p].kind {
+            if !live[p.index()] {
+                continue;
+            }
             if let Some(k) = SYSV_ARGS.iter().position(|&a| a == r) {
-                if live[p.index()] {
-                    args = args.max(k as u8 + 1);
-                }
+                args = args.max(k as u8 + 1);
+            }
+            if let Some(j) = float_arg(r) {
+                fargs = fargs.max(j + 1);
             }
         }
     }
 
     // ---- rdx: returned too? ----
-    let ret2 = ret && rdx_wanted && preserves & (1 << RDX) == 0 && {
-        let undef = undefined_values(f, &cfg, sites, callee, args < 3);
+    let ret2 = rax && !fret && wanted & READ_RDX != 0 && preserves & (1 << RDX) == 0 && {
+        let undef = undefined_values(f, &cfg, sites, callee, args < 3, prev.fargs);
         ex.iter().all(|e| defined_at(&undef, RDX, e))
     };
-    Inferred { sig: Sig { args, stack_args: 0, ret, ret2, variadic: false, preserves }, rdx_read }
+    Inferred { sig: Sig { args, fargs, stack_args: 0, ret, fret, ret2, variadic: false, preserves, xpreserves }, reads }
+}
+
+/// Values that an instruction other than a call or an `Exit`, or a branch,
+/// uses: what the function computes with, rather than passes along.
+fn used_values(f: &Function) -> Vec<bool> {
+    let mut used = vec![false; f.insts.len()];
+    for (_, blk) in f.blocks.iter() {
+        for &id in blk.insts.get(&f.value_pool) {
+            match f.insts[id].kind {
+                InstKind::Call { .. } | InstKind::Exit { .. } => {}
+                k => for_each_operand(k, f, |v| used[v.index()] = true),
+            }
+        }
+        match blk.term {
+            Terminator::Branch { c, .. } => used[c.index()] = true,
+            Terminator::Switch { v, .. } => used[v.index()] = true,
+            _ => {}
+        }
+    }
+    used
+}
+
+/// Values stored to memory.
+fn stored_values(f: &Function) -> Vec<bool> {
+    let mut stored = vec![false; f.insts.len()];
+    for (_, blk) in f.blocks.iter() {
+        for &id in blk.insts.get(&f.value_pool) {
+            if let InstKind::Store { val, .. } = f.insts[id].kind {
+                stored[val.index()] = true;
+            }
+        }
+    }
+    stored
+}
+
+/// Float argument `j` if `reg` is its `BlockParam` number.
+fn float_arg(reg: u8) -> Option<u8> {
+    let k = reg.checked_sub(XMM_PARAM)?;
+    (k % 2 == 0 && ((k / 2) as usize) < FLOAT_ARGS).then_some(k / 2)
+}
+
+/// Values that are float bit patterns the function computed: float lane
+/// arithmetic and conversions, a float call's result, the first `fargs` float
+/// arguments, and bitwise ops, selects and block parameters that pass one on
+/// (`andpd` for `fabs`, the merge of a scalar result into its register).
+fn floats(f: &Function, cfg: &Cfg, sites: &[Site], callee: &dyn Fn(usize) -> Sig, fargs: u8) -> Vec<bool> {
+    let mut fl = vec![false; f.insts.len()];
+    for &p in f.blocks[f.entry].params.get(&f.value_pool) {
+        if let InstKind::BlockParam(r) = f.insts[p].kind {
+            fl[p.index()] = float_arg(r).is_some_and(|j| j < fargs);
+        }
+    }
+    let site_of = |call: ValueId| sites.iter().position(|&x| x == Site::Call(call));
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in &cfg.rpo {
+            let blk = &f.blocks[b];
+            if b != f.entry {
+                for (k, &p) in blk.params.get(&f.value_pool).iter().enumerate() {
+                    let mut any = false;
+                    for &pred in cfg.preds(b) {
+                        incoming(f, pred, b, k, |a| any |= fl[a.index()]);
+                    }
+                    if any && !fl[p.index()] {
+                        fl[p.index()] = true;
+                        changed = true;
+                    }
+                }
+            }
+            for &id in blk.insts.get(&f.value_pool) {
+                let now = match f.insts[id].kind {
+                    InstKind::Bin { op: BinOp::Lane(op, _), .. } => op.makes_float(),
+                    InstKind::Un { op: UnOp::Lane(op, _), .. } => op.makes_float(),
+                    InstKind::Bin { op: BinOp::And | BinOp::Or | BinOp::Xor, lhs, rhs } => fl[lhs.index()] || fl[rhs.index()],
+                    InstKind::Select { t, f: e, .. } => fl[t.index()] || fl[e.index()],
+                    InstKind::CallOut { call, reg: XMM0 } => site_of(call).is_some_and(|k| callee(k).fret),
+                    _ => false,
+                };
+                if now && !fl[id.index()] {
+                    fl[id.index()] = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+    fl
 }
 
 /// Values that may be undefined: rax on entry (and rdx, if `rdx_undef`: it isn't
-/// an argument), `Undef`, registers after a call that the callee neither returns
-/// nor preserves, and block parameters that merge any of those in.
-fn undefined_values(f: &Function, cfg: &Cfg, sites: &[Site], callee: &dyn Fn(usize) -> Sig, rdx_undef: bool) -> Vec<bool> {
+/// an argument; and xmm registers but the first `fargs` float arguments),
+/// `Undef`, registers after a call that the callee neither returns nor preserves,
+/// and block parameters that merge any of those in.
+fn undefined_values(f: &Function, cfg: &Cfg, sites: &[Site], callee: &dyn Fn(usize) -> Sig, rdx_undef: bool, fargs: u8) -> Vec<bool> {
     let mut u = vec![false; f.insts.len()];
     for &p in f.blocks[f.entry].params.get(&f.value_pool) {
         u[p.index()] = match f.insts[p].kind {
             InstKind::BlockParam(RAX) => true,
             InstKind::BlockParam(RDX) => rdx_undef,
+            InstKind::BlockParam(r) if r >= XMM_PARAM => float_arg(r).is_none_or(|j| j >= fargs),
             _ => false,
         };
     }
@@ -364,7 +569,7 @@ fn undefined_values(f: &Function, cfg: &Cfg, sites: &[Site], callee: &dyn Fn(usi
     let after = |u: &[bool], k: Option<usize>, reg: u8| -> bool {
         let Some(k) = k else { return reg != RAX };
         let c = callee(k);
-        if (reg == RAX && c.ret) || (reg == RDX && c.ret2) {
+        if (reg == RAX && c.rax()) || (reg == RDX && c.ret2) || (reg == XMM0 && c.fret) {
             return false;
         }
         !(c.keeps(reg) && sites[k].before(f, reg).is_some_and(|v| !u[v.index()]))
@@ -421,9 +626,10 @@ pub(crate) fn incoming(f: &Function, p: BlockId, b: BlockId, k: usize, mut cb: i
 
 /// Liveness from the function's effects. A call only uses the arguments its callee
 /// takes; a register after a call that the callee preserves uses its value before
-/// the call. The return value counts only if the function `ret`s (rdx at returns,
-/// if it `ret2`s). Marks in `rdx_read` the call sites whose rdx is read.
-fn live_values(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, ret: bool, ret2: bool, rdx_read: &mut [bool]) -> Vec<bool> {
+/// the call. The return value counts only if the function returns rax (`ret`;
+/// rdx at returns too, if it `ret2`s; xmm0 at returns instead if it `fret`s).
+/// Marks in `reads` the call sites whose rdx or xmm0 is read.
+fn live_values(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, ret: bool, ret2: bool, fret: bool, reads: &mut [u8]) -> Vec<bool> {
     let n = f.insts.len();
     let mut param_of: Vec<Option<(BlockId, usize)>> = vec![None; n];
     for (b, blk) in f.blocks.iter() {
@@ -443,9 +649,14 @@ fn live_values(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, ret:
         let (c, args) = s.parts(f);
         mark(c, live, work);
         let args = args.get(&f.value_pool);
-        let arity = sites.iter().position(|&x| x == s).map_or(0, |k| callee(k).args as usize);
-        for &a in &args[..arity.min(args.len()).min(6)] {
+        let c = sites.iter().position(|&x| x == s).map(callee).unwrap_or_default();
+        for &a in &args[..(c.args as usize).min(args.len()).min(6)] {
             mark(a, live, work);
+        }
+        if args.len() == CALL_ARGS {
+            for &a in args[CALL_XMM..].iter().step_by(2).take(c.fargs as usize) {
+                mark(a, live, work);
+            }
         }
     };
     for (b, blk) in f.blocks.iter() {
@@ -457,6 +668,7 @@ fn live_values(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, ret:
                     for_each_operand(f.insts[id].kind, f, |v| mark(v, &mut live, &mut work));
                 }
                 InstKind::Exit { regs } if ret2 => mark(regs.get(&f.value_pool)[1], &mut live, &mut work),
+                InstKind::Exit { regs } if fret => mark(regs.get(&f.value_pool)[EXIT_XMM0], &mut live, &mut work),
                 _ => {}
             }
         }
@@ -478,7 +690,7 @@ fn live_values(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, ret:
             InstKind::Call { .. } => {
                 if let Some(k) = site_of(v) {
                     let c = callee(k);
-                    if !c.ret && c.keeps(RAX) {
+                    if !c.rax() && c.keeps(RAX) {
                         ops.extend(sites[k].before(f, RAX));
                     }
                 }
@@ -486,7 +698,10 @@ fn live_values(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, ret:
             InstKind::CallOut { call, reg } => {
                 if let Some(k) = site_of(call) {
                     if reg == RDX {
-                        rdx_read[k] = true;
+                        reads[k] |= READ_RDX;
+                    }
+                    if reg == XMM0 {
+                        reads[k] |= READ_XMM0;
                     }
                     if callee(k).keeps(reg) {
                         ops.extend(sites[k].before(f, reg));
@@ -573,7 +788,8 @@ pub fn apply(f: &mut Function, sig: Sig, sites: &[Site], shape: &dyn Fn(usize) -
 
     // 1. Registers after a call: the value from before the call if the callee
     //    preserves the register, the callee's result (rax, and rdx for a 16-byte
-    //    result), or Undef.
+    //    result), or Undef. A float result (xmm0) becomes the call's own value,
+    //    which stands for whatever the callee returns.
     for bi in 0..f.blocks.len() {
         let list: Vec<ValueId> = f.blocks[BlockId::new(bi)].insts.get(&f.value_pool).to_vec();
         for id in list {
@@ -587,6 +803,10 @@ pub fn apply(f: &mut Function, sig: Sig, sites: &[Site], shape: &dyn Fn(usize) -
             if (reg == RAX && c.ret) || (reg == RDX && c.ret2) {
                 continue;
             }
+            if reg == XMM0 && c.fret {
+                map.push((id, call));
+                continue;
+            }
             let to = match (c.keeps(reg), sites[k].before(f, reg)) {
                 (true, Some(v)) => v,
                 _ => undef(f, &mut undefs),
@@ -595,17 +815,21 @@ pub fn apply(f: &mut Function, sig: Sig, sites: &[Site], shape: &dyn Fn(usize) -
         }
     }
 
-    // 2. Returns: rax, rax:rdx, or nothing. A tail call whose callee returns less
-    //    than this function does becomes a call and a return.
+    // 2. Returns: rax, rax:rdx, xmm0, or nothing. A tail call whose callee
+    //    returns less than this function does (or in another register) becomes a
+    //    call and a return.
     for bi in 0..f.blocks.len() {
         let b = BlockId::new(bi);
         match f.blocks[b].term {
             Terminator::Return(Some(rax)) => {
-                let exit = f.blocks[b].insts.get(&f.value_pool).iter().rev().find_map(|&id| match f.insts[id].kind {
-                    InstKind::Exit { regs } => Some(regs.get(&f.value_pool)[1]),
+                let exit = |k: usize| f.blocks[b].insts.get(&f.value_pool).iter().rev().find_map(|&id| match f.insts[id].kind {
+                    InstKind::Exit { regs } => Some(regs.get(&f.value_pool).get(k).copied()),
                     _ => None,
-                });
-                let term = if sig.ret2 {
+                }).flatten();
+                let (exit, xmm0) = (exit(1), exit(EXIT_XMM0));
+                let term = if sig.fret {
+                    Terminator::Return(Some(xmm0.unwrap_or_else(|| undef(f, &mut undefs))))
+                } else if sig.ret2 {
                     let rdx = exit.unwrap_or_else(|| undef(f, &mut undefs));
                     Terminator::Return(Some(pair(f, b, rax, rdx)))
                 } else if sig.ret {
@@ -618,13 +842,15 @@ pub fn apply(f: &mut Function, sig: Sig, sites: &[Site], shape: &dyn Fn(usize) -
             Terminator::TailCall { callee, args } => {
                 let Some(k) = sites.iter().position(|&s| s == Site::Tail(b)) else { continue };
                 let c = shape(k);
-                if !(sig.ret && !c.ret || sig.ret2 && !c.ret2) {
+                if !(sig.ret && !c.ret || sig.ret2 && !c.ret2 || sig.ret && sig.fret != c.fret) {
                     continue;
                 }
                 // `jmp g` becomes `v = call g; return v (or v:rdx)`
                 let call = new_inst(f, InstKind::Call { callee, args }, TyId::B8, f.origin[callee.index()]);
                 let mut tail = vec![call];
-                let rax = if c.ret {
+                let rax = if sig.fret {
+                    if c.fret { call } else { undef(f, &mut undefs) }
+                } else if c.rax() {
                     call
                 } else {
                     match (c.keeps(RAX), sites[k].before(f, RAX)) {
@@ -682,6 +908,7 @@ pub fn apply(f: &mut Function, sig: Sig, sites: &[Site], shape: &dyn Fn(usize) -
         }
         let at = s.ip(f);
         let mut new: Vec<ValueId> = old[..(c.args as usize).min(6)].to_vec();
+        let floats: Vec<ValueId> = old[CALL_XMM..].iter().step_by(2).take((c.fargs as usize).min(FLOAT_ARGS)).copied().collect();
         let mut loads = Vec::new();
         for j in 0..c.stack_args as i32 {
             // at a call, [rsp] is the first stack argument; at a jmp, [rsp] is our
@@ -692,6 +919,7 @@ pub fn apply(f: &mut Function, sig: Sig, sites: &[Site], shape: &dyn Fn(usize) -
             loads.extend([p, v]);
             new.push(v);
         }
+        new.extend_from_slice(&floats);
         let start = f.value_pool.len() as u32;
         f.value_pool.extend_from_slice(&new);
         let list = ListRef { start, len: new.len() as u32 };
@@ -719,13 +947,19 @@ pub fn apply(f: &mut Function, sig: Sig, sites: &[Site], shape: &dyn Fn(usize) -
     }
 
     // 4. Registers that aren't arguments stop being parameters: callee-saved
-    //    registers are only saved and restored, and rax, r10, r11 are undefined.
-    //    rsp stays for `frame::promote`.
+    //    registers are only saved and restored, and rax, r10, r11 and xmm
+    //    registers past the float arguments are undefined. rsp stays for
+    //    `frame::promote`.
     let mut k = 0;
     while k < f.blocks[entry].params.len as usize {
         let p = f.value_pool[f.blocks[entry].params.start as usize + k];
         let keep = match f.insts[p].kind {
-            InstKind::BlockParam(r) => r == RSP || SYSV_ARGS[..sig.args as usize].contains(&r) || r >= STACK_ARG_BASE,
+            InstKind::BlockParam(r) => {
+                r == RSP
+                    || SYSV_ARGS[..sig.args as usize].contains(&r)
+                    || float_arg(r).is_some_and(|j| j < sig.fargs)
+                    || (STACK_ARG_BASE..XMM_PARAM).contains(&r)
+            }
             _ => true,
         };
         if keep {

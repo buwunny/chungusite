@@ -4,17 +4,18 @@ The lifter sees one function at a time and doesn't know what its callees read or
 
 ## Pipeline
 
-1. **Lift** every function in the binary (in parallel, one `Lifter` per thread), whether or not it was selected for output: unselected functions are still lifted so their callers get accurate signatures. Each call lists all ten registers that might matter to the callee (`rdi, rsi, rdx, rcx, r8, r9, rsp, rax, r10, r11`), and every caller-saved register afterwards is a `CallOut` placeholder. With `track_exits` on, each return records the caller-saved registers in an `Exit` instruction.
+1. **Lift** every function in the binary (in parallel, one `Lifter` per thread), whether or not it was selected for output: unselected functions are still lifted so their callers get accurate signatures. Each call lists all ten registers that might matter to the callee (`rdi, rsi, rdx, rcx, r8, r9, rsp, rax, r10, r11`), then the halves of xmm0-15, and every caller-saved register afterwards is a `CallOut` placeholder. A function that never touches an xmm register skips them: its calls pass `Undef` there, its returns list no xmm registers, and its calls have no xmm `CallOut`s. With `track_exits` on, each return records the caller-saved registers in an `Exit` instruction.
 2. **Resolve call targets**: a direct `call` to a known function; a relocation at the call site (relocatable objects); a PLT stub (`jmp [rip+slot]`) or a GOT slot (`call [rip+slot]`) named through the dynamic relocations. Anything else is `Indirect`.
 3. **Infer signatures** to a fixpoint, in rounds that run every function in parallel against the previous round's callee signatures. A signature (`abi::Sig`) is:
    - `args`: the highest System V argument register that is live on entry, where a call only uses the arguments its callee takes;
    - `stack_args`: 8-byte words read above the return address;
    - `ret`: rax is defined on every path to a return;
+   - `fargs` and `fret`: float arguments (xmm0-7, low halves, as `f64`) and a float result in xmm0. Both rax and xmm0 can be defined at a return, so `fret` needs a caller that reads xmm0 after the call or, with none, each return to vote: xmm0 is a value float instructions computed (not a constant, not a packed vector, not something stored), and rax isn't the better candidate (the one only computed to be returned, else the one written last);
    - `ret2`: rdx is too, and some caller reads it (16-byte results such as Rust's fat pointers and `(u64, u64)` pairs);
-   - `preserves`: caller-saved registers the function leaves as it found them. gcc's interprocedural register allocation relies on this: if `f` never touches `rdi`, a caller may keep a value in `rdi` across `call f`.
+   - `preserves`, `xpreserves`: caller-saved general and xmm registers the function leaves as it found them. gcc's interprocedural register allocation relies on this: if `f` never touches `rdi` (or `xmm2`), a caller may keep a value there across `call f`.
 
    Imports come from a table of C library signatures ([`src/libc.rs`](../src/libc.rs)). An unknown import or a function that didn't lift takes the most arguments any call site sets up.
-4. **Apply** each signature (`abi::apply`): registers after a call become the callee's result, the value from before the call (preserved), or `Undef`; calls pass exactly their callee's arguments, stack arguments loaded from the caller's stack; returns return `rax`, `rax:rdx` or nothing; a tail call to a callee that returns less than the caller becomes a call and a return; entry registers that aren't arguments become `Undef`. Then `frame::promote` and `opt::clean`.
+4. **Apply** each signature (`abi::apply`): registers after a call become the callee's result, the value from before the call (preserved), or `Undef`; calls pass exactly their callee's arguments, stack arguments loaded from the caller's stack; returns return `rax`, `rax:rdx`, `xmm0` or nothing; a tail call to a callee that returns less than the caller becomes a call and a return; entry registers that aren't arguments become `Undef`. Then `frame::promote` and `opt::clean`.
 5. **Emit** in parallel. Calls to selected functions use their names; everything else goes through `mod ffi { extern "C" { ... } }` at the top of the file, declared with its recovered signature (`-> Pair` for a two-register result). An `Indirect` call transmutes the target to an `extern "C"` function pointer.
 
 ## Stack frames
@@ -29,7 +30,7 @@ A decompiled caller passes addresses, not slices, so in safe mode every function
 
 ## Limits
 
-- Floating-point and vector arguments (xmm registers) aren't tracked; neither are variadic calls' float arguments (`al`).
+- Float arguments and results are `f64`: an `f32` argument is an `f64` whose low 32 bits carry it (the emitted code reads the bits). Vector arguments (`__m128`), the high halves of xmm registers and variadic calls' float arguments (`al`) aren't tracked.
 - Signatures of indirect calls are guessed from the call site.
 - Values returned in memory (structs larger than 16 bytes) appear as the hidden pointer argument in `rdi` and the same pointer returned in `rax`.
 - A function with no return (every path ends in a call that doesn't return, or a loop) preserves nothing and returns nothing.

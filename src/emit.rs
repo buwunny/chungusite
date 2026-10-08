@@ -30,6 +30,7 @@
 //! The input must be clean SSA (`opt::clean`), which is what the borrow analysis
 //! expects too.
 use crate::abi::{Sig, Site, STACK_ARG_BASE, SYSV_ARGS};
+use crate::lift::XMM_PARAM;
 use crate::borrow::{analyze_with, Analysis, Class, Ctx, Off, ParamBorrow, Pass, Root, RSP};
 use crate::cfg::Cfg;
 use crate::expr::{self, lit};
@@ -630,6 +631,10 @@ impl Emitter<'_> {
     fn name(&self, v: ValueId) -> String {
         let ty = self.ty(v);
         match (self.entry_param[v.index()], self.f.insts[v].kind) {
+            (Some(_), InstKind::BlockParam(r)) if (XMM_PARAM..XMM_PARAM + 32).contains(&r) => {
+                let k = r - XMM_PARAM;
+                format!("xmm{}{}", k / 2, if k % 2 == 1 { "_hi" } else { "" })
+            }
             (Some(_), InstKind::BlockParam(r)) if r >= STACK_ARG_BASE => format!("arg{}", 6 + (r - STACK_ARG_BASE) as usize),
             (Some(_), InstKind::BlockParam(r)) => REG[r as usize & 15].to_string(),
             _ if self.is_lit(v) && ty == TyId::BOOL => (self.konst(v) != Some(0)).to_string(),
@@ -880,6 +885,11 @@ impl Emitter<'_> {
             let reg = STACK_ARG_BASE + j;
             order.push((find(reg), unused(reg, format!("_arg{}", 6 + j as usize)), typed(reg).and_then(|a| a.ty)));
         }
+        // float arguments arrive as `f64`: the register holds an f32's bits the same way
+        for j in 0..sig.fargs {
+            let reg = XMM_PARAM + 2 * j;
+            order.push((find(reg), format!("_xmm{j}"), Some(TyId::F64)));
+        }
         // anything else on entry (there shouldn't be anything after `abi::apply`)
         for k in 0..params.len() {
             if !order.iter().any(|&(x, _, _)| x == Some(k)) {
@@ -947,6 +957,7 @@ impl Emitter<'_> {
         }
         let ret = match self.sig {
             Some(s) if s.ret2 => " -> (u64, u64)".to_string(),
+            Some(s) if s.fret => " -> f64".to_string(),
             Some(s) if !s.ret => String::new(),
             _ => match self.types.and_then(|t| t.ret) {
                 Some(t) => format!(" -> {}", self.rs(t)),
@@ -1069,6 +1080,9 @@ impl Emitter<'_> {
 
     /// The function's return type (`u64` unless types say otherwise).
     fn ret_ty(&self) -> TyId {
+        if self.sig.is_some_and(|s| s.fret) {
+            return TyId::F64;
+        }
         self.types.and_then(|t| t.ret).unwrap_or(self.u64_ty)
     }
 
@@ -1366,10 +1380,11 @@ impl Emitter<'_> {
             }
             _ => {
                 self.stats.raw += 1;
-                let tys = vec!["u64"; args.len()].join(", ");
+                let want = |k: usize| info.as_ref().and_then(|c| c.arg_tys.get(k).copied().flatten());
+                let tys: Vec<&str> = (0..args.len()).map(|k| if want(k) == Some(TyId::F64) { "f64" } else { "u64" }).collect();
                 let callee = self.as_u64(callee);
                 (
-                    format!("unsafe {{ core::mem::transmute::<u64, unsafe extern \"C\" fn({tys}) -> u64>({callee})({a}) }}"),
+                    format!("unsafe {{ core::mem::transmute::<u64, unsafe extern \"C\" fn({}) -> u64>({callee})({a}) }}", tys.join(", ")),
                     true,
                     false,
                     self.u64_ty,

@@ -102,26 +102,150 @@ impl TyId {
     pub const PTR: TyId = TyId::from_u32(5);  // *mut B1, i.e. *mut u8
     pub const UNIT: TyId = TyId::from_u32(6); // stores, which define no value
     pub const PAIR: TyId = TyId::from_u32(7); // [B8; 2]: a 16-byte rax:rdx return value
-    pub const B16: TyId = TyId::from_u32(8);  // an xmm register, a 128-bit product
 
     #[inline]
     pub fn unknown(bytes: usize) -> TyId {
-        match bytes { 1 => Self::B1, 2 => Self::B2, 4 => Self::B4, 16 => Self::B16, _ => Self::B8 }
+        match bytes { 1 => Self::B1, 2 => Self::B2, 4 => Self::B4, _ => Self::B8 }
     }
 }
 
 /// Per-binary type interner, pre-seeded with the `TyId` constants above.
-pub struct TyTable { pub tys: Arena<TyId, Ty> }
+/// Instructions keep the lifter's storage types (`B1`..`B8`, `BOOL`, ...); the
+/// richer types `types.rs` recovers (signed integers, pointers, structs) are
+/// interned here and live in side tables next to the IR (`types::FnTypes`).
+pub struct TyTable {
+    pub tys: Arena<TyId, Ty>,
+    pub structs: Arena<StructId, StructDef>,
+    lookup: std::collections::HashMap<Ty, TyId>,
+    names: std::collections::HashSet<String>,
+}
+
+/// A recovered struct: from debug info, or inferred from the offsets a pointer
+/// is accessed at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructDef {
+    /// Rust identifier, unique in the table.
+    pub name: String,
+    /// Sorted by offset, non-overlapping. Gaps are padding.
+    pub fields: Vec<Field>,
+    pub size: u32,
+    /// `#[repr(C, packed)]`: the layout doesn't follow C alignment rules, or (for
+    /// inferred structs) the real alignment isn't known.
+    pub packed: bool,
+    /// From DWARF rather than inferred.
+    pub debug: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Field {
+    pub name: String,
+    pub off: u32,
+    pub ty: TyId,
+}
 
 impl TyTable {
     pub fn new() -> Self {
-        let mut tys = Arena::with_capacity(256);
-        for t in [
+        let mut t = TyTable { tys: Arena::with_capacity(256), structs: Arena::with_capacity(0), lookup: Default::default(), names: Default::default() };
+        // Struct names that would shadow the prelude, or the types the emitted
+        // file declares itself (`Bytes`/`Words` for statics).
+        for n in [
+            "Option", "Result", "Vec", "String", "Box", "Some", "None", "Ok", "Err", "Copy", "Clone", "Send", "Sync", "Sized",
+            "Unpin", "Drop", "Fn", "FnMut", "FnOnce", "Iterator", "IntoIterator", "DoubleEndedIterator", "ExactSizeIterator",
+            "Extend", "ToString", "ToOwned", "Default", "Eq", "PartialEq", "Ord", "PartialOrd", "AsRef", "AsMut", "Into", "From",
+            "TryFrom", "TryInto", "FromIterator", "Self", "Bytes", "Words",
+        ] {
+            t.names.insert(n.to_string());
+        }
+        for ty in [
             Ty::Unknown { bytes: 1 }, Ty::Unknown { bytes: 2 }, Ty::Unknown { bytes: 4 }, Ty::Unknown { bytes: 8 },
             Ty::Bool, Ty::RawPtr { pointee: TyId::B1, mutbl: Mutbl::Mut }, Ty::Array { elem: TyId::B1, len: 0 },
-            Ty::Array { elem: TyId::B8, len: 2 }, Ty::Unknown { bytes: 16 },
-        ] { tys.push(t); }
-        TyTable { tys }
+            Ty::Array { elem: TyId::B8, len: 2 },
+        ] {
+            let id = t.tys.push(ty);
+            t.lookup.entry(ty).or_insert(id);
+        }
+        t
+    }
+
+    /// The id of `ty`, adding it if it's new.
+    pub fn intern(&mut self, ty: Ty) -> TyId {
+        if let Some(&id) = self.lookup.get(&ty) {
+            return id;
+        }
+        let id = self.tys.push(ty);
+        self.lookup.insert(ty, id);
+        id
+    }
+
+    /// The id of `ty` if it has been interned.
+    pub fn get(&self, ty: &Ty) -> Option<TyId> {
+        self.lookup.get(ty).copied()
+    }
+
+    pub fn int(&mut self, bytes: usize, signed: bool) -> TyId {
+        self.intern(Ty::Int { bits: (bytes * 8) as u8, signed })
+    }
+
+    pub fn ptr(&mut self, pointee: TyId, mutbl: Mutbl) -> TyId {
+        self.intern(Ty::RawPtr { pointee, mutbl })
+    }
+
+    /// A struct name not used yet, from a C or Rust type name: `list_node` is
+    /// `ListNode`, and anything that isn't an identifier character becomes `_`.
+    pub fn fresh_struct_name(&mut self, base: &str) -> String {
+        let mut s = crate::names::sanitize(base);
+        if s.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_') {
+            s = s.split('_').filter(|w| !w.is_empty()).map(|w| w[..1].to_ascii_uppercase() + &w[1..]).collect();
+            if s.is_empty() || s.starts_with(|c: char| c.is_ascii_digit()) {
+                s.insert(0, 'S');
+            }
+        }
+        let mut n = s.clone();
+        let mut k = 1;
+        while !self.names.insert(n.clone()) {
+            k += 1;
+            n = format!("{s}_{k}");
+        }
+        n
+    }
+
+    /// Adds a struct and its `Ty::Struct`.
+    pub fn add_struct(&mut self, def: StructDef) -> (StructId, TyId) {
+        let sid = self.structs.push(def);
+        (sid, self.intern(Ty::Struct(sid)))
+    }
+
+    /// Size in bytes (pointers are 8, `Fn` is a code address).
+    pub fn size_of(&self, ty: TyId) -> u32 {
+        match self.tys[ty] {
+            Ty::Int { bits, .. } => bits as u32 / 8,
+            Ty::Bool => 1,
+            Ty::F32 => 4,
+            Ty::F64 => 8,
+            Ty::Unknown { bytes } => bytes as u32,
+            Ty::RawPtr { .. } | Ty::Ref { .. } | Ty::Fn(_) => 8,
+            Ty::Slice { .. } => 16,
+            Ty::Array { elem, len } => self.size_of(elem).saturating_mul(len),
+            Ty::Struct(s) => self.structs[s].size,
+        }
+    }
+
+    /// C alignment (1 for packed structs).
+    pub fn align_of(&self, ty: TyId) -> u32 {
+        self.align_at(ty, 0)
+    }
+
+    fn align_at(&self, ty: TyId, depth: u32) -> u32 {
+        if depth > 64 {
+            return 1; // a struct that contains itself: bad debug info
+        }
+        match self.tys[ty] {
+            Ty::Array { elem, .. } => self.align_at(elem, depth + 1),
+            Ty::Struct(s) if self.structs[s].packed => 1,
+            Ty::Struct(s) => self.structs[s].fields.iter().map(|f| self.align_at(f.ty, depth + 1)).max().unwrap_or(1),
+            Ty::Slice { .. } => 8,
+            _ => self.size_of(ty).clamp(1, 8),
+        }
     }
 }
 
@@ -253,108 +377,71 @@ pub enum Proj { Field(u32), Index(ValueId), ConstIndex(u32), Deref, Subslice { f
 pub enum Terminator {
     Jump { to: BlockId, args: ListRef },
     Branch { c: ValueId, t: BlockId, f: BlockId, args: ListRef /* t args then f args */ },
-    /// A jump table: go to `table[v]`. The table lists one block per case value
-    /// 0, 1, 2, ... (stored in `value_pool` as `ValueId`s with the block's index,
-    /// see `block_of`); the same block can appear more than once. There is no
-    /// default: the code before a jump table bounds `v` to the table. Edge
-    /// arguments are per table entry, in table order, like `Branch`'s.
-    Switch { v: ValueId, table: ListRef, args: ListRef },
+    /// A jump table: case `k` goes to block `table[k]` (block ids stored in
+    /// `value_pool`, see `BlockId::as_value`), any other value to `default`. Its
+    /// edges carry no arguments, so every successor of a `Switch` has no block
+    /// parameters (the lifter routes each case through a parameterless block).
+    Switch { v: ValueId, table: ListRef, default: BlockId },
     Return(Option<ValueId>),
     TailCall { callee: ValueId, args: ListRef },
     Unreachable,
 }
 
-/// A `Switch` table entry as stored in `value_pool`.
-#[inline]
-pub fn block_of(v: ValueId) -> BlockId { BlockId::new(v.index()) }
-#[inline]
-pub fn block_entry(b: BlockId) -> ValueId { ValueId::new(b.index()) }
+impl BlockId {
+    /// A block id stored in `value_pool`, for `Switch` tables.
+    #[inline]
+    pub fn as_value(self) -> ValueId { ValueId(self.0) }
+    #[inline]
+    pub fn from_value(v: ValueId) -> BlockId { BlockId(v.0) }
+}
 
-/// Successor blocks of a terminator, in edge-argument order.
-pub enum Succs<'a> {
-    Fixed([Option<BlockId>; 2], usize),
-    Table(std::slice::Iter<'a, ValueId>),
+impl Terminator {
+    /// Successor blocks, each once for a `Switch` (its default first), and in
+    /// edge-argument order for the others (Branch: true edge, then false edge).
+    /// `pool` is the function's `value_pool`, which holds `Switch` tables.
+    #[inline]
+    pub fn successors(self, pool: &[ValueId]) -> Succs<'_> {
+        let (two, table) = match self {
+            Terminator::Jump { to, .. } => ([Some(to), None], &[][..]),
+            Terminator::Branch { t, f, .. } => ([Some(t), Some(f)], &[][..]),
+            Terminator::Switch { table, default, .. } => ([Some(default), None], table.get(pool)),
+            _ => ([None, None], &[][..]),
+        };
+        Succs { two, i: 0, table, k: 0 }
+    }
+}
+
+/// Iterator over a terminator's successors; see `Terminator::successors`.
+pub struct Succs<'a> {
+    two: [Option<BlockId>; 2],
+    i: usize,
+    table: &'a [ValueId],
+    k: usize,
 }
 
 impl Iterator for Succs<'_> {
     type Item = BlockId;
-    #[inline]
     fn next(&mut self) -> Option<BlockId> {
-        match self {
-            Succs::Fixed(s, i) => {
-                while *i < 2 {
-                    *i += 1;
-                    if let Some(b) = s[*i - 1] {
-                        return Some(b);
-                    }
-                }
-                None
-            }
-            Succs::Table(it) => it.next().map(|&v| block_of(v)),
-        }
-    }
-
-    #[inline]
-    fn nth(&mut self, n: usize) -> Option<BlockId> {
-        match self {
-            Succs::Table(it) => it.nth(n).map(|&v| block_of(v)),
-            _ => {
-                for _ in 0..n {
-                    self.next()?;
-                }
-                self.next()
+        while self.i < 2 {
+            self.i += 1;
+            if let Some(b) = self.two[self.i - 1] {
+                return Some(b);
             }
         }
+        // switch cases: each target the first time it appears, unless it's the default
+        while self.k < self.table.len() {
+            let v = self.table[self.k];
+            self.k += 1;
+            if Some(BlockId::from_value(v)) != self.two[0] && !self.table[..self.k - 1].contains(&v) {
+                return Some(BlockId::from_value(v));
+            }
+        }
+        None
     }
 }
 
-impl Terminator {
-    /// Successor blocks, in edge-argument order (Branch: true edge, then false
-    /// edge; Switch: table order). `pool` is the function's `value_pool`.
-    #[inline]
-    pub fn successors(self, pool: &[ValueId]) -> Succs<'_> {
-        match self {
-            Terminator::Jump { to, .. } => Succs::Fixed([Some(to), None], 0),
-            Terminator::Branch { t, f, .. } => Succs::Fixed([Some(t), Some(f)], 0),
-            Terminator::Switch { table, .. } => Succs::Table(table.get(pool).iter()),
-            _ => Succs::Fixed([None, None], 0),
-        }
-    }
-
-    /// The edge arguments of a terminator with successors.
-    #[inline]
-    pub fn edge_args(self) -> Option<ListRef> {
-        match self {
-            Terminator::Jump { args, .. } | Terminator::Branch { args, .. } | Terminator::Switch { args, .. } => Some(args),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    pub fn edge_args_mut(&mut self) -> Option<&mut ListRef> {
-        match self {
-            Terminator::Jump { args, .. } | Terminator::Branch { args, .. } | Terminator::Switch { args, .. } => Some(args),
-            _ => None,
-        }
-    }
-}
-
-impl Function {
-    /// Each edge out of `b` with its arguments, in order.
-    pub fn edges(&self, b: BlockId) -> impl Iterator<Item = (BlockId, &[ValueId])> + '_ {
-        let term = self.blocks[b].term;
-        let args = term.edge_args().unwrap_or(ListRef::EMPTY);
-        let mut at = args.start as usize;
-        term.successors(&self.value_pool).map(move |s| {
-            let n = self.blocks[s].params.len as usize;
-            let a = &self.value_pool[at..at + n];
-            at += n;
-            (s, a)
-        })
-    }
-}
-
-#[derive(Copy, Clone, Debug)] pub enum BinOp { Add, Sub, Mul, UDiv, SDiv, URem, SRem, And, Or, Xor, Shl, LShr, AShr, RotL, RotR }
+/// `UMulHi`/`SMulHi`: the high 64 bits of the full 128-bit product (one-operand `MUL`/`IMUL`).
+#[derive(Copy, Clone, Debug)] pub enum BinOp { Add, Sub, Mul, UMulHi, SMulHi, UDiv, SDiv, URem, SRem, And, Or, Xor, Shl, LShr, AShr, RotL, RotR }
 #[derive(Copy, Clone, Debug)] pub enum UnOp { Neg, Not, Bswap, Popcnt, Ctz, Clz }
 #[derive(Copy, Clone, Debug)] pub enum Cond { Eq, Ne, Ult, Ule, Ugt, Uge, Slt, Sle, Sgt, Sge }
 #[derive(Copy, Clone, Debug)] pub enum CastKind { Trunc, ZExt, SExt, Bitcast, IntToFloat, FloatToInt }

@@ -1,5 +1,6 @@
 //! Read x86_64 machine code out of an object file (ELF, Mach-O or PE) with `object`,
-//! and find the functions and data in it from the symbol table.
+//! and find the functions and data in it from the symbol table, or, for a stripped
+//! binary, from unwind tables and control flow (`discover.rs`).
 use object::{
     Architecture, Object, ObjectKind, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationFlags, RelocationTarget,
     SectionKind, SymbolKind,
@@ -64,6 +65,9 @@ pub struct Binary<'a> {
     /// Pointer-sized slots in `data` that the dynamic loader fills in (GOT entries,
     /// vtables, pointer tables in a PIE), and what they point to.
     pub pointers: BTreeMap<u64, u64>,
+    /// How many of `funcs` came from `discover::functions` rather than a symbol
+    /// (nonzero only when the static symbol table has no functions).
+    pub discovered: usize,
 }
 
 #[derive(Debug)]
@@ -169,7 +173,28 @@ impl<'a> Binary<'a> {
 
         let data: Vec<DataSection> = sections.into_iter().map(|(_, s)| s).collect();
         let pointers = if data.is_empty() { BTreeMap::new() } else { pointers(&file, &data) };
-        Ok(Binary { file, funcs, data, data_syms, pointers })
+
+        // Stripped: no function in the static symbol table, at most the dynamic exports.
+        let stripped = file.kind() != ObjectKind::Relocatable
+            && !file.symbols().any(|s| s.kind() == SymbolKind::Text && s.is_definition());
+        let mut discovered = 0;
+        if stripped {
+            let known: Vec<(u64, u64)> = funcs.iter().map(|f| (f.addr, f.bytes.len() as u64)).collect();
+            for d in crate::discover::functions(&file, &known, pointers.values().copied()) {
+                if let Some(f) = funcs.iter_mut().find(|f| f.addr == d.addr) {
+                    // An export: keep its name. Its size without a static symbol table ran
+                    // to the next export; the unwind table's extent is exact.
+                    f.bytes = code_in(&file, d.addr, d.size).unwrap_or(f.bytes);
+                    continue;
+                }
+                let Some(bytes) = code_in(&file, d.addr, d.size) else { continue };
+                let name = d.name.map_or_else(|| format!("sub_{:x}", d.addr), str::to_string);
+                funcs.push(FuncBytes { name, demangled: None, addr: d.addr, bytes });
+                discovered += 1;
+            }
+            funcs.sort_by_key(|f| f.addr);
+        }
+        Ok(Binary { file, funcs, data, data_syms, pointers, discovered })
     }
 
     pub fn entry(&self) -> u64 {
@@ -184,11 +209,7 @@ impl<'a> Binary<'a> {
     /// Up to `len` bytes of code starting at `addr` (clipped to the end of its
     /// section), for functions the symbol table misses.
     pub fn code_at(&self, addr: u64, len: u64) -> Option<&'a [u8]> {
-        let sec = self.file.sections().find(|s| {
-            s.kind() == SectionKind::Text && addr >= s.address() && addr < s.address() + s.size()
-        })?;
-        let len = len.min(sec.address() + sec.size() - addr);
-        sec.data_range(addr, len).ok().flatten()
+        code_in(&self.file, addr, len)
     }
 
     /// Name of the function that starts at `addr`, if any.
@@ -203,43 +224,12 @@ impl<'a> Binary<'a> {
     }
 }
 
-/// Every allocated section of a linked program at its load address, for reading
-/// jump tables (`lift::Context`). Empty for relocatable objects, whose sections all
-/// sit at address 0 until linked.
-#[derive(Default)]
-pub struct Image<'a> {
-    /// (address, bytes), sorted by address.
-    sections: Vec<(u64, &'a [u8])>,
-}
-
-impl<'a> Image<'a> {
-    pub fn parse(data: &'a [u8]) -> Image<'a> {
-        let Ok(file) = object::File::parse(data) else { return Image::default() };
-        Image::of(&file)
-    }
-
-    pub fn of(file: &object::File<'a>) -> Image<'a> {
-        if file.kind() == ObjectKind::Relocatable {
-            return Image::default();
-        }
-        let mut sections: Vec<(u64, &'a [u8])> = file
-            .sections()
-            .filter(|s| s.address() != 0 && !matches!(s.kind(), SectionKind::UninitializedData | SectionKind::Metadata | SectionKind::Debug | SectionKind::Other))
-            .filter_map(|s| Some((s.address(), s.data().ok().filter(|d| d.len() as u64 == s.size())?)))
-            .collect();
-        sections.sort_by_key(|s| s.0);
-        Image { sections }
-    }
-}
-
-impl Image<'_> {
-    /// `len` bytes at `addr`, if they are all inside one section.
-    pub fn read(&self, addr: u64, len: usize) -> Option<&[u8]> {
-        let i = self.sections.partition_point(|s| s.0 <= addr).checked_sub(1)?;
-        let (start, bytes) = self.sections[i];
-        let off = usize::try_from(addr - start).ok()?;
-        bytes.get(off..off.checked_add(len)?)
-    }
+fn code_in<'a>(file: &object::File<'a>, addr: u64, len: u64) -> Option<&'a [u8]> {
+    let sec = file
+        .sections()
+        .find(|s| s.kind() == SectionKind::Text && addr >= s.address() && addr < s.address() + s.size())?;
+    let len = len.min(sec.address() + sec.size() - addr);
+    sec.data_range(addr, len).ok().flatten()
 }
 
 /// Slots the loader fills with an address: 64-bit dynamic relocations whose

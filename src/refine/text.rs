@@ -83,7 +83,7 @@ fn inst(f: &Function, id: ValueId, e: &mut impl Emit) {
         InstKind::Bin { op, lhs, rhs } => {
             val(e, true, lhs);
             e.lit(match op {
-                BinOp::Add => " +", BinOp::Sub => " -", BinOp::Mul => " *", BinOp::UDiv | BinOp::SDiv => " /",
+                BinOp::Add => " +", BinOp::Sub => " -", BinOp::Mul | BinOp::UMulHi | BinOp::SMulHi => " *", BinOp::UDiv | BinOp::SDiv => " /",
                 BinOp::URem | BinOp::SRem => " %", BinOp::And => " &", BinOp::Or => " |", BinOp::Xor => " ^",
                 BinOp::Shl | BinOp::RotL => " <<", BinOp::LShr | BinOp::AShr | BinOp::RotR => " >>",
             });

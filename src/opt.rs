@@ -45,13 +45,17 @@ pub(crate) fn resolve(repl: &[Option<ValueId>], mut v: ValueId) -> ValueId {
 
 /// (start, len) of each edge argument slice into `target` from block `from`.
 pub(crate) fn edges_into(f: &Function, from: BlockId, target: BlockId, out: &mut Vec<usize>) {
-    let Some(args) = f.blocks[from].term.edge_args() else { return };
-    let mut at = args.start as usize;
-    for s in f.blocks[from].term.successors(&f.value_pool) {
-        if s == target {
-            out.push(at);
+    match f.blocks[from].term {
+        Terminator::Jump { to, args } if to == target => out.push(args.start as usize),
+        Terminator::Branch { t, f: e, args, .. } => {
+            if t == target {
+                out.push(args.start as usize);
+            }
+            if e == target {
+                out.push(args.start as usize + f.blocks[t].params.len as usize);
+            }
         }
-        at += f.blocks[s].params.len as usize;
+        _ => {}
     }
 }
 
@@ -104,8 +108,10 @@ fn remove_param(f: &mut Function, b: BlockId, k: usize, preds: &[BlockId], scrat
         scratch.sort_unstable_by(|a, b| b.cmp(a)); // back to front keeps offsets valid
         for &start in scratch.iter() {
             let pool = &mut f.value_pool;
-            let args = f.blocks[p].term.edge_args_mut().expect("an edge has arguments");
-            list_remove(pool, args, start + k);
+            match &mut f.blocks[p].term {
+                Terminator::Jump { args, .. } | Terminator::Branch { args, .. } => list_remove(pool, args, start + k),
+                _ => unreachable!(),
+            }
         }
     }
     let mut params = f.blocks[b].params;
@@ -275,8 +281,7 @@ pub(crate) fn rewrite_uses(f: &mut Function, repl: &[Option<ValueId>]) {
         match &mut t {
             Terminator::Jump { args, .. } => map_list(&mut f.value_pool, *args, r),
             Terminator::Branch { c, args, .. } => { r(c); map_list(&mut f.value_pool, *args, r) }
-            Terminator::Return(Some(v)) => r(v),
-            Terminator::Switch { v, args, .. } => { r(v); map_list(&mut f.value_pool, *args, r) }
+            Terminator::Return(Some(v)) | Terminator::Switch { v, .. } => r(v),
             Terminator::TailCall { callee, args } => { r(callee); map_list(&mut f.value_pool, *args, r) }
             _ => {}
         }

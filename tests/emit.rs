@@ -55,9 +55,11 @@ fn sum_loop_runs_the_same_in_both_modes() {
     assert!(safe.starts_with("pub fn sum(rdi_ref: &mut [u8], mut rsi: u64, mut rcx: u64) -> u64 {"), "{safe}");
     assert!(!safe.contains("unsafe"), "{safe}");
     assert!(fast.starts_with("pub unsafe fn sum(mut rdi: u64, mut rsi: u64, mut rcx: u64) -> u64 {"), "{fast}");
-    // The loop is structured: exit with `break`, return after it.
-    assert!(fast.contains("    loop {\n") && fast.contains("            break;\n") && !fast.contains("match bb"), "{fast}");
-    assert!(fast.ends_with("    }\n    return v19 as u64;\n}\n"), "{fast}");
+    // The loop is structured: a `while` with the exit test as its condition,
+    // the load inlined into the sum, and the return after it.
+    assert!(fast.contains("    while v6 < rsi {\n") && !fast.contains("match bb"), "{fast}");
+    assert!(fast.contains("(v19, v6) = (v19.wrapping_add(unsafe { (rdi.wrapping_add(v6.wrapping_mul(8)).wrapping_add(0x10) as *const u64).read_unaligned() }), v6.wrapping_add(1));"), "{fast}");
+    assert!(fast.ends_with("    }\n    return v19;\n}\n"), "{fast}");
 
     let main = r#"
 mod fast { include!("fast.rs"); }
@@ -86,6 +88,94 @@ fn main() {
     rustc(&dir, "main.rs", main, &["-o", dir.join("run").to_str().unwrap()]);
     let out = Command::new(dir.join("run")).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// `a || b` folds into one condition, and an irreducible cycle becomes a
+/// `match bb` over just its own blocks; both compile and run like the original.
+#[test]
+fn short_circuits_and_irreducible_regions() {
+    // or2(a, b) = if a == 0 || b > 5 { 1 } else { 2 }
+    let mut a = CodeAssembler::new(64).unwrap();
+    let mut yes = a.create_label();
+    a.test(rdi, rdi).unwrap();
+    a.je(yes).unwrap();
+    a.cmp(rsi, 5).unwrap();
+    a.ja(yes).unwrap();
+    a.mov(eax, 2).unwrap();
+    a.ret().unwrap();
+    a.set_label(&mut yes).unwrap();
+    a.mov(eax, 1).unwrap();
+    a.ret().unwrap();
+    let or2 = emit(&a.assemble(common::BASE).unwrap(), "or2", Mode::Fast);
+    assert!(or2.contains("    if rdi == 0 || rsi > 5 {\n") && !or2.contains("'b"), "{or2}");
+
+    // tangle(a, n, k): rax = k * 2; if a == 0 jump into the middle of the cycle;
+    // the cycle adds 3 and subtracts 1 from n until it is zero; then rax += a.
+    let mut a = CodeAssembler::new(64).unwrap();
+    let (mut top, mut mid, mut out) = (a.create_label(), a.create_label(), a.create_label());
+    a.lea(rax, qword_ptr(rdx + rdx)).unwrap();
+    a.test(rdi, rdi).unwrap();
+    a.je(mid).unwrap();
+    a.set_label(&mut top).unwrap();
+    a.add(rax, 3).unwrap();
+    a.set_label(&mut mid).unwrap();
+    a.test(rsi, rsi).unwrap();
+    a.je(out).unwrap();
+    a.sub(rsi, 1).unwrap();
+    a.jmp(top).unwrap();
+    a.set_label(&mut out).unwrap();
+    a.add(rax, rdi).unwrap();
+    a.ret().unwrap();
+    let tangle = emit(&a.assemble(common::BASE).unwrap(), "tangle", Mode::Fast);
+    // The code before the cycle stays outside the `match`, which has an arm per
+    // block of the cycle only (the exit, with one predecessor, is inlined there).
+    let (before, rest) = tangle.split_once("match bb {").expect(&tangle);
+    assert!(before.contains("rdx.wrapping_add(rdx)") && before.contains("if rdi == 0 {"), "{tangle}");
+    assert_eq!(rest.matches(" => {").count(), 3, "{tangle}");
+
+    let main = r#"
+mod code { include!("code.rs"); }
+fn main() {
+    for (a, b) in [(0, 0), (0, 9), (1, 5), (1, 6), (7, 2)] {
+        assert_eq!(unsafe { code::or2(a, b) }, if a == 0 || b > 5 { 1 } else { 2 });
+    }
+    for (a, n, k) in [(0u64, 0u64, 5u64), (0, 4, 1), (2, 0, 1), (2, 3, 10)] {
+        let adds = if a == 0 { n } else { n + 1 };
+        assert_eq!(unsafe { code::tangle(a, n, k) }, k * 2 + 3 * adds + a);
+    }
+}
+"#;
+    let dir = scratch("tangle");
+    std::fs::write(dir.join("code.rs"), format!("{PRELUDE}{or2}{tangle}").replace("#![allow", "#[allow")).unwrap();
+    rustc(&dir, "main.rs", main, &["-o", dir.join("run").to_str().unwrap()]);
+    let out = Command::new(dir.join("run")).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A jump table comes out as an `if`/`else if` chain on the case, or a `match`
+/// in a state machine, and computes the same thing in both modes.
+#[test]
+fn jump_table_runs() {
+    let (code, table) = common::jump_table(0x3000);
+    let mut f = Function::with_capacity(64, 8);
+    Lifter::new().lift_with_data(&code, common::BASE, &[(0x3000, &table)], &mut f).unwrap();
+    clean(&mut f);
+    verify(&f).unwrap();
+    let mut src = String::from(PRELUDE);
+    for (mode, structure, name) in [(Mode::Fast, true, "fast"), (Mode::Safe, true, "safe"), (Mode::Fast, false, "machine")] {
+        emit_function_with(&f, name, mode, structure, &|_| None, &|_| None, &mut src);
+    }
+    assert!(src.contains(" == 0 {") && src.contains("} else if ") && src.contains("bb = match "), "{src}");
+    let main = format!(
+        "{src}\nfn main() {{\n    for x in [0u64, 1, 2, 3, 7, 1 << 32, u64::MAX] {{\n        \
+         let want = match x as u32 {{ 0 => (x as u32) + 10, 1 => (x as u32) + 20, 2 => (x as u32) + 30, _ => 0 }} as u64;\n        \
+         assert_eq!(fast(x), want, \"{{x}}\");\n        assert_eq!(safe(x), want);\n        \
+         assert_eq!(unsafe {{ machine(x) }}, want);\n    }}\n}}\n"
+    );
+    let dir = scratch("switch");
+    rustc(&dir, "main.rs", &main, &["-o", dir.join("run").to_str().unwrap()]);
+    let out = Command::new(dir.join("run")).output().unwrap();
+    assert!(out.status.success(), "{}\n{main}", String::from_utf8_lossy(&out.stderr));
 }
 
 /// xorshift64*, as in tests/robust.rs.
@@ -206,7 +296,10 @@ fn cli_decompiles_an_elf() {
         let src = String::from_utf8(out.stdout).unwrap();
         assert!(src.contains("pub fn probe() -> u64 {\n    todo!(\"not lifted: unsupported instruction Cpuid at 0x10\")"), "{src}");
         if mode == "safe" {
-            assert!(src.contains("pub fn get_count(rdi_ref: &[u8]) -> u64 {"), "{src}");
+            // one field at offset 8: a struct inferred from the access
+            assert!(src.contains("pub fn get_count(rdi_ref: &S1) -> u64 {"), "{src}");
+            assert!(src.contains("return rdi_ref.f8;"), "{src}");
+            assert!(src.contains("pub struct S1 {\n    pub _pad0: [u8; 8],\n    pub f8: u64,\n}"), "{src}");
         }
         rustc(&dir, &format!("{mode}.rs"), &src, &["--crate-type", "lib", "--emit", "metadata"]);
     }
@@ -268,10 +361,18 @@ fn structured_control_flow_matches_the_state_machine() {
         emit_function_with(&f, &format!("sm{p}"), Mode::Fast, false, &|_| None, &|_| None, &mut sm);
         if stats.state_machines > 0 {
             machines += 1;
-        } else if st.contains("loop {") || st.contains("if ") {
+        } else if st.contains("loop {") || st.contains("while ") || st.contains("if ") {
             structured += 1;
         }
-        let fuel = |src: String, n: u32| src.replace("loop {", &format!("loop {{ fuel!({n});"));
+        // every loop, `while` loops included, burns fuel each time round
+        let fuel = |src: String, n: u32| {
+            let is_loop = |l: &str| {
+                let l = l.trim_start();
+                let l = if l.starts_with('\'') { l.split_once(": ").map_or(l, |x| x.1) } else { l };
+                l.ends_with(" {") && (l == "loop {" || l.starts_with("while "))
+            };
+            src.lines().map(|l| if is_loop(l) { format!("{l} fuel!({n});\n") } else { format!("{l}\n") }).collect::<String>()
+        };
         lib.push_str(&format!("// {code:02x?}\n{}{}", fuel(st, 1_000), fuel(sm, 1_000_000)));
         let arity = sm_arity(&lib, p);
         let args = (0..arity).map(|k| format!("x[{k}]")).collect::<Vec<_>>().join(", ");

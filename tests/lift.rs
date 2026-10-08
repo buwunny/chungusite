@@ -1,11 +1,6 @@
 mod common;
-use chungusite::{
-    dump::dump,
-    ir::{BlockId, Function, Terminator},
-    lift::{Context, LiftError, Lifter},
-    verify::verify,
-};
-use iced_x86::{code_asm::*, BlockEncoderOptions, Code, Instruction, MemoryOperand, Register};
+use chungusite::{dump::dump, ir::{BlockId, Function}, lift::{LiftError, Lifter}, verify::verify};
+use iced_x86::code_asm::*;
 
 #[test]
 fn lifts_loop_with_block_params() {
@@ -207,72 +202,63 @@ fn traps_end_the_block() {
     assert_eq!(out, "bb0():\n  Unreachable\n");
 }
 
-/// Memory for jump tables: one section of bytes at `addr`.
-struct Rodata {
-    addr: u64,
-    bytes: Vec<u8>,
-}
-
-impl Context for Rodata {
-    fn read(&self, addr: u64, len: usize) -> Option<&[u8]> {
-        let off = usize::try_from(addr.checked_sub(self.addr)?).ok()?;
-        self.bytes.get(off..off + len)
-    }
-}
-
-/// `switch (rdi) { case 0: return 10; case 1: return 11; case 2: return 10; }`
-/// through a table of 32-bit offsets, the way PIC code does it. Returns the code
-/// and the table's memory.
-fn switch_code(table_at: u64) -> (Vec<u8>, Rodata) {
-    let mut a = CodeAssembler::new(64).unwrap();
-    let mut ten = a.create_label();
-    let mut eleven = a.create_label();
-    // lea rdx, [rip+table]
-    let lea = Instruction::with2(Code::Lea_r64_m, Register::RDX, MemoryOperand::with_base_displ(Register::RIP, table_at as i64)).unwrap();
-    a.add_instruction(lea).unwrap();
-    a.movsxd(rax, dword_ptr(rdx + rdi * 4)).unwrap();
-    a.add(rax, rdx).unwrap();
-    a.jmp(rax).unwrap();
-    a.set_label(&mut ten).unwrap();
-    a.mov(eax, 10).unwrap();
-    a.ret().unwrap();
-    a.set_label(&mut eleven).unwrap();
-    a.mov(eax, 11).unwrap();
-    a.ret().unwrap();
-    a.int3().unwrap(); // padding: not a target
-    let r = a.assemble_options(0x1000, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS).unwrap();
-    let ten = r.label_ip(&ten).unwrap();
-    let eleven = r.label_ip(&eleven).unwrap();
-    let mut bytes = Vec::new();
-    for t in [ten, eleven, ten] {
-        bytes.extend_from_slice(&((t as i64 - table_at as i64) as i32).to_le_bytes());
-    }
-    // what follows the table isn't an instruction in this function, so the table ends
-    bytes.extend_from_slice(&0x7fff_0000i32.to_le_bytes());
-    (r.inner.code_buffer, Rodata { addr: table_at, bytes })
+#[test]
+fn one_operand_mul_writes_both_halves() {
+    let out = ir(|a| {
+        a.mov(rax, rdi).unwrap();
+        a.mul(rsi).unwrap();
+        a.seto(cl).unwrap(); // CF = OF = the high half isn't zero
+        a.add(rax, rdx).unwrap();
+        a.ret().unwrap();
+    });
+    assert!(out.contains("v2 = Mul v0, v1\n  v3 = UMulHi v0, v1\n"), "{out}");
+    assert!(out.contains("cmp.Ne"), "{out}");
+    assert!(out.contains("Add v2, v3"), "{out}");
 }
 
 #[test]
-fn jump_table_becomes_a_switch() {
-    let (code, mem) = switch_code(0x8000);
+fn sixteen_byte_copies_and_zeroing() {
+    let out = ir(|a| {
+        a.movups(xmm0, xmmword_ptr(rsi)).unwrap();
+        a.movups(xmmword_ptr(rdi), xmm0).unwrap();
+        a.xorps(xmm1, xmm1).unwrap();
+        a.movaps(xmmword_ptr(rdi + 16), xmm1).unwrap();
+        a.ret().unwrap();
+    });
+    let expected = "\
+bb0(v15, v0, v5):
+  v1 = ptr v0 + 0
+  v2 = load v1
+  v3 = ptr v1 + 8
+  v4 = load v3
+  v6 = ptr v5 + 0
+  v7 = ptr v6 + 8
+  store v6 <- v2
+  store v7 <- v4
+  v10 = const 0x0
+  v11 = ptr v5 + 16
+  v12 = ptr v11 + 8
+  store v11 <- v10
+  store v12 <- v10
+  ret v15
+";
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn jump_tables_become_switches() {
+    let (code, table) = common::jump_table(0x3000);
     let mut f = Function::with_capacity(64, 8);
-    Lifter::new().lift_in(&code, 0x1000, Some(&mem), &mut f).unwrap();
+    Lifter::new().lift_with_data(&code, common::BASE, &[(0x3000, &table)], &mut f).unwrap();
     verify(&f).unwrap();
-    let Terminator::Switch { v, .. } = f.blocks[f.entry].term else { panic!("{}", dump(&f)) };
-    let targets: Vec<BlockId> = f.blocks[f.entry].term.successors(&f.value_pool).collect();
-    assert_eq!(targets.len(), 3, "{}", dump(&f));
-    assert_eq!(targets[0], targets[2]);
-    assert_ne!(targets[0], targets[1]);
-    // the index is rdi as the table load read it
-    assert!(matches!(f.insts[v].kind, chungusite::ir::InstKind::BlockParam(7)), "{}", dump(&f));
-}
+    let out = dump(&f);
+    // one parameterless block per case target (bb7..bb9) passes the registers on
+    assert!(out.contains("switch v6 [bb7, bb8, bb9] default bb9"), "{out}");
+    assert!(out.contains("bb7():\n  jump bb2(v4)"), "{out}");
 
-#[test]
-fn jump_table_without_memory_is_unsupported() {
-    let (code, _) = switch_code(0x8000);
-    let mut f = Function::with_capacity(64, 8);
-    let err = Lifter::new().lift(&code, 0x1000, &mut f).unwrap_err();
-    assert!(matches!(err, LiftError::Unsupported { .. }), "{err:?}");
+    // Without the table the jump can't be followed: unsupported, not a tail call.
+    let err = Lifter::new().lift(&code, common::BASE, &mut f).unwrap_err();
+    assert!(matches!(err, LiftError::Unsupported { mnemonic: iced_x86::Mnemonic::Jmp, .. }), "{err:?}");
 }
 
 #[test]
@@ -282,27 +268,4 @@ fn indirect_jump_without_a_table_is_a_tail_call() {
         a.jmp(rax).unwrap();
     });
     assert!(out.contains("tailcall"), "{out}");
-}
-
-#[test]
-fn sse_copy_stays_in_the_block() {
-    let out = ir(|a| {
-        a.movups(xmm0, xmmword_ptr(rsi)).unwrap();
-        a.movups(xmmword_ptr(rdi), xmm0).unwrap();
-        a.xorps(xmm1, xmm1).unwrap();
-        a.movdqu(xmmword_ptr(rdi + 16), xmm1).unwrap();
-        a.ret().unwrap();
-    });
-    assert_eq!(out.matches("store").count(), 2, "{out}");
-    // an xmm register live into a block isn't tracked
-    let mut a = CodeAssembler::new(64).unwrap();
-    let mut next = a.create_label();
-    a.xorps(xmm0, xmm0).unwrap();
-    a.jmp(next).unwrap();
-    a.set_label(&mut next).unwrap();
-    a.movups(xmmword_ptr(rdi), xmm0).unwrap();
-    a.ret().unwrap();
-    let code = a.assemble(0x1000).unwrap();
-    let mut f = Function::with_capacity(16, 4);
-    assert!(matches!(Lifter::new().lift(&code, 0x1000, &mut f), Err(LiftError::Unsupported { .. })));
 }

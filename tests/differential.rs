@@ -2,14 +2,16 @@
 //! the same thing as the machine code it came from?
 //!
 //! `tests/differential/corpus.c` is compiled with every C compiler found (`cc`,
-//! `clang`) at -O1, -O2 and -Os, and the object file is also linked into a program
-//! (`-nostartfiles`), so that its data and jump tables sit at real addresses. Each
-//! function in that program is lifted, cleaned and emitted in both modes, exactly as
-//! the CLI does, with the data it points into as statics. A generated Rust program
-//! links the original object file next to the decompiled source and calls both on the
-//! same random inputs, comparing return values and every byte of every buffer
-//! argument afterwards. Each (function, mode) runs in its own process, so a crash or
-//! an infinite loop in decompiled code is reported against that function alone.
+//! `clang`) at -O1, -O2 and -Os, each once without and once with debug info (`+g`,
+//! where types come from DWARF instead of inference). The object file is also
+//! linked into a program (`-nostartfiles`), so that its data and jump tables sit at
+//! real addresses. Each function in that program is lifted, cleaned and emitted in
+//! both modes, exactly as the CLI does, with the data it points into as statics. A
+//! generated Rust program links the original object file next to the decompiled
+//! source and calls both on the same random inputs, comparing return values and
+//! every byte of every buffer argument afterwards. Each (function, mode) runs in
+//! its own process, so a crash or an infinite loop in decompiled code is reported
+//! against that function alone.
 //!
 //! A function that doesn't lift yet is counted, not failed: the pass rate printed at
 //! the end is the share of (compiler, -O level, function) combinations that lift and
@@ -28,7 +30,7 @@ use chungusite::{
     emit::Mode,
     globals::{Globals, PRELUDE},
     load::Binary,
-    program::{Input, Program},
+    program::{BuildOptions, Input, Program},
 };
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -165,7 +167,7 @@ const SYSV: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
 /// callees' signatures, with the corpus cases selected for emission, and data the
 /// code points into as statics. Also returns each mode's prelude (the `extern "C"`
 /// block for callees that aren't emitted, and the statics).
-fn decompile(file: &[u8], cases: &[Case]) -> (Vec<Decompiled>, [String; 2]) {
+fn decompile(file: &[u8], cases: &[Case], dwarf: bool) -> (Vec<Decompiled>, [String; 2]) {
     let bin = Binary::parse(file).expect("compiler output should parse");
     let inputs = bin
         .funcs
@@ -179,7 +181,7 @@ fn decompile(file: &[u8], cases: &[Case]) -> (Vec<Decompiled>, [String; 2]) {
     let by_addr: HashMap<u64, &str> = bin.funcs.iter().map(|f| (f.addr, f.name.as_str())).collect();
     let globals = Globals::new(&bin, used, &by_addr);
     let global_of = |addr: u64| globals.expr(addr);
-    let program = Program::build(inputs, Some(file), false);
+    let program = Program::build_with(inputs, Some(file), false, BuildOptions { dwarf, model: None });
     let [fast, safe] = [Mode::Fast, Mode::Safe].map(|m| program.emit_all(m, &global_of));
     let decompiled = cases
         .iter()
@@ -229,36 +231,43 @@ fn decompile(file: &[u8], cases: &[Case]) -> (Vec<Decompiled>, [String; 2]) {
 // Generating the runner program
 
 /// How to pass each parameter of an emitted function, from its signature line, e.g.
-/// `pub unsafe fn get8(mut rdi: u64, mut rsi: u64) -> u64 {`. Errs when the harness
-/// can't call it (a slice for an argument that the C code takes as an integer).
+/// `pub unsafe fn get8(mut rdi: u64, rsi: i32) -> u64 {`. Parameters are named after
+/// their register (`rdi`, `rdi_ref`, `rdi_p`, `arg6`) or, with debug info, after
+/// the C parameter, in order. Errs when the harness can't call it (a slice for an
+/// argument that the C code takes as an integer).
 fn call_args(src: &str, case: &Case) -> Result<String, String> {
     let sig = src.lines().find(|l| l.starts_with("pub ")).ok_or("no signature in emitted code")?;
     let close = sig.rfind(") -> ").or_else(|| sig.rfind(") {")).ok_or("unexpected signature")?;
     let params = &sig[sig.find('(').unwrap() + 1..close];
     let mut out = Vec::new();
-    for p in params.split(", ").filter(|p| !p.is_empty()) {
+    for (pos, p) in params.split(", ").filter(|p| !p.is_empty()).enumerate() {
         let p = p.strip_prefix("mut ").unwrap_or(p);
         let (name, ty) = p.split_once(": ").ok_or_else(|| format!("unexpected parameter `{p}`"))?;
-        let reg = name.strip_suffix("_ref").unwrap_or(name);
-        // rdi..r9, then arg6, arg7, ... on the stack; `_rdx` is an argument the
-        // decompiled function takes but doesn't use
-        let idx = SYSV
-            .iter()
-            .position(|&r| r == reg)
-            .or_else(|| reg.strip_prefix("arg").and_then(|n| n.parse().ok()))
-            .filter(|&i| i < case.args.len());
+        // `_rdx`, `_n`: an argument the decompiled function takes but doesn't use
+        let name = name.strip_prefix('_').unwrap_or(name);
+        let reg = name.strip_suffix("_ref").or_else(|| name.strip_suffix("_p")).unwrap_or(name);
+        let by_reg = SYSV.iter().position(|&r| r == reg).or_else(|| reg.strip_prefix("arg").and_then(|n| n.parse().ok()));
+        let named = by_reg.is_none() && reg != "rsp";
+        let idx = if named { Some(pos) } else { by_reg }.filter(|&i| i < case.args.len());
+        let buf = |i: usize| matches!(case.args[i], Arg::Buf(_) | Arg::Str(_));
         out.push(match (ty, idx) {
-            ("u64", Some(i)) => format!("a.reg({i})"),
-            ("u64", None) if reg == "rsp" => "a.stack()".to_string(),
-            ("u64", None) => "a.junk()".to_string(),
-            (_, Some(i)) if matches!(case.args[i], Arg::Buf(_) | Arg::Str(_)) => match ty {
-                "&[u8]" => format!("a.shared({i})"),
-                "&mut [u8]" => format!("a.slice({i})"),
-                "Option<&[u8]>" => format!("Some(a.shared({i}))"),
-                "Option<&mut [u8]>" => format!("Some(a.slice({i}))"),
-                _ => return Err(format!("unexpected parameter type `{ty}`")),
-            },
-            _ => return Err(format!("safe mode takes `{reg}` as `{ty}`, but the C function has no pointer argument there")),
+            (_, None) if reg == "rsp" => "a.stack()".to_string(),
+            (_, None) => format!("a.junk() as {}", if ty.starts_with('*') { "_" } else { ty }),
+            ("&[u8]", Some(i)) if buf(i) => format!("a.shared({i})"),
+            ("&mut [u8]", Some(i)) if buf(i) => format!("a.slice({i})"),
+            ("Option<&[u8]>", Some(i)) if buf(i) => format!("Some(a.shared({i}))"),
+            ("Option<&mut [u8]>", Some(i)) if buf(i) => format!("Some(a.slice({i}))"),
+            // a struct the buffer holds
+            (t, Some(i)) if buf(i) && t.starts_with("&mut ") => format!("&mut *(a.reg({i}) as *mut _)"),
+            (t, Some(i)) if buf(i) && t.starts_with('&') => format!("&*(a.reg({i}) as *const _)"),
+            (t, Some(i)) if buf(i) && t.starts_with("Option<&mut ") => format!("Some(&mut *(a.reg({i}) as *mut _))"),
+            (t, Some(i)) if buf(i) && t.starts_with("Option<&") => format!("Some(&*(a.reg({i}) as *const _))"),
+            (t, Some(_)) if t.starts_with('&') || t.starts_with("Option<") => {
+                return Err(format!("safe mode takes `{reg}` as `{ty}`, but the C function has no pointer argument there"))
+            }
+            ("bool", Some(i)) => format!("a.reg({i}) as u8 != 0"),
+            (t, Some(i)) if t.starts_with('*') => format!("a.reg({i}) as _"),
+            (t, Some(i)) => format!("a.reg({i}) as {t}"),
         });
     }
     Ok(out.join(", "))
@@ -330,7 +339,7 @@ fn runner_source(funcs: &[&Decompiled], prelude: &[String; 2]) -> (String, Strin
             Ok(args) if !src.lines().find(|l| l.starts_with("pub ")).unwrap_or("").contains(") -> ") => {
                 format!("Ok(|a: &mut Args| unsafe {{ {m}::{}({args}); 0 }})", c.name)
             }
-            Ok(args) => format!("Ok(|a: &mut Args| unsafe {{ {m}::{}({args}) }})", c.name),
+            Ok(args) => format!("Ok(|a: &mut Args| unsafe {{ Ret::bits({m}::{}({args})) }})", c.name),
             Err(e) => format!("Err({e:?})"),
         };
         let _ = writeln!(
@@ -346,7 +355,7 @@ fn runner_source(funcs: &[&Decompiled], prelude: &[String; 2]) -> (String, Strin
     (main, fast, safe)
 }
 
-const ALLOW: &str = "#[allow(unused_mut, unused_variables, unused_assignments, unreachable_code, non_snake_case, unused_parens, unused_unsafe, dead_code)]\n";
+const ALLOW: &str = "#[allow(unused_mut, unused_variables, unused_assignments, unreachable_code, non_snake_case, non_camel_case_types, unused_parens, unused_unsafe, dead_code)]\n";
 
 const RUNNER: &str = r##"#![allow(unused_unsafe, unused_parens, dead_code, unreachable_code)]
 mod fast { include!("fast.rs"); }
@@ -357,6 +366,14 @@ mod c {
 }
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
+
+/// A decompiled function's return value as the bits it leaves in rax.
+trait Ret { fn bits(self) -> u64; }
+macro_rules! ret { ($($t:ty => $u:ty),*) => { $(impl Ret for $t { fn bits(self) -> u64 { self as $u as u64 } })* } }
+ret!(u8 => u8, u16 => u16, u32 => u32, u64 => u64, i8 => u8, i16 => u16, i32 => u32, i64 => u64, bool => u8);
+impl<T> Ret for *mut T { fn bits(self) -> u64 { self as u64 } }
+impl<T> Ret for *const T { fn bits(self) -> u64 { self as u64 } }
+impl Ret for (u64, u64) { fn bits(self) -> u64 { self.0 } }
 
 enum A { Int { bits: u32, signed: bool, lo: i128, hi: i128, full: bool }, Buf(usize), Str(usize) }
 #[derive(Clone, Copy)]
@@ -526,6 +543,8 @@ struct Variant {
     label: String,
     cc: String,
     opt: &'static str,
+    /// Compile with `-g` and use the debug info.
+    dwarf: bool,
 }
 
 fn compilers() -> Vec<String> {
@@ -577,7 +596,8 @@ fn check_variant(v: &Variant, cases: &[Case], corpus: &Path, root: &Path) -> Vec
     let dir = root.join(&v.label);
     std::fs::create_dir_all(&dir).unwrap();
     let obj = dir.join("corpus.o");
-    let out = Command::new(&v.cc).args([v.opt, "-c", "-o"]).arg(&obj).arg(corpus).output().unwrap();
+    let g: &[&str] = if v.dwarf { &["-g"] } else { &[] };
+    let out = Command::new(&v.cc).arg(v.opt).args(g).args(["-c", "-o"]).arg(&obj).arg(corpus).output().unwrap();
     assert!(out.status.success(), "{} {} failed on corpus.c:\n{}", v.cc, v.opt, String::from_utf8_lossy(&out.stderr));
 
     // Decompile the object linked into a program, as a decompiler would see it:
@@ -586,7 +606,7 @@ fn check_variant(v: &Variant, cases: &[Case], corpus: &Path, root: &Path) -> Vec
     let linked = dir.join("corpus.elf");
     let out = Command::new(&v.cc).arg("-nostartfiles").arg("-o").arg(&linked).arg(&obj).output().unwrap();
     assert!(out.status.success(), "{} failed to link corpus.o:\n{}", v.cc, String::from_utf8_lossy(&out.stderr));
-    let (decompiled, prelude) = decompile(&std::fs::read(&linked).unwrap(), cases);
+    let (decompiled, prelude) = decompile(&std::fs::read(&linked).unwrap(), cases, v.dwarf);
     let lifted: Vec<&Decompiled> = decompiled.iter().filter(|d| d.result.is_ok()).collect();
     let (main, fast, safe) = runner_source(&lifted, &prelude);
     std::fs::write(dir.join("fast.rs"), fast).unwrap();
@@ -657,7 +677,10 @@ fn decompiled_c_matches_the_original() {
     for cc in &ccs {
         let label = compiler_label(cc);
         for opt in OPT_LEVELS {
-            variants.push(Variant { label: format!("{label}{opt}"), cc: cc.clone(), opt });
+            for dwarf in [false, true] {
+                let g = if dwarf { "+g" } else { "" };
+                variants.push(Variant { label: format!("{label}{opt}{g}"), cc: cc.clone(), opt, dwarf });
+            }
         }
     }
 

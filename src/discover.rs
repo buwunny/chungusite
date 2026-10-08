@@ -5,6 +5,7 @@
 //!   exact start and length of every function compiled with unwind info, which
 //!   is nearly all of them on x86_64;
 //! * the dynamic symbols (exports), which `strip` keeps;
+//! * Mach-O's `LC_FUNCTION_STARTS`, which `strip` keeps too: every start, no sizes;
 //! * the entry point and the start of each code section (`_init`, `_fini`);
 //! * targets of direct calls, `lea reg, [rip+x]` into code (function pointers,
 //!   `main` in `_start`), and code addresses stored in data (vtables, tables);
@@ -12,14 +13,17 @@
 //!
 //! Functions without unwind info end where control flow from their start stops
 //! (the last instruction reached before the next known start, following jump
-//! tables and stopping at calls to imports that don't return, like
-//! `__stack_chk_fail`), so the padding
-//! after them is not included and whatever follows the padding is checked for
-//! a prologue. A candidate strictly inside an FDE's range is rejected: unwind
-//! info is authoritative, and such addresses are mostly the cold half of a
-//! split function or a misread of something that isn't a call.
+//! tables and stopping at calls that don't return), so the padding after them
+//! is not included and whatever follows the padding is checked for a prologue.
+//! A call doesn't return if it goes to an import like `__stack_chk_fail` or
+//! `abort` (through the PLT or the GOT), to a function with such a name, or to
+//! a function every path through which ends in a call that doesn't return or
+//! a trap (`ud2`, `hlt`, `int3`). A candidate strictly inside an FDE's range is
+//! rejected: unwind info is authoritative, and such addresses are mostly the
+//! cold half of a split function or a misread of something that isn't a call.
 use iced_x86::{Code, ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
-use object::{Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationTarget, SectionKind};
+use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, ObjectSymbolTable, RelocationTarget, SectionKind};
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// A function found without the symbol table.
@@ -37,9 +41,10 @@ struct Text<'a> {
 }
 
 /// Discover the functions in `file`. `known` are functions that are already
-/// known with their sizes (dynamic exports); `pointers` are values the loader
-/// writes into data (`Binary::pointers`), some of which are function addresses.
-pub fn functions(file: &object::File, known: &[(u64, u64)], pointers: impl IntoIterator<Item = u64>) -> Vec<Found> {
+/// known with their sizes (dynamic exports); `pointers` are the slots the loader
+/// fills in and the values it writes there (`Binary::pointers`), some of which
+/// are function addresses.
+pub fn functions(file: &object::File, known: &[(u64, u64)], pointers: &BTreeMap<u64, u64>) -> Vec<Found> {
     let mut code: Vec<Text> = file
         .sections()
         .filter(|s| s.kind() == SectionKind::Text && s.size() > 0 && !is_stub_section(s.name().unwrap_or("")))
@@ -47,7 +52,8 @@ pub fn functions(file: &object::File, known: &[(u64, u64)], pointers: impl IntoI
         .collect();
     code.sort_by_key(|c| c.addr);
     let in_code = |a: u64| code.iter().position(|c| a >= c.addr && a < c.addr + c.bytes.len() as u64);
-    let img = Image::new(file);
+    let mut img = Image::new(file);
+    img.slots = pointers.iter().map(|(&s, &a)| (s, a)).collect();
 
     // Exact ranges: unwind tables and exported symbols.
     let mut exact: BTreeMap<u64, u64> = BTreeMap::new();
@@ -79,8 +85,11 @@ pub fn functions(file: &object::File, known: &[(u64, u64)], pointers: impl IntoI
     for c in &code {
         seed(c.addr, &mut starts);
     }
-    for p in pointers {
+    for &p in pointers.values() {
         seed(p, &mut starts);
+    }
+    for a in function_starts(file) {
+        seed(a, &mut starts);
     }
     if file.entry() != 0 {
         names.insert(file.entry(), "_start");
@@ -121,6 +130,13 @@ pub fn functions(file: &object::File, known: &[(u64, u64)], pointers: impl IntoI
             }
         }
         if new.is_empty() {
+            // Functions found not to return end their callers' paths: walk
+            // those again before looking at what is left between functions.
+            let found: HashSet<u64> = starts.iter().copied().filter(|a| !walked[a].returns && img.noreturn.insert(*a)).collect();
+            if !found.is_empty() {
+                walked.retain(|_, w| !w.calls(&img).any(|t| found.contains(&t)));
+                continue;
+            }
             // Prologues in the gaps between functions.
             let mut covered: Vec<(u64, u64)> = starts.iter().map(|a| (*a, walked[a].end)).collect();
             covered.sort_unstable();
@@ -183,6 +199,24 @@ struct Walk {
     /// The last code address loaded into rdi before the first indirect call
     /// (`main`, when this is `_start`).
     rdi_code_ref: Option<u64>,
+    /// Some path leaves the function normally: through a `ret`, a tail call to
+    /// a function that returns, an indirect jump that isn't a jump table, or by
+    /// running into `limit` or bytes that don't decode (where it goes is unknown).
+    /// False if every path ends in a call that doesn't return or a trap
+    /// (`ud2`, `hlt`, `int3`).
+    returns: bool,
+    /// The memory operands of `call [rip+slot]` and `jmp [rip+slot]` (GOT slots).
+    slots: Vec<u64>,
+}
+
+impl Walk {
+    /// What the calls and tail calls go to, directly or through a GOT slot
+    /// (and what the loader puts in the slot): if one of them turns out not to
+    /// return, this walk may end sooner.
+    fn calls<'a>(&'a self, img: &'a Image) -> impl Iterator<Item = u64> + 'a {
+        let slots = self.slots.iter().flat_map(|s| std::iter::once(*s).chain(img.slots.get(s).copied()));
+        self.refs.iter().copied().chain(slots)
+    }
 }
 
 /// Follow control flow from `start` without leaving `[start, limit)`. If
@@ -197,6 +231,8 @@ fn walk(img: &Image, bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk 
     let mut rdi_done = false;
     // rip-relative addresses taken with `lea`: candidate jump table bases.
     let mut leas = Vec::new();
+    let mut returns = false;
+    let mut slots = Vec::new();
     let mut insn = Instruction::default();
     while let Some(at) = todo.pop() {
         let mut ip = at;
@@ -204,7 +240,14 @@ fn walk(img: &Image, bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk 
         // cases its `ja` (`jae`) leaves
         let mut cmp_imm: Option<u64> = None;
         let mut cases = None;
-        while ip < limit && seen.insert(ip) {
+        // Cleared where the path ends in a known way: at a jump, a return, a
+        // call that doesn't return, a trap, or code already walked.
+        let mut open = true;
+        while ip < limit {
+            if !seen.insert(ip) {
+                open = false;
+                break;
+            }
             dec.set_ip(ip);
             if dec.set_position((ip - start) as usize).is_err() {
                 break;
@@ -248,22 +291,31 @@ fn walk(img: &Image, bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk 
                 };
             }
             cmp_imm = imm;
+            let slot = insn.is_ip_rel_memory_operand().then(|| insn.ip_rel_memory_address());
             match insn.flow_control() {
                 FlowControl::Call if insn.op0_kind() == OpKind::NearBranch64 => {
                     let t = insn.near_branch_target();
                     refs.push(t);
                     if img.noreturn.contains(&t) {
+                        open = false;
                         break;
                     }
                 }
                 FlowControl::IndirectCall => {
                     rdi_done = true;
-                    if insn.is_ip_rel_memory_operand() && img.noreturn.contains(&insn.ip_rel_memory_address()) {
+                    slots.extend(slot);
+                    if slot.is_some_and(|s| img.slot_noreturn(s)) {
+                        open = false;
                         break;
                     }
                 }
                 FlowControl::IndirectBranch => {
-                    todo.extend(jump_table(&insn, img, &leas, start, limit, cases));
+                    let cases = jump_table(&insn, img, &leas, start, limit, cases);
+                    slots.extend(slot);
+                    // Without a table, a tail call through a register or the GOT.
+                    returns |= cases.is_empty() && !slot.is_some_and(|s| img.slot_noreturn(s));
+                    todo.extend(cases);
+                    open = false;
                     break;
                 }
                 FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch
@@ -274,22 +326,86 @@ fn walk(img: &Image, bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk 
                         todo.push(t);
                     } else {
                         refs.push(t); // tail call
+                        returns |= !img.noreturn.contains(&t);
                     }
                     if insn.flow_control() == FlowControl::UnconditionalBranch {
+                        open = false;
                         break;
                     }
                 }
-                FlowControl::Return | FlowControl::Interrupt => break,
-                FlowControl::Exception if insn.mnemonic() == Mnemonic::Ud2 => break,
-                _ if insn.mnemonic() == Mnemonic::Hlt => break,
+                FlowControl::Return => {
+                    returns = true;
+                    open = false;
+                    break;
+                }
+                FlowControl::Interrupt => {
+                    // `int3` is a trap; `int n` is a system call, which may return.
+                    returns |= insn.mnemonic() != Mnemonic::Int3;
+                    open = false;
+                    break;
+                }
+                FlowControl::Exception if insn.mnemonic() == Mnemonic::Ud2 => {
+                    open = false;
+                    break;
+                }
+                _ if insn.mnemonic() == Mnemonic::Hlt => {
+                    open = false;
+                    break;
+                }
                 _ => {}
             }
         }
+        returns |= open;
     }
     if exact {
         end = limit;
     }
-    Walk { limit, end, refs, rdi_code_ref: rdi }
+    Walk { limit, end, refs, rdi_code_ref: rdi, returns, slots }
+}
+
+/// Where a call never returns, for the lifter: the PLT stubs and GOT slots of
+/// imports that don't return (`noreturn`), the functions among `funcs` (start,
+/// bytes, symbol name) that don't, by name or because every path through them
+/// ends in a call that doesn't return or a trap, and the GOT slots the loader
+/// fills with one of those functions (`slots`: slot -> address). Rust calls
+/// `handle_alloc_error` and the panic functions through such slots.
+pub fn noreturn_calls(file: &object::File, funcs: &[(u64, &[u8], &str)], slots: &HashMap<u64, u64>) -> HashSet<u64> {
+    let mut img = Image::new(file);
+    img.slots = slots.clone();
+    img.noreturn.extend(funcs.iter().filter(|f| noreturn(f.2)).map(|f| f.0));
+    let walk_one = |img: &Image, &(a, bytes, _): &(u64, &[u8], &str)| walk(img, bytes, a, a + bytes.len() as u64, true);
+    let walks: Vec<Walk> = funcs.par_iter().map(|f| walk_one(&img, f)).collect();
+    // Callee or slot -> the functions that call it, to know what to walk again.
+    let mut callers: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, w) in walks.iter().enumerate() {
+        for t in w.calls(&img) {
+            callers.entry(t).or_default().push(i);
+        }
+    }
+    let by_addr: HashMap<u64, usize> = funcs.iter().enumerate().map(|(i, f)| (f.0, i)).collect();
+    let mut via_slot: HashMap<u64, Vec<u64>> = HashMap::new();
+    for (&s, &t) in &img.slots {
+        if by_addr.contains_key(&t) {
+            via_slot.entry(t).or_default().push(s);
+        }
+    }
+    let mut found: Vec<usize> = (0..funcs.len()).filter(|&i| !walks[i].returns).collect();
+    while !found.is_empty() {
+        let mut dirty = BTreeSet::new();
+        for &i in &found {
+            let a = funcs[i].0;
+            if img.noreturn.insert(a) {
+                for t in std::iter::once(a).chain(via_slot.get(&a).into_iter().flatten().copied()) {
+                    dirty.extend(callers.get(&t).into_iter().flatten().copied());
+                }
+            }
+        }
+        let dirty: Vec<usize> = dirty.into_iter().filter(|&i| !img.noreturn.contains(&funcs[i].0)).collect();
+        found = dirty.into_par_iter().filter(|&i| !walk_one(&img, &funcs[i]).returns).collect();
+    }
+    let slots: Vec<u64> = img.slots.iter().filter(|(_, t)| img.noreturn.contains(t)).map(|(&s, _)| s).collect();
+    img.noreturn.extend(slots);
+    img.noreturn
 }
 
 /// The cases of a jump table behind the indirect `jmp` `insn`, as far as they
@@ -331,8 +447,11 @@ fn jump_table(insn: &Instruction, img: &Image, leas: &[u64], start: u64, limit: 
 struct Image<'a> {
     /// Loaded sections, sorted by address, for reading jump tables.
     mem: Vec<(u64, &'a [u8])>,
-    /// PLT stubs and GOT slots of imports that don't return.
+    /// PLT stubs and GOT slots of imports that don't return, and functions
+    /// known not to return.
     noreturn: HashSet<u64>,
+    /// Slots the loader fills with an address in the binary (GOT entries).
+    slots: HashMap<u64, u64>,
 }
 
 impl<'a> Image<'a> {
@@ -346,7 +465,12 @@ impl<'a> Image<'a> {
         let got = got_names(file);
         let plt = plt_names(file, &got);
         let noreturn = plt.iter().chain(&got).filter(|(_, n)| noreturn(n)).map(|(&a, _)| a).collect();
-        Image { mem, noreturn }
+        Image { mem, noreturn, slots: HashMap::new() }
+    }
+
+    /// `call [rip+slot]` doesn't return: the slot holds an import or a function that doesn't.
+    fn slot_noreturn(&self, slot: u64) -> bool {
+        self.noreturn.contains(&slot) || self.slots.get(&slot).is_some_and(|t| self.noreturn.contains(t))
     }
 
     fn read(&self, addr: u64, n: usize) -> Option<&[u8]> {
@@ -356,18 +480,77 @@ impl<'a> Image<'a> {
     }
 }
 
-/// Imports that don't return: code after a call to one belongs to the next function.
-/// Imports that never return: a call to one ends its block.
+/// Functions that never return, by symbol name: a call to one ends its block,
+/// and code after it belongs to the next function. C library imports, and the
+/// Rust standard library's panic and allocation-failure functions (`-> !`),
+/// which a Rust binary defines itself and often calls through the GOT.
 pub fn noreturn(name: &str) -> bool {
     let name = name.split('@').next().unwrap_or(name);
-    matches!(
+    if matches!(
         name,
         "abort" | "exit" | "_exit" | "_Exit" | "quick_exit" | "__stack_chk_fail" | "__assert_fail"
             | "__assert_perror_fail" | "__fortify_fail" | "__chk_fail" | "err" | "errx" | "verr" | "verrx"
             | "longjmp" | "siglongjmp" | "__longjmp_chk" | "pthread_exit" | "__cxa_throw" | "__cxa_rethrow"
             | "__cxa_bad_cast" | "__cxa_bad_typeid" | "__cxa_throw_bad_array_new_length" | "_Unwind_Resume"
-            | "__cxa_pure_virtual" | "__cxa_call_unexpected" | "_ZSt9terminatev"
-    )
+            | "__cxa_pure_virtual" | "__cxa_call_unexpected" | "_ZSt9terminatev" | "rust_begin_unwind"
+    ) {
+        return true;
+    }
+    // Identifiers appear verbatim in both Rust manglings, so only names that
+    // contain one of the last path segments are demangled.
+    if !RUST_NORETURN.iter().any(|p| name.contains(p.rsplit("::").next().unwrap())) && !name.contains("panicking") {
+        return false;
+    }
+    let Some(path) = crate::load::demangle(name) else { return false };
+    // Generic arguments: `core::panicking::assert_failed::<u32, u32>`.
+    let path = path.split("::<").next().unwrap_or(&path);
+    path.starts_with("core::panicking::") || RUST_NORETURN.contains(&path)
+}
+
+/// Rust standard library functions that return `!`, besides all of `core::panicking`.
+const RUST_NORETURN: &[&str] = &[
+    "core::option::unwrap_failed",
+    "core::option::expect_failed",
+    "core::result::unwrap_failed",
+    "core::cell::panic_already_borrowed",
+    "core::cell::panic_already_mutably_borrowed",
+    "core::slice::index::slice_index_fail",
+    "core::slice::index::slice_start_index_len_fail",
+    "core::slice::index::slice_end_index_len_fail",
+    "core::slice::index::slice_index_order_fail",
+    "core::slice::index::slice_start_index_overflow_fail",
+    "core::slice::index::slice_end_index_overflow_fail",
+    "core::slice::copy_from_slice_impl::len_mismatch_fail",
+    "core::str::slice_error_fail",
+    "core::str::slice_error_fail_rt",
+    "core::str::slice_error_fail_ct",
+    "alloc::alloc::handle_alloc_error",
+    "alloc::raw_vec::handle_error",
+    "alloc::raw_vec::capacity_overflow",
+    "std::alloc::rust_oom",
+    "std::process::exit",
+    "std::process::abort",
+    "std::panicking::begin_panic",
+    "std::panicking::begin_panic_handler",
+    "std::panicking::rust_panic_with_hook",
+    "std::panicking::rust_panic",
+    "__rustc::rust_begin_unwind",
+];
+
+/// Mach-O's `LC_FUNCTION_STARTS`: the start of every function, as ULEB128
+/// deltas from the `__TEXT` segment. `strip` keeps it. Empty for other formats.
+fn function_starts(file: &object::File) -> Vec<u64> {
+    use object::read::macho::LoadCommandVariant;
+    let object::File::MachO64(m) = file else { return Vec::new() };
+    let Some(text) = file.segments().find(|s| s.name().ok().flatten() == Some("__TEXT")) else { return Vec::new() };
+    let mut out = Vec::new();
+    let Ok(mut cmds) = m.macho_load_commands() else { return out };
+    while let Ok(Some(cmd)) = cmds.next() {
+        let Ok(LoadCommandVariant::LinkeditData(l)) = cmd.variant() else { continue };
+        let Ok(starts) = l.function_starts(m.endian(), m.data(), text.address()) else { continue };
+        out.extend(starts.map_while(Result::ok));
+    }
+    out
 }
 
 /// GOT slot -> the symbol the dynamic loader puts there, from the dynamic relocations.
@@ -668,6 +851,71 @@ mod tests {
         let mut out = Vec::new();
         eh_frame(&d, 0x2000, &mut out);
         assert_eq!(out, vec![(0x1000, 0x20)]);
+    }
+
+    /// A stripped x86_64 Mach-O executable: `__TEXT,__text` at 0x100000100
+    /// holding `xor eax, eax; jmp next` and then `next: mov rax, rdi; ret`, and,
+    /// if `starts`, an `LC_FUNCTION_STARTS` that lists both.
+    fn macho(starts: bool) -> Vec<u8> {
+        let code = [0x31, 0xc0, 0xeb, 0x00, 0x48, 0x89, 0xf8, 0xc3];
+        let (base, code_at, blob_at) = (0x1_0000_0000u64, 0x100usize, 0x180usize);
+        let mut d = Vec::new();
+        let u32s = |d: &mut Vec<u8>, v: &[u32]| v.iter().for_each(|x| d.extend(x.to_le_bytes()));
+        let name = |d: &mut Vec<u8>, s: &str| d.extend(s.bytes().chain(std::iter::repeat(0)).take(16));
+        let (ncmds, cmds_size) = if starts { (2, 152 + 16) } else { (1, 152) };
+        // mach_header_64: magic, x86_64, MH_EXECUTE, flags, reserved
+        u32s(&mut d, &[0xfeed_facf, 0x0100_0007, 3, 2, ncmds, cmds_size, 0, 0]);
+        // LC_SEGMENT_64 __TEXT, from the start of the file, with one section
+        u32s(&mut d, &[0x19, 152]);
+        name(&mut d, "__TEXT");
+        for v in [base, 0x1000, 0, (code_at + code.len()) as u64] {
+            d.extend(v.to_le_bytes());
+        }
+        u32s(&mut d, &[5, 5, 1, 0]);
+        name(&mut d, "__text");
+        name(&mut d, "__TEXT");
+        for v in [base + code_at as u64, code.len() as u64] {
+            d.extend(v.to_le_bytes());
+        }
+        // offset, align, reloff, nreloc, S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS, reserved
+        u32s(&mut d, &[code_at as u32, 4, 0, 0, 0x8000_0400, 0, 0, 0]);
+        // ULEB128 offsets from __TEXT: 0x100, then +4; zero ends the list
+        let blob = [0x80, 0x02, 0x04, 0x00, 0, 0, 0, 0];
+        if starts {
+            u32s(&mut d, &[0x26, 16, blob_at as u32, blob.len() as u32]);
+        }
+        d.resize(code_at, 0);
+        d.extend(code);
+        d.resize(blob_at, 0);
+        d.extend(blob);
+        d
+    }
+
+    #[test]
+    fn macho_function_starts() {
+        let found = |starts: bool| {
+            let data = macho(starts);
+            let file = object::File::parse(&data[..]).unwrap();
+            assert_eq!(function_starts(&file), if starts { vec![0x1_0000_0100, 0x1_0000_0104] } else { vec![] });
+            functions(&file, &[], &BTreeMap::new()).iter().map(|f| (f.addr, f.size)).collect::<Vec<_>>()
+        };
+        // Without the list, the jump to `next` stays inside one function.
+        assert_eq!(found(false), vec![(0x1_0000_0100, 8)]);
+        // With it, the jump is a tail call to the second function.
+        assert_eq!(found(true), vec![(0x1_0000_0100, 4), (0x1_0000_0104, 4)]);
+    }
+
+    #[test]
+    fn rust_noreturn_names() {
+        assert!(noreturn("_ZN4core9panicking9panic_fmt17h0123456789abcdefE"));
+        assert!(noreturn("_RNvNtCscI6d9CVNmLh_4core6option13unwrap_failed"));
+        assert!(noreturn("_RNvNtCs40k4W9msRzi_5alloc7raw_vec12handle_error"));
+        assert!(noreturn("_ZN5alloc5alloc18handle_alloc_error17h0123456789abcdefE"));
+        assert!(noreturn("abort@GLIBC_2.2.5"));
+        // `Fallibility::capacity_overflow` returns an error when allocation may fail.
+        assert!(!noreturn("_ZN9hashbrown3raw11Fallibility17capacity_overflow17h0123456789abcdefE"));
+        assert!(!noreturn("_ZN4core3fmt5write17h0123456789abcdefE"));
+        assert!(!noreturn("main"));
     }
 
     #[test]

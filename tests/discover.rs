@@ -103,3 +103,114 @@ fn stripped_binaries_have_the_same_functions() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Functions that never return, without unwind tables: `die` is one because
+/// every path through it ends in `exit` or `abort`, so `checked` and `more` end
+/// at their call to it, and `unused`, which nothing calls, isn't swallowed by
+/// `checked`. `via_slot` calls `die` through a pointer the loader fills in (as
+/// Rust calls `handle_alloc_error` through the GOT) and `via_got` calls `abort`
+/// through the GOT; both branch on flags set before the call at the address
+/// after it, which only lifts if the call is known not to return.
+const NORETURN_C: &str = r#"
+#include <stdio.h>
+#include <stdlib.h>
+
+__attribute__((noinline, noreturn)) void die(const char *m, int code) {
+    fputs(m, stderr);
+    if (code)
+        exit(code);
+    abort();
+}
+
+__attribute__((noinline)) int checked(int x) {
+    if (x < 0)
+        die("negative\n", 2);
+    return x * 3;
+}
+
+__attribute__((noinline)) int unused(int x) { return x ^ 0x55; }
+
+__attribute__((noinline)) int more(int x, int y) {
+    if (x == y)
+        die("equal\n", 0);
+    return x - y;
+}
+
+__asm__(
+    ".text\n"
+    ".globl via_slot\n"
+    ".type via_slot, @function\n"
+    "via_slot:\n"
+    "  test %rdi, %rdi\n"
+    "  jns 1f\n"
+    "  xor %esi, %esi\n"
+    "  call *die_slot(%rip)\n"
+    "1: je 2f\n"
+    "  mov $1, %eax\n"
+    "  ret\n"
+    "2: xor %eax, %eax\n"
+    "  ret\n"
+    ".size via_slot, .-via_slot\n"
+    ".globl via_got\n"
+    ".type via_got, @function\n"
+    "via_got:\n"
+    "  test %rdi, %rdi\n"
+    "  jns 1f\n"
+    "  call *abort@GOTPCREL(%rip)\n"
+    "1: je 2f\n"
+    "  mov $1, %eax\n"
+    "  ret\n"
+    "2: xor %eax, %eax\n"
+    "  ret\n"
+    ".size via_got, .-via_got\n"
+    ".section .data.rel.ro, \"aw\"\n"
+    ".p2align 3\n"
+    "die_slot: .quad die\n"
+    ".text\n");
+
+int via_slot(long), via_got(long);
+
+int main(int argc, char **argv) { return checked(argc) + more(argc, 3) + via_slot(argc) + via_got(argc); }
+"#;
+
+#[test]
+fn calls_that_dont_return_end_functions() {
+    let ccs: Vec<&str> = ["cc", "clang"].into_iter().filter(|c| have(c)).collect();
+    if ccs.is_empty() || !have("strip") {
+        eprintln!("discover: no C compiler or strip, skipping");
+        return;
+    }
+    let dir = scratch("noreturn");
+    let src = dir.join("noreturn.c");
+    std::fs::write(&src, NORETURN_C).unwrap();
+    let ours = ["die", "checked", "unused", "more", "via_slot", "via_got"];
+    for cc in &ccs {
+        for opt in ["-O0", "-O1", "-O2", "-Os"] {
+            let label = format!("{cc} {opt}");
+            let full = dir.join(format!("{cc}{opt}"));
+            let stripped = dir.join(format!("{cc}{opt}-stripped"));
+            let flags = [opt, "-fno-asynchronous-unwind-tables", "-fno-unwind-tables"];
+            let out = Command::new(cc).args(flags).arg("-o").arg(&full).arg(&src).output().unwrap();
+            assert!(out.status.success(), "{label}: {}", String::from_utf8_lossy(&out.stderr));
+            let out = Command::new("strip").arg("-o").arg(&stripped).arg(&full).output().unwrap();
+            assert!(out.status.success(), "strip: {}", String::from_utf8_lossy(&out.stderr));
+
+            // The calls through a slot end their blocks, so both lift.
+            let (_, out, _) = chungusite(&[full.to_str().unwrap(), "--list"]);
+            for f in ["via_slot", "via_got"] {
+                let line = out.lines().find(|l| l.contains(&format!(" {f} @ "))).unwrap_or_else(|| panic!("{label}: no {f}"));
+                assert!(line.starts_with("ok"), "{label}: {line}");
+            }
+
+            // Without symbols or unwind tables, every function is found with its exact size.
+            let want = list(&full);
+            let got = list(&stripped);
+            for (a, (size, name)) in want.iter().filter(|(_, (_, n))| ours.contains(&n.as_str())) {
+                assert_eq!(got.get(a).map(|g| g.0), Some(*size), "{label}: {name} at {a:#x}");
+            }
+            let extra: Vec<_> = got.keys().filter(|a| !want.contains_key(a)).map(|a| format!("{a:#x}")).collect();
+            assert!(extra.is_empty(), "{label}: invented {extra:?}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -188,7 +188,7 @@ impl<'a> Binary<'a> {
         let mut discovered = 0;
         if stripped {
             let known: Vec<(u64, u64)> = funcs.iter().map(|f| (f.addr, f.bytes.len() as u64)).collect();
-            for d in crate::discover::functions(&file, &known, pointers.values().copied()) {
+            for d in crate::discover::functions(&file, &known, &pointers) {
                 if let Some(f) = funcs.iter_mut().find(|f| f.addr == d.addr) {
                     // An export: keep its name. Its size without a static symbol table ran
                     // to the next export; the unwind table's extent is exact.

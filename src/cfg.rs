@@ -17,21 +17,37 @@ pub struct Cfg {
 
 impl Cfg {
     pub fn new(f: &Function) -> Cfg {
-        let n = f.blocks.len();
-
         // Successors, flattened: those of `b` are `succs[succ_start[b]..succ_start[b + 1]]`.
-        let mut succ_start = Vec::with_capacity(n + 1);
-        let mut succs = Vec::with_capacity(2 * n);
+        let mut succ_start = Vec::with_capacity(f.blocks.len() + 1);
+        let mut succs = Vec::with_capacity(2 * f.blocks.len());
         for (_, blk) in f.blocks.iter() {
             succ_start.push(succs.len());
             succs.extend(blk.term.successors(&f.value_pool));
         }
         succ_start.push(succs.len());
+        Cfg::build(f.entry, &succ_start, &succs)
+    }
+
+    /// The graph whose node `b` has edges to `succ[b]` (node `i` is `BlockId::new(i)`).
+    pub fn from_succs(succ: &[Vec<BlockId>], entry: BlockId) -> Cfg {
+        let mut succ_start = Vec::with_capacity(succ.len() + 1);
+        let mut succs = Vec::new();
+        for s in succ {
+            succ_start.push(succs.len());
+            succs.extend_from_slice(s);
+        }
+        succ_start.push(succs.len());
+        Cfg::build(entry, &succ_start, &succs)
+    }
+
+    fn build(entry: BlockId, succ_start: &[usize], succs: &[BlockId]) -> Cfg {
+        let n = succ_start.len() - 1;
+        let nodes = || (0..n).map(BlockId::new);
         let succ = |b: BlockId| &succs[succ_start[b.index()]..succ_start[b.index() + 1]];
 
         // Predecessors, counting sort style.
         let mut count = vec![0u32; n + 1];
-        for &s in &succs {
+        for &s in succs {
             count[s.index() + 1] += 1;
         }
         for i in 0..n {
@@ -39,8 +55,8 @@ impl Cfg {
         }
         let pred_start = count.clone();
         let mut fill = count;
-        let mut preds = vec![f.entry; pred_start[n] as usize];
-        for (b, _) in f.blocks.iter() {
+        let mut preds = vec![entry; pred_start[n] as usize];
+        for b in nodes() {
             for &s in succ(b) {
                 preds[fill[s.index()] as usize] = b;
                 fill[s.index()] += 1;
@@ -50,8 +66,8 @@ impl Cfg {
         // Reverse postorder with an explicit stack.
         let mut post = Vec::with_capacity(n);
         let mut seen = vec![false; n];
-        let mut stack: Vec<(BlockId, u32)> = vec![(f.entry, 0)];
-        seen[f.entry.index()] = true;
+        let mut stack: Vec<(BlockId, u32)> = vec![(entry, 0)];
+        seen[entry.index()] = true;
         while let Some(&mut (b, ref mut next)) = stack.last_mut() {
             let succ = succ(b);
             if (*next as usize) < succ.len() {
@@ -73,7 +89,7 @@ impl Cfg {
         }
 
         let mut cfg = Cfg { pred_start, preds, rpo, rpo_index, idom: vec![None; n] };
-        cfg.compute_dominators(f.entry);
+        cfg.compute_dominators(entry);
         cfg
     }
 

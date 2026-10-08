@@ -441,11 +441,7 @@ impl Program {
             f.sig = sigs[i];
             let Ok(ir) = &mut f.ir else { return };
             let shapes: Vec<CallShape> = (0..f.sites.len())
-                .map(|k| {
-                    let s = site_sig(&f.targets[k], f.guesses[k], &sigs, &guessed);
-                    let (args, fargs) = if s.variadic { (s.args.max(f.guesses[k].0), s.fargs.max(f.guesses[k].1)) } else { (s.args, s.fargs) };
-                    CallShape { args, fargs, ..s }
-                })
+                .map(|k| site_sig(&f.targets[k], f.guesses[k], &sigs, &guessed))
                 .collect();
             f.sites = abi::apply(ir, sigs[i], &f.sites, &|k| shapes[k]);
             debug_assert!(verify(ir).is_ok(), "{}: {:?}", f.name, verify(ir));
@@ -629,6 +625,23 @@ impl Program {
                 }
             }
         }
+        // The address of a function in the output (`lea rdi, [rip+f]`, a callback)
+        // is that function, or its raw twin: code calling through a pointer
+        // passes integers.
+        let by_addr: HashMap<u64, usize> = self.funcs.iter().enumerate().map(|(i, f)| (f.addr, i)).collect();
+        let fn_ptr = |addr: u64| {
+            let &j = by_addr.get(&addr)?;
+            let f = &self.funcs[j];
+            if !f.selected || f.ir.is_err() {
+                return None;
+            }
+            let ident = match safe.as_ref() {
+                Some(s) if s.twin[j] => &s.twin_ident[j],
+                _ => &f.ident,
+            };
+            Some(format!("({ident} as u64)"))
+        };
+        let global_of = |addr: u64| fn_ptr(addr).or_else(|| (opts.global_of)(addr));
         let mut out: Vec<Option<(String, EmitStats)>> = self
             .funcs
             .par_iter()
@@ -644,7 +657,8 @@ impl Program {
                         call: &call,
                         demote: false,
                         structure: true,
-                        global_of: opts.global_of,
+                        global_of: &global_of,
+                        global_end: opts.global_end,
                         global_slice: opts.global_slice,
                         analysis,
                         types: f.types.as_ref().map(|t| (t, &self.tys)),
@@ -915,6 +929,8 @@ impl Program {
 pub struct Options<'a> {
     /// Rust expression for a constant address into the binary's data.
     pub global_of: &'a (dyn Fn(u64) -> Option<String> + Sync),
+    /// The end of the static holding an address, as another address (`Env::global_end`).
+    pub global_end: &'a (dyn Fn(u64, u64) -> Option<String> + Sync),
     /// The read-only `Bytes` static an address is in, which safe code can index.
     pub global_slice: &'a (dyn Fn(u64) -> Option<String> + Sync),
     /// Functions to emit in fast mode even in safe mode (by index), because
@@ -927,7 +943,7 @@ pub struct Options<'a> {
 
 impl Default for Options<'_> {
     fn default() -> Self {
-        Options { global_of: &|_| None, global_slice: &|_| None, fast: &[], address_taken: &[] }
+        Options { global_of: &|_| None, global_end: &|_, _| None, global_slice: &|_| None, fast: &[], address_taken: &[] }
     }
 }
 
@@ -1072,12 +1088,15 @@ fn arg_tys(sig: Sig, int: &[Option<TyId>]) -> Vec<Option<TyId>> {
     v
 }
 
+/// What a call site passes: the callee's signature, with a variadic one's
+/// extra arguments as far as the site sets registers up.
 fn site_sig(t: &Target, (args, fargs): (u8, u8), sigs: &[Sig], guessed: &HashMap<Target, Sig>) -> Sig {
-    match t {
+    let s = match t {
         Target::Func(j) => guessed.get(t).copied().unwrap_or(sigs[*j]),
         Target::Import(n) => crate::libc::lookup(n).or_else(|| guessed.get(t).copied()).unwrap_or_default(),
         Target::Indirect => Sig { args, fargs, ret: true, ..Sig::default() },
-    }
+    };
+    if s.variadic { Sig { args: s.args.max(args), fargs: s.fargs.max(fargs), ..s } } else { s }
 }
 
 /// One line for a lift error.

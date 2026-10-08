@@ -67,6 +67,10 @@ pub struct Binary<'a> {
     /// Pointer-sized slots in `data` that the dynamic loader fills in (GOT entries,
     /// vtables, pointer tables in a PIE), and what they point to.
     pub pointers: BTreeMap<u64, u64>,
+    /// Data a shared library defines that the dynamic loader copies into the
+    /// binary at start (`R_X86_64_COPY`: `stdin`, `stderr`, `environ`), by address,
+    /// with the library symbol's name.
+    pub copied: BTreeMap<u64, String>,
     /// How many of `funcs` came from `discover::functions` rather than a symbol
     /// (nonzero only when the static symbol table has no functions).
     pub discovered: usize,
@@ -181,6 +185,7 @@ impl<'a> Binary<'a> {
             data.push(DataSection { name: TLS_SECTION.into(), addr: t.addr, size: t.size, bytes: Some(Cow::Owned(block)), writable: true });
         }
         let pointers = if data.is_empty() { BTreeMap::new() } else { pointers(&file, &data) };
+        let copied = copied(&file);
 
         // Stripped: no function in the static symbol table, at most the dynamic exports.
         let stripped = file.kind() != ObjectKind::Relocatable
@@ -202,7 +207,7 @@ impl<'a> Binary<'a> {
             }
             funcs.sort_by_key(|f| f.addr);
         }
-        Ok(Binary { file, funcs, data, data_syms, pointers, discovered })
+        Ok(Binary { file, funcs, data, data_syms, pointers, copied, discovered })
     }
 
     pub fn entry(&self) -> u64 {
@@ -243,6 +248,21 @@ fn code_in<'a>(file: &object::File<'a>, addr: u64, len: u64) -> Option<&'a [u8]>
 /// Slots the loader fills with an address: 64-bit dynamic relocations whose
 /// target is known (`R_X86_64_RELATIVE`, or a symbol the binary defines), plus,
 /// for a binary without dynamic relocations (static, non-PIE), every nonzero GOT slot.
+fn copied(file: &object::File) -> BTreeMap<u64, String> {
+    let mut out = BTreeMap::new();
+    let Some(dynsyms) = file.dynamic_symbol_table() else { return out };
+    for (at, r) in file.dynamic_relocations().into_iter().flatten() {
+        let (RelocationFlags::Elf { r_type: object::elf::R_X86_64_COPY }, RelocationTarget::Symbol(i)) = (r.flags(), r.target()) else { continue };
+        let Some(name) = dynsyms.symbol_by_index(i).ok().and_then(|s| s.name().ok().map(str::to_string)) else { continue };
+        // `stderr@GLIBC_2.2.5` in some tables
+        let name = name.split('@').next().unwrap_or_default().to_string();
+        if !name.is_empty() {
+            out.insert(at, name);
+        }
+    }
+    out
+}
+
 fn pointers(file: &object::File, data: &[DataSection]) -> BTreeMap<u64, u64> {
     use object::elf::{R_X86_64_64, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT, R_X86_64_RELATIVE};
     let mut out = BTreeMap::new();

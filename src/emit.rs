@@ -133,6 +133,9 @@ pub struct Env<'a> {
     /// Rust expression for a constant address that points into the binary's data
     /// (the address of a `static`), or `None` to keep the raw address.
     pub global_of: &'a dyn Fn(u64) -> Option<String>,
+    /// `global_end(base, at)`: the end of the `static` holding `base`, if
+    /// another one starts at `at` (`Globals::end_expr`).
+    pub global_end: &'a dyn Fn(u64, u64) -> Option<String>,
     /// Safe mode: the read-only `Bytes` static containing an address, which
     /// reads can index as a slice; `None` keeps reads through it raw.
     pub global_slice: &'a dyn Fn(u64) -> Option<String>,
@@ -185,6 +188,7 @@ struct Emitter<'a> {
     exprs: Vec<Option<String>>,
     /// Rust expression for a constant address that points into the binary's data.
     global_of: &'a dyn Fn(u64) -> Option<String>,
+    global_end: &'a dyn Fn(u64, u64) -> Option<String>,
     /// Where each value points (`sources.rs`), to count raw accesses by source.
     src: Vec<u8>,
     stats: EmitStats,
@@ -240,7 +244,7 @@ pub fn emit_function_with(
 ) -> EmitStats {
     let _ = name_of;
     let call = |_: Site| None;
-    let env = Env { sig: None, call: &call, demote: false, structure, global_of, global_slice: &|_| None, analysis: None, types: None, struct_args: false };
+    let env = Env { sig: None, call: &call, demote: false, structure, global_of, global_end: &|_, _| None, global_slice: &|_| None, analysis: None, types: None, struct_args: false };
     emit_function_in(f, name, mode, &env, out)
 }
 
@@ -327,6 +331,7 @@ pub fn emit_function_in(f: &Function, name: &str, mode: Mode, env: &Env, out: &m
         exprs: vec![None; inline.len()],
         inline,
         global_of: env.global_of,
+        global_end: env.global_end,
         src: crate::sources::sources(f),
         stats: EmitStats::default(),
         table,
@@ -940,6 +945,74 @@ impl Emitter<'_> {
             return self.conv(&format!("{} as u8", expr::cast(self.name(v))), TyId::B1, t);
         }
         self.val(v, t)
+    }
+
+    /// `c`, compared with `other`, as the end of the static `other` points
+    /// into, when `c` is the address just past it: a loop over one array may
+    /// stop at the address of whatever follows it in the binary, which the
+    /// output's statics don't keep next to each other.
+    fn past_end(&self, c: ValueId, other: ValueId) -> Option<String> {
+        let at = match self.f.insts[c].kind {
+            InstKind::IntToPtr(x) => self.konst(x)?,
+            InstKind::Const(_) => self.konst(c)?,
+            _ => return None,
+        };
+        let (mut bases, mut seen) = (Vec::new(), Vec::new());
+        if !self.bases(other, &mut bases, &mut seen) || bases.is_empty() {
+            return None;
+        }
+        let e = (self.global_end)(bases[0], at)?;
+        bases[1..].iter().all(|&b| (self.global_end)(b, at).as_ref() == Some(&e)).then_some(e)
+    }
+
+    /// The constant addresses `v` is computed from, by offsets and through
+    /// block parameters; `false` if it may come from anywhere else.
+    fn bases(&self, v: ValueId, out: &mut Vec<u64>, seen: &mut Vec<ValueId>) -> bool {
+        if seen.contains(&v) {
+            return true;
+        }
+        if seen.len() >= 32 {
+            return false;
+        }
+        seen.push(v);
+        let f = self.f;
+        match f.insts[v].kind {
+            InstKind::Const(_) => {
+                out.extend(self.konst(v));
+                true
+            }
+            InstKind::IntToPtr(x) | InstKind::PtrToInt(x) => self.bases(x, out, seen),
+            InstKind::PtrOffset { base, .. } => self.bases(base, out, seen),
+            InstKind::Bin { op: BinOp::Add, lhs, rhs } => {
+                let addr = |k: Option<u64>| k.filter(|&k| (self.global_of)(k).is_some());
+                match (self.konst(lhs), self.konst(rhs)) {
+                    (k @ Some(_), _) | (_, k @ Some(_)) if addr(k).is_some() => {
+                        out.extend(k);
+                        true
+                    }
+                    (Some(_), None) => self.bases(rhs, out, seen),
+                    (None, Some(_)) => self.bases(lhs, out, seen),
+                    _ => false,
+                }
+            }
+            InstKind::Bin { op: BinOp::Sub, lhs, rhs } if self.konst(rhs).is_some() => self.bases(lhs, out, seen),
+            InstKind::BlockParam(_) => {
+                let Some((b, k)) = f.blocks.iter().find_map(|(b, blk)| {
+                    blk.params.get(&f.value_pool).iter().position(|&p| p == v).map(|k| (b, k))
+                }) else { return false };
+                let (mut any, mut ok) = (false, true);
+                for (p, blk) in f.blocks.iter() {
+                    if blk.term.successors(&f.value_pool).any(|s| s == b) {
+                        crate::abi::incoming(f, p, b, k, |x| {
+                            any = true;
+                            ok = ok && self.bases(x, out, seen);
+                        });
+                    }
+                }
+                any && ok
+            }
+            _ => false,
+        }
     }
 
     /// `v as u64`, or just `v` if it already is one.
@@ -1715,6 +1788,23 @@ impl Emitter<'_> {
 
     fn cmp(&self, cc: Cond, lhs: ValueId, rhs: ValueId) -> String {
         let ty = self.ty(lhs);
+        let unsigned = match cc {
+            Cond::Eq => Some("=="),
+            Cond::Ne => Some("!="),
+            Cond::Ult => Some("<"),
+            Cond::Ule => Some("<="),
+            Cond::Ugt => Some(">"),
+            Cond::Uge => Some(">="),
+            _ => None,
+        };
+        if let Some(op) = unsigned {
+            if let Some(e) = self.past_end(lhs, rhs) {
+                return format!("{e} {op} {}", expr::rhs(self.as_u64(rhs)));
+            }
+            if let Some(e) = self.past_end(rhs, lhs) {
+                return format!("{} {op} {e}", expr::lhs(self.as_u64(lhs), op));
+            }
+        }
         let ptr = |v: ValueId| matches!(self.table.tys[self.vt[v.index()]], Ty::RawPtr { .. });
         if ptr(lhs) || ptr(rhs) {
             let null = |p: ValueId, z: ValueId| (ptr(p) && self.konst(z) == Some(0)).then(|| expr::recv(self.name(p)));

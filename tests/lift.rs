@@ -265,6 +265,47 @@ fn jump_tables_become_switches() {
 }
 
 #[test]
+fn relative_jump_tables_at_o0() {
+    // gcc -O0 computes the offset into the table first, adds it to the table's
+    // address, and sign-extends the entry with `cdqe`:
+    //   cmp edi, 2 ; ja default ; mov eax, edi ; lea rdx, [rax*4] ; lea rax, [rip+table]
+    //   mov eax, [rdx+rax] ; cdqe ; lea rdx, [rip+table] ; add rax, rdx ; jmp rax
+    use iced_x86::{BlockEncoderOptions, Code, Instruction, MemoryOperand, Register};
+    const TABLE: u64 = 0x3000;
+    let lea_table = |r| Instruction::with2(Code::Lea_r64_m, r, MemoryOperand::with_base_displ(Register::RIP, TABLE as i64)).unwrap();
+    let mut a = CodeAssembler::new(64).unwrap();
+    let mut cases = [a.create_label(), a.create_label(), a.create_label()];
+    let mut default = a.create_label();
+    let mut done = a.create_label();
+    a.cmp(edi, 2).unwrap();
+    a.ja(default).unwrap();
+    a.mov(eax, edi).unwrap();
+    a.lea(rdx, ptr(rax * 4)).unwrap();
+    a.add_instruction(lea_table(Register::RAX)).unwrap();
+    a.mov(eax, dword_ptr(rdx + rax)).unwrap();
+    a.cdqe().unwrap();
+    a.add_instruction(lea_table(Register::RDX)).unwrap();
+    a.add(rax, rdx).unwrap();
+    a.jmp(rax).unwrap();
+    for (k, l) in cases.iter_mut().enumerate() {
+        a.set_label(l).unwrap();
+        a.lea(eax, dword_ptr(rdi + 10 * (k as i32 + 1))).unwrap();
+        a.jmp(done).unwrap();
+    }
+    a.set_label(&mut default).unwrap();
+    a.xor(eax, eax).unwrap();
+    a.set_label(&mut done).unwrap();
+    a.ret().unwrap();
+    let r = a.assemble_options(common::BASE, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS).unwrap();
+    let table: Vec<u8> = cases.iter().flat_map(|l| ((r.label_ip(l).unwrap() - TABLE) as i32).to_le_bytes()).collect();
+    let mut f = Function::with_capacity(64, 8);
+    Lifter::new().lift_with_data(&r.inner.code_buffer, common::BASE, &[(TABLE, &table)], &mut f).unwrap();
+    verify(&f).unwrap();
+    let out = dump(&f);
+    assert!(out.contains("switch") && !out.contains("tailcall"), "{out}");
+}
+
+#[test]
 fn indirect_jump_without_a_table_is_a_tail_call() {
     let out = ir(|a| {
         a.mov(rax, qword_ptr(rdi + 0x18)).unwrap();

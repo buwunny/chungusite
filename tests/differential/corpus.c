@@ -24,6 +24,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <emmintrin.h>
 
 #define NOINLINE __attribute__((noinline))
@@ -621,6 +622,32 @@ uint64_t jump_table(uint64_t i, uint64_t x) {
     }
 }
 
+// A switch in a loop: the table's address is loaded once, before the loop.
+// @diff switch_loop: u64(str:24)
+uint64_t switch_loop(const char *s) {
+    uint64_t h = 0, n = 0;
+    for (; *s; s++, n++) {
+        uint64_t c = (uint8_t)*s;
+        c = (c * 0x9e37) ^ (h >> 7);
+        c += (c >> 3) * 5;
+        c ^= (c << 9) + (h >> 13);
+        c += (c >> 11) ^ n;
+        switch (c % 11) {
+        case 0: h += 3; break;
+        case 1: h ^= 0x55; break;
+        case 2: h *= 7; break;
+        case 3: h -= 11; break;
+        case 4: h <<= 1; break;
+        case 5: h += 0x100; break;
+        case 6: h |= 9; break;
+        case 7: h = ~h; break;
+        case 8: h += n * 17; break;
+        default: h += 1;
+        }
+    }
+    return h;
+}
+
 /* ---- flags read in another block ---- */
 
 // gcc tests `==` and then `<` of the same cmp in the next block.
@@ -810,3 +837,59 @@ double f_abs(double x) { return -__builtin_fabs(x) + 1.0; }
 
 // @diff f_to_f32: f32(f64, i32)
 float f_to_f32(double x, int32_t k) { return (float)x + (float)k; }
+
+/* ---- arrays, function pointers, variadic calls ---- */
+
+// A loop over one array stops at `keys + 16`, the address of whatever follows.
+int64_t keys[16] = { 5, -3, 8, 1, 9, -7, 2, 6, 4, -1, 3, 7, -9, 11, 0, 13 };
+int64_t vals[16] = { 50, 30, 80, 10, 90, 70, 20, 60, 40, 15, 33, 77, 99, 11, 1, 13 };
+
+// @diff key_is: i32(i64, i64)
+NOINLINE int key_is(int64_t a, int64_t b) { return a == b; }
+
+// @diff lookup_key: i64(i64:-10..15)
+int64_t lookup_key(int64_t k) {
+    for (int i = 0; i < 16; i++)
+        if (key_is(vals[i] - keys[i] * 10, k)) return vals[i];
+    return -1;
+}
+
+struct pool { uint64_t (*release)(uint64_t opaque, uint64_t p); uint64_t opaque; };
+// @diff pool_release: u64(u64, u64)
+NOINLINE uint64_t pool_release(uint64_t opaque, uint64_t p) { return opaque * 31 + p; }
+struct pool the_pool = { pool_release, 7 };
+
+// Each pointer is loaded and tested before the call that passes it.
+// @diff release_all: u64(buf:24)
+uint64_t release_all(const uint64_t *v) {
+    uint64_t s = 0;
+    if (v[0]) s += the_pool.release(the_pool.opaque, v[0]);
+    if (v[1]) s += the_pool.release(the_pool.opaque, v[1]);
+    if (v[2]) s += the_pool.release(the_pool.opaque, v[2]);
+    return s;
+}
+
+// @diff twice: u64(u64)
+NOINLINE uint64_t twice(uint64_t x) { return x * 2 + 1; }
+// @diff thrice: u64(u64)
+NOINLINE uint64_t thrice(uint64_t x) { return x * 3 + 2; }
+NOINLINE uint64_t call_with(uint64_t (*f)(uint64_t), uint64_t x) { return f(x) ^ x; }
+
+// A function's address as a value.
+// @diff pick_fn: u64(u64)
+uint64_t pick_fn(uint64_t x) { return call_with((x & 1) ? twice : thrice, x); }
+
+// An argument moved from another register into a variadic one (r9 for
+// gcc's fortified `__snprintf_chk`, rcx for plain `snprintf`).
+// @diff fmt_moved: void(buf:64, u64, u64)
+void fmt_moved(char *b, uint64_t x, uint64_t y) { snprintf(b, 64, "%lu", (unsigned long)y); (void)x; }
+
+// Both paths set the variadic arguments up for one call.
+// @diff fmt_either: void(buf:64, u64, u64)
+void fmt_either(char *b, uint64_t x, uint64_t y) {
+    const char *f;
+    uint64_t v;
+    if (x > y) { f = "%lu >"; v = x / (y | 1); }
+    else { f = "%lu <="; v = y % (x | 1); }
+    snprintf(b, 64, f, (unsigned long)v);
+}

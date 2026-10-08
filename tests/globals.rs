@@ -104,6 +104,84 @@ fn statics_and_demangled_names_from_a_cdylib() {
     }
 }
 
+const SWITCHES: &str = r#"
+#[no_mangle]
+pub extern "C" fn dispatch(op: u32, a: u64, b: u64) -> u64 {
+    match op {
+        0 => a ^ b,
+        1 => a & b,
+        2 => a | b,
+        3 => !a,
+        4 => a,
+        5 => b,
+        6 => a ^ 0x55,
+        7 => b & 0xff,
+        _ => 7,
+    }
+}
+#[repr(u8)]
+#[derive(Clone, Copy)]
+pub enum Shape { Dot, Line, Tri, Square, Penta, Hexa }
+// Unoptimized, a `match` on an enum is a jump table with no bounds check.
+#[no_mangle]
+pub extern "C" fn corners(s: Shape, x: u64) -> u64 {
+    match s {
+        Shape::Dot => x,
+        Shape::Line => x ^ 2,
+        Shape::Tri => x | 3,
+        Shape::Square => x & 4,
+        Shape::Penta => !x,
+        Shape::Hexa => 6,
+    }
+}
+"#;
+
+// Arguments and results `as _`: type recovery narrows them (`op: u32`).
+const SWITCHES_MAIN: &str = r#"
+fn main() {
+    for op in 0..12u64 {
+        for (a, b) in [(0u64, 0u64), (0x1234, 0xff00), (u64::MAX, 3)] {
+            let want = match op { 0 => a ^ b, 1 => a & b, 2 => a | b, 3 => !a, 4 => a, 5 => b, 6 => a ^ 0x55, 7 => b & 0xff, _ => 7 };
+            assert_eq!(unsafe { dec::dispatch(op as _, a as _, b as _) } as u64, want, "dispatch({op}, {a}, {b})");
+        }
+    }
+    for s in 0..6u64 {
+        let x = 0x5a5a;
+        let want = [x, x ^ 2, x | 3, x & 4, !x, 6][s as usize];
+        assert_eq!(unsafe { dec::corners(s as _, x as _) } as u64, want, "corners({s})");
+    }
+}
+"#;
+
+/// Jump tables as rustc lays them out, bounds-checked (`-O2`) and not (`-O0`),
+/// lift into switches that compute the same thing.
+#[test]
+fn jump_tables_from_a_cdylib() {
+    for opt in ["0", "2"] {
+        let dir = scratch(&format!("switches{opt}"));
+        rustc(&dir, "orig.rs", SWITCHES, &["--crate-type", "cdylib", "-C", &format!("opt-level={opt}"), "--crate-name", "orig"]);
+        let so = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "so" || e == "dylib" || e == "dll"))
+            .expect("cdylib");
+        let bin = env!("CARGO_BIN_EXE_chungusite");
+        for mode in ["fast", "safe"] {
+            let out = Command::new(bin).arg(&so).args(["--mode", mode, "-f", "dispatch", "-f", "corners"]).output().unwrap();
+            let src = String::from_utf8(out.stdout).unwrap();
+            assert!(out.status.success(), "{}\n{src}", String::from_utf8_lossy(&out.stderr));
+            assert!(!src.contains("todo!"), "-O{opt}:\n{src}");
+            let d = dir.join(mode);
+            std::fs::create_dir_all(&d).unwrap();
+            rustc(&d, "dec.rs", &src, &["--crate-type", "rlib", "--crate-name", "dec"]);
+            let rlib = d.join("libdec.rlib");
+            rustc(&d, "main.rs", SWITCHES_MAIN, &["--extern", &format!("dec={}", rlib.display()), "-o", d.join("run").to_str().unwrap()]);
+            let run = Command::new(d.join("run")).output().unwrap();
+            assert!(run.status.success(), "-O{opt} {mode}: {}\n{src}", String::from_utf8_lossy(&run.stderr));
+        }
+    }
+}
+
 /// The same output however many threads do the work.
 #[test]
 fn parallel_output_is_deterministic() {

@@ -26,7 +26,7 @@
 use chungusite::{
     emit::Mode,
     load::Binary,
-    program::{Input, Options, Program},
+    program::{BuildOptions, Input, Program},
 };
 use rayon::prelude::*;
 use std::collections::BTreeMap;
@@ -39,10 +39,11 @@ use std::time::{Duration, Instant};
 /// `("compiler/-Olevel/function/mode" substring, reason)`. Each entry is a bug to fix;
 /// remove it once the case passes (the test prints a note when it does).
 const KNOWN_BAD: &[(&str, &str)] = &[
-    // The compiler turns the switch into a lookup table in .rodata. RIP-relative
-    // loads are lifted as constant addresses, which read the original process's
-    // memory (roadmap item 6), so the decompiled code dereferences a bogus pointer.
-    ("/switch8/", "jump/lookup table in .rodata: globals aren't mapped to statics yet"),
+    // The compiler turns the switch into a lookup table in .rodata. The harness
+    // decompiles the relocatable object, whose sections have no addresses, so the
+    // table can't become a static (roadmap item 6) and the decompiled code
+    // dereferences a bogus pointer. In a linked binary it would.
+    ("/switch8/", "lookup table in a relocatable object's .rodata, which isn't mapped to a static"),
 ];
 
 const OPT_LEVELS: [&str; 3] = ["-O1", "-O2", "-Os"];
@@ -178,7 +179,7 @@ fn decompile(obj: &[u8], cases: &[Case], dwarf: bool) -> (Vec<Decompiled>, [Stri
             Input { name: fb.name.clone(), ident: fb.name.clone(), addr: fb.addr, bytes: fb.bytes, selected }
         })
         .collect();
-    let program = Program::build_with(inputs, Some(obj), false, Options { dwarf, model: None });
+    let program = Program::build_with(inputs, Some(obj), false, BuildOptions { dwarf, model: None });
     let [fast, safe] = [Mode::Fast, Mode::Safe].map(|m| program.emit_all(m, &|_| None));
     let decompiled = cases
         .iter()

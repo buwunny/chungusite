@@ -1893,7 +1893,15 @@ impl Emitter<'_> {
         }
         // a pointer variable this address is computed from, directly
         if let Ty::RawPtr { pointee, .. } = self.table.tys[self.vt[r.index()]] {
-            if pointee == s && !self.inline[r.index()] && crate::types::decompose(self.f, ptr) == (r, d) {
+            // (and only if this access's own address is written with `r`: an
+            // address the same as an earlier one is written as that one, which
+            // may be the only variable in scope, as in a condition the
+            // structurer repeats in another branch)
+            if pointee == s
+                && !self.inline[r.index()]
+                && crate::types::decompose(self.f, ptr) == (r, d)
+                && mentions(&self.as_u64(ptr), &self.name(r))
+            {
                 return Some((format!("(*{}){path}", self.name(r)), true, lt));
             }
         }
@@ -2191,4 +2199,12 @@ impl Source for Emitter<'_> {
         blk.params.len == 0
             && blk.insts.get(&self.f.value_pool).iter().all(|&v| self.skip[v.index()] || self.is_lit(v) || self.inline[v.index()])
     }
+}
+
+/// `e` uses the variable `name` (as a whole identifier).
+fn mentions(e: &str, name: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    e.match_indices(name).any(|(i, _)| {
+        !e[..i].ends_with(word) && !e[i + name.len()..].starts_with(word)
+    })
 }

@@ -102,10 +102,11 @@ impl TyId {
     pub const PTR: TyId = TyId::from_u32(5);  // *mut B1, i.e. *mut u8
     pub const UNIT: TyId = TyId::from_u32(6); // stores, which define no value
     pub const PAIR: TyId = TyId::from_u32(7); // [B8; 2]: a 16-byte rax:rdx return value
+    pub const B16: TyId = TyId::from_u32(8);  // an xmm register, a 128-bit product
 
     #[inline]
     pub fn unknown(bytes: usize) -> TyId {
-        match bytes { 1 => Self::B1, 2 => Self::B2, 4 => Self::B4, _ => Self::B8 }
+        match bytes { 1 => Self::B1, 2 => Self::B2, 4 => Self::B4, 16 => Self::B16, _ => Self::B8 }
     }
 }
 
@@ -118,7 +119,7 @@ impl TyTable {
         for t in [
             Ty::Unknown { bytes: 1 }, Ty::Unknown { bytes: 2 }, Ty::Unknown { bytes: 4 }, Ty::Unknown { bytes: 8 },
             Ty::Bool, Ty::RawPtr { pointee: TyId::B1, mutbl: Mutbl::Mut }, Ty::Array { elem: TyId::B1, len: 0 },
-            Ty::Array { elem: TyId::B8, len: 2 },
+            Ty::Array { elem: TyId::B8, len: 2 }, Ty::Unknown { bytes: 16 },
         ] { tys.push(t); }
         TyTable { tys }
     }
@@ -252,22 +253,104 @@ pub enum Proj { Field(u32), Index(ValueId), ConstIndex(u32), Deref, Subslice { f
 pub enum Terminator {
     Jump { to: BlockId, args: ListRef },
     Branch { c: ValueId, t: BlockId, f: BlockId, args: ListRef /* t args then f args */ },
-    Switch { v: ValueId, table: ListRef /* BlockIds in value_pool */, default: BlockId },
+    /// A jump table: go to `table[v]`. The table lists one block per case value
+    /// 0, 1, 2, ... (stored in `value_pool` as `ValueId`s with the block's index,
+    /// see `block_of`); the same block can appear more than once. There is no
+    /// default: the code before a jump table bounds `v` to the table. Edge
+    /// arguments are per table entry, in table order, like `Branch`'s.
+    Switch { v: ValueId, table: ListRef, args: ListRef },
     Return(Option<ValueId>),
     TailCall { callee: ValueId, args: ListRef },
     Unreachable,
 }
 
-impl Terminator {
-    /// Successor blocks, in edge-argument order (Branch: true edge, then false edge).
-    /// `Switch` tables are not produced by the lifter yet and are not listed.
+/// A `Switch` table entry as stored in `value_pool`.
+#[inline]
+pub fn block_of(v: ValueId) -> BlockId { BlockId::new(v.index()) }
+#[inline]
+pub fn block_entry(b: BlockId) -> ValueId { ValueId::new(b.index()) }
+
+/// Successor blocks of a terminator, in edge-argument order.
+pub enum Succs<'a> {
+    Fixed([Option<BlockId>; 2], usize),
+    Table(std::slice::Iter<'a, ValueId>),
+}
+
+impl Iterator for Succs<'_> {
+    type Item = BlockId;
     #[inline]
-    pub fn successors(self) -> [Option<BlockId>; 2] {
+    fn next(&mut self) -> Option<BlockId> {
         match self {
-            Terminator::Jump { to, .. } => [Some(to), None],
-            Terminator::Branch { t, f, .. } => [Some(t), Some(f)],
-            _ => [None, None],
+            Succs::Fixed(s, i) => {
+                while *i < 2 {
+                    *i += 1;
+                    if let Some(b) = s[*i - 1] {
+                        return Some(b);
+                    }
+                }
+                None
+            }
+            Succs::Table(it) => it.next().map(|&v| block_of(v)),
         }
+    }
+
+    #[inline]
+    fn nth(&mut self, n: usize) -> Option<BlockId> {
+        match self {
+            Succs::Table(it) => it.nth(n).map(|&v| block_of(v)),
+            _ => {
+                for _ in 0..n {
+                    self.next()?;
+                }
+                self.next()
+            }
+        }
+    }
+}
+
+impl Terminator {
+    /// Successor blocks, in edge-argument order (Branch: true edge, then false
+    /// edge; Switch: table order). `pool` is the function's `value_pool`.
+    #[inline]
+    pub fn successors(self, pool: &[ValueId]) -> Succs<'_> {
+        match self {
+            Terminator::Jump { to, .. } => Succs::Fixed([Some(to), None], 0),
+            Terminator::Branch { t, f, .. } => Succs::Fixed([Some(t), Some(f)], 0),
+            Terminator::Switch { table, .. } => Succs::Table(table.get(pool).iter()),
+            _ => Succs::Fixed([None, None], 0),
+        }
+    }
+
+    /// The edge arguments of a terminator with successors.
+    #[inline]
+    pub fn edge_args(self) -> Option<ListRef> {
+        match self {
+            Terminator::Jump { args, .. } | Terminator::Branch { args, .. } | Terminator::Switch { args, .. } => Some(args),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn edge_args_mut(&mut self) -> Option<&mut ListRef> {
+        match self {
+            Terminator::Jump { args, .. } | Terminator::Branch { args, .. } | Terminator::Switch { args, .. } => Some(args),
+            _ => None,
+        }
+    }
+}
+
+impl Function {
+    /// Each edge out of `b` with its arguments, in order.
+    pub fn edges(&self, b: BlockId) -> impl Iterator<Item = (BlockId, &[ValueId])> + '_ {
+        let term = self.blocks[b].term;
+        let args = term.edge_args().unwrap_or(ListRef::EMPTY);
+        let mut at = args.start as usize;
+        term.successors(&self.value_pool).map(move |s| {
+            let n = self.blocks[s].params.len as usize;
+            let a = &self.value_pool[at..at + n];
+            at += n;
+            (s, a)
+        })
     }
 }
 

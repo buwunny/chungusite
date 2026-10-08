@@ -53,6 +53,11 @@ fn write_fn(s: &mut String, f: &Function) -> fmt::Result {
                 let show = |xs: &[ValueId]| xs.iter().map(|&x| v(x)).collect::<Vec<_>>().join(", ");
                 format!("br {} bb{}({}) bb{}({})", v(c), t.index(), show(&a[..nt]), e.index(), show(&a[nt..]))
             }
+            Terminator::Switch { v: x, .. } => {
+                let show = |xs: &[ValueId]| xs.iter().map(|&x| v(x)).collect::<Vec<_>>().join(", ");
+                let arms: Vec<String> = f.edges(b).enumerate().map(|(k, (s, a))| format!("{k}: bb{}({})", s.index(), show(a))).collect();
+                format!("switch {} [{}]", v(x), arms.join(", "))
+            }
             Terminator::Return(r) => format!("ret {}", r.map(v).unwrap_or_default()),
             Terminator::TailCall { callee, args } => format!("tailcall {}({})", v(callee), list(f, args)),
             other => format!("{other:?}"),

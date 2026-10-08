@@ -405,3 +405,137 @@ uint64_t stack_buf(uint64_t a, uint64_t b) {
 // @diff max_of3: i64(i64, i64, i64)
 NOINLINE int64_t max2(int64_t a, int64_t b) { return a > b ? a : b; }
 int64_t max_of3(int64_t a, int64_t b, int64_t c) { return max2(max2(a, b), c); }
+
+/* ---- wide arithmetic and bit instructions ---- */
+
+// The high half of a 64x64 product: one-operand mul.
+// @diff mul_hi: u64(u64, u64)
+uint64_t mul_hi(uint64_t a, uint64_t b) { return (uint64_t)(((unsigned __int128)a * b) >> 64); }
+
+// @diff mul_hi32: u32(u32, u32)
+uint32_t mul_hi32(uint32_t a, uint32_t b) { return (uint32_t)(((uint64_t)a * b) >> 32); }
+
+// @diff smul_hi: i64(i64, i64)
+int64_t smul_hi(int64_t a, int64_t b) { return (int64_t)(((__int128)a * b) >> 64); }
+
+// Overflow checks read CF/OF after mul and imul.
+// @diff mul_ovf: u64(u64, u64)
+uint64_t mul_ovf(uint64_t a, uint64_t b) { uint64_t r; return __builtin_mul_overflow(a, b, &r) ? 0 : r + 1; }
+
+// @diff smul_ovf: i64(i64, i64)
+int64_t smul_ovf(int64_t a, int64_t b) { int64_t r; return __builtin_mul_overflow(a, b, &r) ? -1 : r; }
+
+// @diff smul_ovf32: i32(i32, i32)
+int32_t smul_ovf32(int32_t a, int32_t b) { int32_t r; return __builtin_mul_overflow(a, b, &r) ? -1 : r; }
+
+// 128-bit add and subtract: add/adc, sub/sbb.
+// @diff add128_hi: u64(u64, u64, u64, u64)
+uint64_t add128_hi(uint64_t alo, uint64_t ahi, uint64_t blo, uint64_t bhi) {
+    unsigned __int128 a = ((unsigned __int128)ahi << 64) | alo, b = ((unsigned __int128)bhi << 64) | blo;
+    return (uint64_t)((a + b) >> 64);
+}
+
+// @diff sub128_hi: u64(u64, u64, u64, u64)
+uint64_t sub128_hi(uint64_t alo, uint64_t ahi, uint64_t blo, uint64_t bhi) {
+    unsigned __int128 a = ((unsigned __int128)ahi << 64) | alo, b = ((unsigned __int128)bhi << 64) | blo;
+    return (uint64_t)((a - b) >> 64);
+}
+
+// A mask from the carry: cmp; sbb.
+// @diff below_mask: u64(u64, u64)
+uint64_t below_mask(uint64_t a, uint64_t b) { return a < b ? ~(uint64_t)0 : 0; }
+
+// 128-bit shifts: shld / shrd.
+// @diff shl128_hi: u64(u64, u64, u32:0..128)
+uint64_t shl128_hi(uint64_t lo, uint64_t hi, uint32_t n) {
+    unsigned __int128 x = ((unsigned __int128)hi << 64) | lo;
+    return (uint64_t)((x << (n & 127)) >> 64);
+}
+
+// @diff shr128_lo: u64(u64, u64, u32:0..128)
+uint64_t shr128_lo(uint64_t lo, uint64_t hi, uint32_t n) {
+    unsigned __int128 x = ((unsigned __int128)hi << 64) | lo;
+    return (uint64_t)(x >> (n & 127));
+}
+
+// @diff ctz64: u64(u64)
+uint64_t ctz64(uint64_t x) { return x ? (uint64_t)__builtin_ctzll(x) : 64; }
+
+// @diff clz64: u64(u64)
+uint64_t clz64(uint64_t x) { return x ? (uint64_t)__builtin_clzll(x) : 64; }
+
+// @diff bswap64: u64(u64)
+uint64_t bswap64(uint64_t x) { return __builtin_bswap64(x); }
+
+// @diff bswap32: u32(u32)
+uint32_t bswap32(uint32_t x) { return __builtin_bswap32(x); }
+
+// @diff rotl64: u64(u64, u32)
+uint64_t rotl64(uint64_t x, uint32_t n) { return (x << (n & 63)) | (x >> (-n & 63)); }
+
+// @diff rotr16: u16(u16, u32)
+uint16_t rotr16(uint16_t x, uint32_t n) { return (uint16_t)((x >> (n & 15)) | (x << (-n & 15))); }
+
+// Shifting a byte by up to 31: x86 doesn't wrap the count at 8.
+// @diff shr8_cl: u8(buf:4, u32)
+uint8_t shr8_cl(uint8_t *p, uint32_t n) { uint8_t v = p[0]; __asm__("shrb %%cl, %0" : "+r"(v) : "c"(n)); return v; }
+
+// @diff bit_set: u64(u64, u32:0..64)
+uint64_t bit_set(uint64_t x, uint32_t n) { return (x >> (n & 63)) & 1 ? 7 : 9; }
+
+/* ---- atomics (single-threaded here) ---- */
+
+// @diff fetch_add: u64(buf:16, u64)
+uint64_t fetch_add(uint8_t *p, uint64_t v) { return __atomic_fetch_add((uint64_t *)p, v, __ATOMIC_SEQ_CST); }
+
+// @diff swap_in: u64(buf:16, u64)
+uint64_t swap_in(uint8_t *p, uint64_t v) { return __atomic_exchange_n((uint64_t *)p, v, __ATOMIC_SEQ_CST); }
+
+// @diff cas: u64(buf:16, u64, u64)
+uint64_t cas(uint8_t *p, uint64_t expect, uint64_t v) {
+    __atomic_compare_exchange_n((uint64_t *)p, &expect, v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return expect;
+}
+
+// @diff cas_hit: u64(buf:16, u64)
+uint64_t cas_hit(uint8_t *p, uint64_t v) {
+    uint64_t expect = *(uint64_t *)p;
+    return __atomic_compare_exchange_n((uint64_t *)p, &expect, v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 2;
+}
+
+/* ---- SSE moves ---- */
+
+struct pair { uint64_t a, b; };
+
+// A 16-byte struct copy: movups / movdqu.
+// @diff copy16: void(buf:32, buf:32)
+void copy16(uint8_t *d, const uint8_t *s) { *(struct pair *)d = *(const struct pair *)s; }
+
+// Zeroing: xorps / pxor, then 16-byte stores.
+// @diff zero48: void(buf:64)
+void zero48(uint8_t *p) { memset(p, 0, 48); }
+
+// Two 8-byte values into one 16-byte store: movq / punpcklqdq.
+// @diff store_pair: void(buf:32, u64, u64)
+void store_pair(uint8_t *p, uint64_t a, uint64_t b) { struct pair x = { a, b }; *(struct pair *)p = x; }
+
+/* ---- jump tables ---- */
+
+// Dense cases with code in each: an indirect jump through a table.
+// @diff jump_table: u64(u64:0..16, u64)
+uint64_t jump_table(uint64_t i, uint64_t x) {
+    switch (i) {
+    case 0: return x * 3 + 1;
+    case 1: return x ^ 0x5555;
+    case 2: return x << 3;
+    case 3: return x - 77;
+    case 4: return ~x;
+    case 5: return x * x;
+    case 6: return x >> 5;
+    case 7: return x + i * 1000;
+    case 8: return x | 0xf0f0;
+    case 9: return x & 0x0ff0;
+    case 10: return x * 41;
+    default: return 5;
+    }
+}

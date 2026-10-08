@@ -2,9 +2,11 @@
 //! the same thing as the machine code it came from?
 //!
 //! `tests/differential/corpus.c` is compiled with every C compiler found (`cc`,
-//! `clang`) at -O1, -O2 and -Os. Each function in the object file is lifted, cleaned
-//! and emitted in both modes, exactly as the CLI does. A generated Rust program links
-//! the original object file next to the decompiled source and calls both on the
+//! `clang`) at -O1, -O2 and -Os, and the object file is also linked into a program
+//! (`-nostartfiles`), so that its data and jump tables sit at real addresses. Each
+//! function in that program is lifted, cleaned and emitted in both modes, exactly as
+//! the CLI does, with the data it points into as statics. A generated Rust program
+//! links the original object file next to the decompiled source and calls both on the
 //! same random inputs, comparing return values and every byte of every buffer
 //! argument afterwards. Each (function, mode) runs in its own process, so a crash or
 //! an infinite loop in decompiled code is reported against that function alone.
@@ -24,11 +26,12 @@
 //! The full table is written to `$CARGO_TARGET_TMPDIR/differential/report.txt`.
 use chungusite::{
     emit::Mode,
+    globals::{Globals, PRELUDE},
     load::Binary,
     program::{Input, Program},
 };
 use rayon::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -37,12 +40,7 @@ use std::time::{Duration, Instant};
 /// Decompiled code that is known to compute the wrong thing, as
 /// `("compiler/-Olevel/function/mode" substring, reason)`. Each entry is a bug to fix;
 /// remove it once the case passes (the test prints a note when it does).
-const KNOWN_BAD: &[(&str, &str)] = &[
-    // The compiler turns the switch into a lookup table in .rodata. RIP-relative
-    // loads are lifted as constant addresses, which read the original process's
-    // memory (roadmap item 6), so the decompiled code dereferences a bogus pointer.
-    ("/switch8/", "jump/lookup table in .rodata: globals aren't mapped to statics yet"),
-];
+const KNOWN_BAD: &[(&str, &str)] = &[];
 
 const OPT_LEVELS: [&str; 3] = ["-O1", "-O2", "-Os"];
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -153,7 +151,7 @@ fn parse_corpus(src: &str) -> Vec<Case> {
 }
 
 // ---------------------------------------------------------------------------
-// Decompiling one object file
+// Decompiling the linked corpus
 
 /// One function's decompiled source, or why it didn't lift.
 struct Decompiled {
@@ -163,12 +161,12 @@ struct Decompiled {
 
 const SYSV: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
 
-/// Decompile the object file the way the CLI does: every function, so calls see
-/// their callees' signatures, with the corpus cases selected for emission. Also
-/// returns each mode's prelude (the `extern "C"` block for callees that aren't
-/// emitted).
-fn decompile(obj: &[u8], cases: &[Case]) -> (Vec<Decompiled>, [String; 2]) {
-    let bin = Binary::parse(obj).expect("compiler output should parse");
+/// Decompile the program the way the CLI does: every function, so calls see their
+/// callees' signatures, with the corpus cases selected for emission, and data the
+/// code points into as statics. Also returns each mode's prelude (the `extern "C"`
+/// block for callees that aren't emitted, and the statics).
+fn decompile(file: &[u8], cases: &[Case]) -> (Vec<Decompiled>, [String; 2]) {
+    let bin = Binary::parse(file).expect("compiler output should parse");
     let inputs = bin
         .funcs
         .iter()
@@ -177,8 +175,12 @@ fn decompile(obj: &[u8], cases: &[Case]) -> (Vec<Decompiled>, [String; 2]) {
             Input { name: fb.name.clone(), ident: fb.name.clone(), addr: fb.addr, bytes: fb.bytes, selected }
         })
         .collect();
-    let program = Program::build(inputs, Some(obj), false);
-    let [fast, safe] = [Mode::Fast, Mode::Safe].map(|m| program.emit_all(m, &|_| None));
+    let used: HashSet<String> = bin.funcs.iter().map(|f| f.name.clone()).collect();
+    let by_addr: HashMap<u64, &str> = bin.funcs.iter().map(|f| (f.addr, f.name.as_str())).collect();
+    let globals = Globals::new(&bin, used, &by_addr);
+    let global_of = |addr: u64| globals.expr(addr);
+    let program = Program::build(inputs, Some(file), false);
+    let [fast, safe] = [Mode::Fast, Mode::Safe].map(|m| program.emit_all(m, &global_of));
     let decompiled = cases
         .iter()
         .map(|case| {
@@ -197,7 +199,29 @@ fn decompile(obj: &[u8], cases: &[Case]) -> (Vec<Decompiled>, [String; 2]) {
             Decompiled { case: case.clone(), result }
         })
         .collect();
-    let prelude = program.prelude();
+    let mut prelude = program.prelude();
+    // The statics the emitted functions use, and the ones those point to.
+    let mut statics = BTreeSet::new();
+    for f in program.funcs.iter().filter(|f| f.selected) {
+        if let Ok(ir) = &f.ir {
+            let mut items = Vec::new();
+            globals.referenced(ir, &mut items);
+            statics.extend(items);
+        }
+    }
+    if !statics.is_empty() {
+        prelude.push_str(PRELUDE);
+        let mut todo: Vec<_> = statics.iter().copied().collect();
+        let mut more = Vec::new();
+        while !todo.is_empty() {
+            for item in &todo {
+                globals.emit_static(item, &mut prelude, &mut more);
+            }
+            more.sort();
+            more.dedup();
+            todo = more.drain(..).filter(|i| statics.insert(*i)).collect();
+        }
+    }
     (decompiled, [prelude.clone(), prelude])
 }
 
@@ -556,7 +580,13 @@ fn check_variant(v: &Variant, cases: &[Case], corpus: &Path, root: &Path) -> Vec
     let out = Command::new(&v.cc).args([v.opt, "-c", "-o"]).arg(&obj).arg(corpus).output().unwrap();
     assert!(out.status.success(), "{} {} failed on corpus.c:\n{}", v.cc, v.opt, String::from_utf8_lossy(&out.stderr));
 
-    let (decompiled, prelude) = decompile(&std::fs::read(&obj).unwrap(), cases);
+    // Decompile the object linked into a program, as a decompiler would see it:
+    // relocations applied, and .rodata (lookup and jump tables) at real addresses.
+    // The runner links the object itself, which is the same code.
+    let linked = dir.join("corpus.elf");
+    let out = Command::new(&v.cc).arg("-nostartfiles").arg("-o").arg(&linked).arg(&obj).output().unwrap();
+    assert!(out.status.success(), "{} failed to link corpus.o:\n{}", v.cc, String::from_utf8_lossy(&out.stderr));
+    let (decompiled, prelude) = decompile(&std::fs::read(&linked).unwrap(), cases);
     let lifted: Vec<&Decompiled> = decompiled.iter().filter(|d| d.result.is_ok()).collect();
     let (main, fast, safe) = runner_source(&lifted, &prelude);
     std::fs::write(dir.join("fast.rs"), fast).unwrap();

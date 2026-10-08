@@ -94,6 +94,20 @@ fn parse_addr(s: &str) -> Result<u64, String> {
     r.map_err(|e| format!("bad address {s:?}: {e}"))
 }
 
+/// The input file, mapped into memory rather than read: the decompiler only
+/// touches the parts it needs, and the OS pages them in from its cache.
+fn read(path: &std::path::Path) -> std::io::Result<Box<dyn std::ops::Deref<Target = [u8]>>> {
+    let file = std::fs::File::open(path)?;
+    // SAFETY: the map is read-only. If another process truncates or rewrites the
+    // file while it is mapped, reads can fault or see the new bytes; that is the
+    // usual caveat of mapping an input file, and acceptable for a command-line tool.
+    match unsafe { memmap2::Mmap::map(&file) } {
+        Ok(m) => Ok(Box::new(m)),
+        // empty files and special files can't be mapped
+        Err(_) => Ok(Box::new(std::fs::read(path)?)),
+    }
+}
+
 fn parse_hex(s: &str) -> Result<Vec<u8>, String> {
     let digits: Vec<u8> = s.bytes().filter(u8::is_ascii_hexdigit).collect();
     if !digits.len().is_multiple_of(2) {
@@ -120,7 +134,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     if let Some(n) = cli.jobs {
         rayon::ThreadPoolBuilder::new().num_threads(n).build_global().map_err(|e| e.to_string())?;
     }
-    let data;
+    let data: Box<dyn std::ops::Deref<Target = [u8]>>;
     let hex_bytes;
     let bin;
     // `all` is every function in the binary: signatures depend on the callees,
@@ -128,12 +142,12 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     let (all, funcs, source, bin): (Vec<FuncBytes>, Vec<FuncBytes>, String, Option<&Binary>) = match (&cli.hex, &cli.input) {
         (Some(h), _) => {
             hex_bytes = parse_hex(h)?;
-            data = Vec::new();
+            data = Box::new(Vec::new());
             let f = || FuncBytes { name: "func".into(), demangled: None, addr: 0x1000, bytes: &hex_bytes };
             (vec![f()], vec![f()], "hex input".into(), None)
         }
         (None, Some(path)) => {
-            data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            data = read(path).map_err(|e| format!("{}: {e}", path.display()))?;
             bin = Binary::parse(&data).map_err(|e| format!("{}: {e}", path.display()))?;
             let all = bin.funcs.iter().map(copy).collect();
             (all, select(&bin, cli)?, path.display().to_string(), Some(&bin))
@@ -164,8 +178,12 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         .map(|f| Input { name: f.name.clone(), ident: String::new(), addr: f.addr, bytes: f.bytes, selected: false })
         .collect();
     let mut index = Vec::with_capacity(funcs.len());
+    let mut at: HashMap<(u64, usize), usize> = HashMap::with_capacity(inputs.len());
+    for (i, x) in inputs.iter().enumerate().rev() {
+        at.insert((x.addr, x.bytes.len()), i);
+    }
     for (fb, ident) in funcs.iter().zip(&idents) {
-        match inputs.iter().position(|x| x.addr == fb.addr && x.bytes.len() == fb.bytes.len() && !x.selected) {
+        match at.get(&(fb.addr, fb.bytes.len())).copied().filter(|&i| !inputs[i].selected) {
             Some(i) => {
                 inputs[i].ident = ident.clone();
                 inputs[i].selected = true;

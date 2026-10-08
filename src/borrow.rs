@@ -163,17 +163,10 @@ fn konst(f: &Function, v: ValueId) -> Option<i64> {
 
 /// Edge argument `k` on every edge from `p` into `b`.
 fn incoming(f: &Function, p: BlockId, b: BlockId, k: usize, mut cb: impl FnMut(ValueId)) {
-    match f.blocks[p].term {
-        Terminator::Jump { to, args } if to == b => cb(f.value_pool[args.start as usize + k]),
-        Terminator::Branch { t, f: e, args, .. } => {
-            if t == b {
-                cb(f.value_pool[args.start as usize + k]);
-            }
-            if e == b {
-                cb(f.value_pool[args.start as usize + f.blocks[t].params.len as usize + k]);
-            }
+    for (s, args) in f.edges(p) {
+        if s == b {
+            cb(args[k]);
         }
-        _ => {}
     }
 }
 

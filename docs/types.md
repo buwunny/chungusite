@@ -59,9 +59,11 @@ Every type is a claim the emitted code relies on, so each one keeps what the mac
 
 ## In the emitted code
 
-- Signatures carry the types and debug names. The prologue converts typed arguments back to the `u64` register variables the body was written against, so bodies need no type-directed rewriting; values inside a body are typed integers and pointer values are still `u64` addresses.
+- Signatures carry the types and debug names. The prologue converts typed arguments back to the `u64` register variables the body was written against, so bodies need no type-directed rewriting; values inside a body are typed integers.
+- A value in the body that points at a struct is a `*mut S` when it is loaded from memory or carried by a block parameter and every use is one the emitter converts: an access through it, an address computed from it, a compare, a call argument, an edge copy or a return. Its field reads are `(*v7).next`, and a compare with 0 is `v7.is_null()`. Arguments stay `u64` registers in the body. On chungusite's own debug build 10,922 locals are typed pointers, with 867 `is_null()` tests.
 - 8- and 16-bit arguments are widened by their own signedness, matching clang's caller-side extension, so a debug `i8` parameter sees the same register value the original did.
 - In fast mode an access that is exactly a field of a typed pointer argument reads `(*p).field`; in safe mode an argument `borrow::analyze` classifies as a reference, all of whose accesses are exact fields, is `&S`/`&mut S` and accesses are `p.field`, unless decompiled code calls the function or it lends the argument to a callee as a slice (callers lend byte slices, not structs). A field access never replaces a bounds-checked slice access.
+- In safe mode a slice argument whose pointee is a 2-, 4- or 8-byte integer is `&[T]`/`&mut [T]` when every access through it reads or writes one whole element at an offset from the argument that is provably a multiple of the element size (a residue-mod-`w` dataflow over the body), nothing copies or fills it, and it isn't passed to a call. Accesses index elements: `a[v8 as usize]` when the address is plainly `a + 4 * v8`, `a[(p - a_base) / 4]` for a pointer walk. The same gate as structs applies (no decompiled caller, since callers lend bytes). On chungusite's own debug build 78 functions take one.
 - Calls between decompiled functions pass and receive the callee's types.
 
 The stderr summary adds a line: `types: A of B arguments typed, N structs inferred from field accesses, K prototypes from debug info`. On chungusite's own debug build: 45,587 of 63,944 arguments typed, 1,938 inferred structs, 7,175 prototypes from debug info; without debug info, 42,546 typed. Before pointee classes crossed calls these were 29,392 and 23,922, and 72,892 accesses printed as struct fields, now 73,998. The fast-mode output type-checks.
@@ -80,10 +82,8 @@ It is asked about each argument and the return value (`Var::Arg`, `Var::Ret`) of
 
 ## Tests
 
-`tests/types.rs` checks prototypes and structs from `gcc -O2 -g`, safe-mode struct references, `--no-dwarf` inference, one struct across callers and callees (with and without the callees' debug info), `parse_label` and the gate. `tests/differential.rs` runs each corpus build both without and with `-g`, so a wrong type from either source shows up as a wrong result; 1,724 of 1,728 pairs pass and none disagree.
+`tests/types.rs` checks prototypes and structs from `gcc -O2 -g`, safe-mode struct references, `--no-dwarf` inference, one struct across callers and callees (with and without the callees' debug info), typed pointer locals, `&[T]` arguments, `parse_label` and the gate. `tests/differential.rs` runs each corpus build both without and with `-g`, so a wrong type from either source shows up as a wrong result; 1,724 of 1,728 pairs pass and none disagree.
 
 ## Next
 
-- Pointer values inside bodies as real pointers rather than `u64`.
-- Indexed arguments in safe mode as `&[T]` rather than `&[u8]`.
 - Typed statics (`[u32; N]`, strings) from how globals are accessed.

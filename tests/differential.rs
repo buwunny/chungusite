@@ -281,6 +281,11 @@ fn call_args(src: &str, case: &Case) -> Result<String, String> {
             ("&mut [u8]", Some(i)) if buf(i) => format!("a.slice({i})"),
             ("Option<&[u8]>", Some(i)) if buf(i) => format!("Some(a.shared({i}))"),
             ("Option<&mut [u8]>", Some(i)) if buf(i) => format!("Some(a.slice({i}))"),
+            // a slice of wider elements: the buffer's whole elements
+            (t, Some(i)) if buf(i) && t.starts_with("&mut [") => format!("a.elems_mut({i})"),
+            (t, Some(i)) if buf(i) && t.starts_with("&[") => format!("a.elems({i})"),
+            (t, Some(i)) if buf(i) && t.starts_with("Option<&mut [") => format!("Some(a.elems_mut({i}))"),
+            (t, Some(i)) if buf(i) && t.starts_with("Option<&[") => format!("Some(a.elems({i}))"),
             // a struct the buffer holds
             (t, Some(i)) if buf(i) && t.starts_with("&mut ") => format!("&mut *(a.reg({i}) as *mut _)"),
             (t, Some(i)) if buf(i) && t.starts_with('&') => format!("&*(a.reg({i}) as *const _)"),
@@ -505,6 +510,12 @@ impl Args {
         unsafe { std::slice::from_raw_parts_mut(self.bufs[i].as_mut_ptr(), self.bufs[i].len()) }
     }
     fn shared(&mut self, i: usize) -> &'static [u8] { self.slice(i) }
+    fn elems_mut<T>(&mut self, i: usize) -> &'static mut [T] {
+        let b = &mut self.bufs[i];
+        assert!(b.as_ptr() as usize % std::mem::align_of::<T>() == 0, "unaligned buffer");
+        unsafe { std::slice::from_raw_parts_mut(b.as_mut_ptr() as *mut T, b.len() / std::mem::size_of::<T>()) }
+    }
+    fn elems<T>(&mut self, i: usize) -> &'static [T] { self.elems_mut(i) }
     fn stack(&mut self) -> u64 { self.stack.as_mut_ptr() as u64 + 4096 }
     fn junk(&mut self) -> u64 { self.junk }
     fn base(&self, i: usize) -> u64 { self.bufs[i].as_ptr() as u64 }

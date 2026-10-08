@@ -12,17 +12,22 @@
 //!   bounds-checked slice read or write; everything else falls back to the
 //!   fast-mode raw access. The function is only `unsafe` if a raw access remains.
 //!
-//! Control flow is structured (`structure.rs`): `if`/`else`, `loop` with `break`
-//! and `continue`, and early `return`, with block parameters as mutable variables.
-//! An irreducible CFG falls back to a `loop { match bb { .. } }` state machine,
-//! which is correct for any CFG.
+//! Control flow is structured (`structure.rs`): `if`/`else`, `while`, `loop` with
+//! `break` and `continue`, and early `return`, with block parameters as mutable
+//! variables. Only an irreducible part of the CFG becomes a
+//! `loop { match bb { .. } }` state machine.
+//!
+//! A value used once, in the block that defines it, is written into its use
+//! instead of getting a `let` (a load only if nothing between them writes
+//! memory), and constants are always written as literals.
 //!
 //! The input must be clean SSA (`opt::clean`), which is what the borrow analysis
 //! expects too.
 use crate::abi::{Sig, Site, STACK_ARG_BASE, SYSV_ARGS};
 use crate::borrow::{analyze, Class, ParamBorrow, RSP};
 use crate::cfg::Cfg;
-use crate::structure::{print, structure, Node, Source};
+use crate::expr::{self, lit};
+use crate::structure::{print, structure, Node, Source, DISPATCH_VAR};
 use crate::ir::*;
 use crate::verify::for_each_operand;
 use std::fmt::Write;
@@ -41,8 +46,9 @@ pub struct EmitStats {
     pub raw: usize,
     /// Instructions or terminators the emitter can't express yet (`todo!()`).
     pub todo: usize,
-    /// Functions whose control flow is irreducible, emitted as a
-    /// `loop { match bb { .. } }` state machine instead of structured code.
+    /// Functions with irreducible control flow, which is emitted as a
+    /// `loop { match bb { .. } }` state machine (just the irreducible part,
+    /// unless structuring is off or fails).
     pub state_machines: usize,
 }
 
@@ -107,6 +113,10 @@ struct Emitter<'a> {
     /// Values that need a variable declared up front (block params, and values
     /// used outside the block that defines them).
     hoisted: Vec<bool>,
+    /// Values written into their single use instead of getting a `let`.
+    inline: Vec<bool>,
+    /// The expression of each inlined value, once its block has been emitted.
+    exprs: Vec<Option<String>>,
     /// Rust expression for a constant address that points into the binary's data.
     global_of: &'a dyn Fn(u64) -> Option<String>,
     stats: EmitStats,
@@ -175,17 +185,22 @@ pub fn emit_function_in(f: &Function, name: &str, mode: Mode, env: &Env, out: &m
         })
         .collect();
 
+    let hoisted = hoisted(f, &cfg);
+    let skip = callee_only(f, &cfg, env.call);
+    let inline = inlined(f, &cfg, &hoisted, &skip, mode == Mode::Safe);
     let mut e = Emitter {
         f,
         sig: env.sig,
         call: env.call,
         used: used(f, &cfg),
-        skip: callee_only(f, &cfg, env.call),
+        skip,
         structure: env.structure,
         borrow,
         args,
         entry_param,
-        hoisted: hoisted(f, &cfg),
+        hoisted,
+        exprs: vec![None; inline.len()],
+        inline,
         global_of: env.global_of,
         stats: EmitStats::default(),
     };
@@ -295,6 +310,83 @@ fn callee_only(f: &Function, cfg: &Cfg, call: &dyn Fn(Site) -> Option<CallInfo>)
     skip
 }
 
+/// Pure instructions that can move to their use.
+fn pure(k: InstKind) -> bool {
+    use InstKind::*;
+    match k {
+        Bin { op, .. } => !matches!(op, BinOp::UDiv | BinOp::SDiv | BinOp::URem | BinOp::SRem),
+        Un { .. } | Cmp { .. } | Cast { .. } | Select { .. } | PtrOffset { .. } | IntToPtr(_) | PtrToInt(_)
+        | AddrOfLocal(_) | Aggregate { .. } => true,
+        _ => false,
+    }
+}
+
+/// Instructions that read memory or can panic: they can move to their use only
+/// past instructions that do neither.
+fn movable(k: InstKind) -> bool {
+    match k {
+        InstKind::Load { volatile, .. } => !volatile,
+        InstKind::Bin { op, .. } => matches!(op, BinOp::UDiv | BinOp::SDiv | BinOp::URem | BinOp::SRem),
+        _ => false,
+    }
+}
+
+/// Values written straight into their only use: used once, in the block that
+/// defines them, and either pure or (`movable`) with nothing between the
+/// definition and the use that writes memory or calls. "The use" is where the
+/// expression ends up, which is the use of the user when that is inlined too.
+/// In safe mode a load stays out of a store, which may borrow the same slice
+/// mutably.
+fn inlined(f: &Function, cfg: &Cfg, hoisted: &[bool], skip: &[bool], safe: bool) -> Vec<bool> {
+    let n = f.insts.len();
+    let mut uses = vec![0u32; n];
+    for &b in &cfg.rpo {
+        let blk = &f.blocks[b];
+        for &id in blk.insts.get(&f.value_pool) {
+            for_each_operand(f.insts[id].kind, f, |v| uses[v.index()] += 1);
+        }
+        term_uses(f, blk.term, |v| uses[v.index()] += 1);
+    }
+    let mut inline = vec![false; n];
+    let mut user = vec![u32::MAX; n];
+    let mut pos = vec![0u32; n];
+    for &b in &cfg.rpo {
+        let blk = &f.blocks[b];
+        let insts = blk.insts.get(&f.value_pool);
+        let end = insts.len() as u32;
+        for (i, &id) in insts.iter().enumerate() {
+            for_each_operand(f.insts[id].kind, f, |v| user[v.index()] = i as u32);
+        }
+        term_uses(f, blk.term, |v| user[v.index()] = end);
+        // barriers[i] = instructions before i that write memory or call
+        let mut barriers = vec![0u32; insts.len() + 1];
+        for (i, &id) in insts.iter().enumerate() {
+            let k = f.insts[id].kind;
+            let barrier = !skip[id.index()] && !pure(k) && !movable(k) && !matches!(k, InstKind::Const(_) | InstKind::Undef | InstKind::CallOut { .. } | InstKind::BlockParam(_));
+            barriers[i + 1] = barriers[i] + barrier as u32;
+        }
+        for (i, &id) in insts.iter().enumerate().rev() {
+            let k = f.insts[id].kind;
+            let v = id.index();
+            if uses[v] != 1 || hoisted[v] || skip[v] || !(pure(k) || movable(k)) {
+                continue;
+            }
+            let mut p = user[v];
+            // `if a { if b { x } else { y } } else { z }` on one line is too much
+            if matches!(k, InstKind::Select { .. }) && p < end && matches!(f.insts[insts[p as usize]].kind, InstKind::Select { .. }) {
+                continue;
+            }
+            if p < end && inline[insts[p as usize].index()] {
+                p = pos[insts[p as usize].index()];
+            }
+            pos[v] = p;
+            let into_store = p < end && matches!(f.insts[insts[p as usize]].kind, InstKind::Store { .. });
+            inline[v] = !movable(k) || barriers[p as usize] == barriers[i + 1] && !(safe && into_store);
+        }
+    }
+    inline
+}
+
 fn term_uses(f: &Function, t: Terminator, mut cb: impl FnMut(ValueId)) {
     let list = |l: ListRef, cb: &mut dyn FnMut(ValueId)| l.get(&f.value_pool).iter().for_each(|&v| cb(v));
     match t {
@@ -343,11 +435,59 @@ fn signed(ty: TyId) -> &'static str {
 }
 
 impl Emitter<'_> {
+    /// The value as an expression: its variable, its literal, or (if inlined) its
+    /// whole expression.
     fn name(&self, v: ValueId) -> String {
+        let ty = self.ty(v);
         match (self.entry_param[v.index()], self.f.insts[v].kind) {
             (Some(_), InstKind::BlockParam(r)) if r >= STACK_ARG_BASE => format!("arg{}", 6 + (r - STACK_ARG_BASE) as usize),
             (Some(_), InstKind::BlockParam(r)) => REG[r as usize & 15].to_string(),
-            _ => format!("v{}", v.index()),
+            _ if self.is_lit(v) && ty == TyId::BOOL => (self.konst(v) != Some(0)).to_string(),
+            _ if self.is_lit(v) => format!("{}_{}", lit(self.konst(v).unwrap_or(0)), rty(ty)),
+            _ => match &self.exprs[v.index()] {
+                Some(e) => e.clone(),
+                None => {
+                    debug_assert!(!self.inline[v.index()], "v{} used before its block was emitted", v.index());
+                    format!("v{}", v.index())
+                }
+            },
+        }
+    }
+
+    /// Constants (and undefined values, which are zero) are written as literals
+    /// where they are used, and get no variable.
+    fn is_lit(&self, v: ValueId) -> bool {
+        matches!(self.f.insts[v].kind, InstKind::Const(_) | InstKind::Undef) && !matches!(self.ty(v), TyId::PAIR | TyId::UNIT)
+    }
+
+    /// A constant's value, masked to its type.
+    fn konst(&self, v: ValueId) -> Option<u64> {
+        match self.f.insts[v].kind {
+            InstKind::Const(c) => {
+                let ty = self.ty(v);
+                let mask = if bytes(ty) >= 8 { u64::MAX } else { (1u64 << (bytes(ty) * 8)) - 1 };
+                Some(self.f.consts[c.index()] as u64 & mask)
+            }
+            InstKind::Undef => Some(0),
+            _ => None,
+        }
+    }
+
+    /// `v` where its type is already fixed by the other operand: a constant needs
+    /// no suffix there.
+    fn operand(&self, v: ValueId) -> String {
+        match self.konst(v) {
+            Some(c) if self.ty(v) != TyId::BOOL => lit(c),
+            _ => expr::rhs(self.name(v)),
+        }
+    }
+
+    /// `v as u64`, or just `v` if it already is one.
+    fn as_u64(&self, v: ValueId) -> String {
+        if rty(self.ty(v)) == "u64" {
+            self.name(v)
+        } else {
+            format!("{} as u64", expr::cast(self.name(v)))
         }
     }
 
@@ -444,7 +584,7 @@ impl Emitter<'_> {
         for &b in &cfg.rpo {
             let blk = &f.blocks[b];
             for &v in blk.params.get(&f.value_pool).iter().chain(blk.insts.get(&f.value_pool)) {
-                if self.hoisted[v.index()] && !self.skip[v.index()] {
+                if self.hoisted[v.index()] && !self.skip[v.index()] && !self.is_lit(v) {
                     let zero = match self.ty(v) {
                         TyId::BOOL => "false",
                         TyId::PAIR => "(0, 0)",
@@ -463,8 +603,12 @@ impl Emitter<'_> {
         // again below if it doesn't, so count them only once.
         let before = self.stats;
         if self.structure {
-            if let Some(nodes) = structure(f, cfg, self) {
-                print(&nodes, 1, out);
+            if let Some(s) = structure(f, cfg, self) {
+                if s.regions > 0 {
+                    self.stats.state_machines += 1;
+                    let _ = writeln!(out, "    let mut {DISPATCH_VAR}: u32 = {};", f.entry.index());
+                }
+                print(&s.nodes, 1, out);
                 return;
             }
             self.stats = before;
@@ -486,10 +630,17 @@ impl Emitter<'_> {
         let blk = &f.blocks[b];
         let mut out = Vec::new();
         for &id in blk.insts.get(&f.value_pool) {
-            if self.skip[id.index()] {
+            if self.skip[id.index()] || self.is_lit(id) {
                 continue;
             }
             let at = f.origin.get(id.index()).copied().unwrap_or(0);
+            if self.inline[id.index()] {
+                if let Stmt::Value(e) = self.inst(id) {
+                    self.exprs[id.index()] = Some(e);
+                    continue;
+                }
+                unreachable!("only plain values are inlined");
+            }
             let n = self.name(id);
             match self.inst(id) {
                 Stmt::Value(e) if self.hoisted[id.index()] => out.push(format!("{n} = {e}; // {at:#x}")),
@@ -514,7 +665,7 @@ impl Emitter<'_> {
         let t = self.f.blocks[b].term;
         match t {
             Terminator::Return(Some(v)) if self.ty(v) == TyId::PAIR => format!("return {};", self.name(v)),
-            Terminator::Return(Some(v)) => format!("return {} as u64;", self.name(v)),
+            Terminator::Return(Some(v)) => format!("return {};", self.as_u64(v)),
             Terminator::Return(None) if self.sig.is_some_and(|s| !s.ret) => "return;".to_string(),
             Terminator::Return(None) => "return 0;".to_string(),
             Terminator::TailCall { callee, args } => {
@@ -568,7 +719,22 @@ impl Emitter<'_> {
         let pairs: Vec<(String, String)> = params
             .iter()
             .zip(args)
-            .map(|(&p, &a)| (self.name(p), self.name(a)))
+            .map(|(&p, &a)| {
+                let (pt, at) = (rty(self.ty(p)), rty(self.ty(a)));
+                // the lifter can pass a wider register than the parameter holds
+                let int = |t: &str| t.starts_with('u');
+                let v = match self.konst(a) {
+                    _ if pt == at => self.name(a),
+                    Some(c) if int(pt) && at != "bool" => {
+                        let bits = bytes(self.ty(p)) * 8;
+                        format!("{}_{pt}", lit(if bits >= 64 { c } else { c & ((1 << bits) - 1) }))
+                    }
+                    _ if pt == "bool" && int(at) => format!("{} != 0", expr::lhs(self.name(a), "!=")),
+                    _ if int(pt) && (int(at) || at == "bool") => format!("{} as {pt}", expr::cast(self.name(a))),
+                    _ => self.name(a),
+                };
+                (self.name(p), v)
+            })
             .filter(|(p, a)| p != a)
             .collect();
         match pairs.len() {
@@ -613,7 +779,7 @@ impl Emitter<'_> {
             Undef | CallOut { .. } => format!("0_{t}"),
             Aggregate { ty: TyId::PAIR, fields } => {
                 let v = fields.get(&f.value_pool);
-                format!("({} as u64, {} as u64)", n(v[0]), n(v[1]))
+                format!("({}, {})", self.as_u64(v[0]), self.as_u64(v[1]))
             }
             AddrOfLocal(_) => "frame.as_mut_ptr() as u64".to_string(),
             Call { callee, args } => {
@@ -629,48 +795,33 @@ impl Emitter<'_> {
             Param(i) => format!("todo!(\"param {i}\")"),
             BlockParam(_) => n(id),
             Bin { op, lhs, rhs } => self.bin(op, lhs, rhs),
-            Un { op, v } => match op {
-                UnOp::Neg => format!("{}.wrapping_neg()", n(v)),
-                UnOp::Not => format!("!{}", n(v)),
-                UnOp::Bswap => format!("{}.swap_bytes()", n(v)),
-                UnOp::Popcnt => format!("{}.count_ones() as {t}", n(v)),
-                UnOp::Ctz => format!("{}.trailing_zeros() as {t}", n(v)),
-                UnOp::Clz => format!("{}.leading_zeros() as {t}", n(v)),
-            },
-            Cmp { cc, lhs, rhs } => {
-                let (a, b) = (n(lhs), n(rhs));
-                let s = signed(self.ty(lhs));
-                match cc {
-                    Cond::Eq => format!("{a} == {b}"),
-                    Cond::Ne => format!("{a} != {b}"),
-                    Cond::Ult => format!("{a} < {b}"),
-                    Cond::Ule => format!("{a} <= {b}"),
-                    Cond::Ugt => format!("{a} > {b}"),
-                    Cond::Uge => format!("{a} >= {b}"),
-                    Cond::Slt => format!("({a} as {s}) < ({b} as {s})"),
-                    Cond::Sle => format!("({a} as {s}) <= ({b} as {s})"),
-                    Cond::Sgt => format!("({a} as {s}) > ({b} as {s})"),
-                    Cond::Sge => format!("({a} as {s}) >= ({b} as {s})"),
+            Un { op, v } => {
+                let r = expr::recv(n(v));
+                match op {
+                    UnOp::Neg => format!("{r}.wrapping_neg()"),
+                    UnOp::Not => format!("!{}", expr::unary(n(v))),
+                    UnOp::Bswap => format!("{r}.swap_bytes()"),
+                    UnOp::Popcnt => format!("{r}.count_ones() as {t}"),
+                    UnOp::Ctz => format!("{r}.trailing_zeros() as {t}"),
+                    UnOp::Clz => format!("{r}.leading_zeros() as {t}"),
                 }
             }
-            Cast { kind, v } => match kind {
-                CastKind::SExt => format!("{} as {} as {t}", n(v), signed(self.ty(v))),
-                _ => format!("{} as {t}", n(v)),
-            },
+            Cmp { cc, lhs, rhs } => self.cmp(cc, lhs, rhs),
+            Cast { kind, v } => self.cast(kind, v, ty),
             Select { c, t: a, f: b } => format!("if {} {{ {} }} else {{ {} }}", n(c), n(a), n(b)),
             PtrOffset { base, index, scale, disp } => {
-                let mut s = n(base);
+                let mut s = expr::recv(n(base));
                 if let Some(i) = index {
                     s = if scale == 1 {
                         format!("{s}.wrapping_add({})", n(i))
                     } else {
-                        format!("{s}.wrapping_add({}.wrapping_mul({scale}))", n(i))
+                        format!("{s}.wrapping_add({}.wrapping_mul({scale}))", expr::recv(n(i)))
                     };
                 }
                 match disp {
                     0 => s,
-                    d if d < 0 => format!("{s}.wrapping_sub({:#x})", -(d as i64)),
-                    d => format!("{s}.wrapping_add({d:#x})"),
+                    d if d < 0 => format!("{s}.wrapping_sub({})", lit((d as i64).unsigned_abs())),
+                    d => format!("{s}.wrapping_add({})", lit(d as u64)),
                 }
             }
             IntToPtr(v) => match f.insts[v].kind {
@@ -683,9 +834,9 @@ impl Emitter<'_> {
             MemCopy { dst, src, len } => {
                 let s = format!(
                     "unsafe {{ core::ptr::copy({} as *const u8, {} as *mut u8, {} as usize) }}",
-                    n(src),
-                    n(dst),
-                    n(len)
+                    expr::cast(n(src)),
+                    expr::cast(n(dst)),
+                    expr::cast(n(len))
                 );
                 self.stats.raw += 1;
                 return Stmt::Effect(s);
@@ -713,7 +864,7 @@ impl Emitter<'_> {
         let args = args.get(&self.f.value_pool);
         // Straight from the lifter, a call lists all six argument registers and more.
         let args = if self.sig.is_none() { &args[..args.len().min(6)] } else { args };
-        let a: Vec<String> = args.iter().map(|&v| format!("{} as u64", self.name(v))).collect();
+        let a: Vec<String> = args.iter().map(|&v| self.as_u64(v)).collect();
         let a = a.join(", ");
         match (self.call)(site) {
             Some(CallInfo { path: Some(p), ret, ret2, foreign }) => {
@@ -736,34 +887,137 @@ impl Emitter<'_> {
     }
 
     fn bin(&self, op: BinOp, lhs: ValueId, rhs: ValueId) -> String {
-        let (a, b) = (self.name(lhs), self.name(rhs));
         let ty = self.ty(lhs);
-        let (t, s) = (rty(ty), signed(ty));
+        let t = rty(ty);
+        let infix = |o: &str| format!("{} {o} {}", expr::lhs(self.name(lhs), o), self.operand(rhs));
         if ty == TyId::BOOL {
-            let o = match op {
+            return infix(match op {
                 BinOp::And => "&",
                 BinOp::Or => "|",
                 _ => "^",
-            };
-            return format!("{a} {o} {b}");
+            });
         }
+        let a = expr::recv(self.name(lhs));
+        // the right operand: its type is fixed by the method, so a literal needs no suffix
+        let b = match self.konst(rhs) {
+            Some(c) => lit(c),
+            None => self.name(rhs),
+        };
+        // a shift or rotate amount, as the u32 the method takes
+        let amount = match self.konst(rhs) {
+            Some(c) => lit(c & 0xff),
+            None => format!("{} as u32", expr::cast(self.name(rhs))),
+        };
+        let neg = self.konst(rhs).map(|c| c.wrapping_neg() & if bytes(ty) >= 8 { u64::MAX } else { (1 << (bytes(ty) * 8)) - 1 });
         match op {
+            // `x - 8` reads better than `x + 0xfffffffffffffff8`
+            BinOp::Add if neg.is_some_and(|m| m < 0x10000) => format!("{a}.wrapping_sub({})", lit(neg.unwrap())),
+            BinOp::Sub if neg.is_some_and(|m| m < 0x10000) => format!("{a}.wrapping_add({})", lit(neg.unwrap())),
             BinOp::Add => format!("{a}.wrapping_add({b})"),
             BinOp::Sub => format!("{a}.wrapping_sub({b})"),
             BinOp::Mul => format!("{a}.wrapping_mul({b})"),
-            BinOp::UDiv => format!("{a} / {b}"),
-            BinOp::URem => format!("{a} % {b}"),
-            BinOp::SDiv => format!("({a} as {s}).wrapping_div({b} as {s}) as {t}"),
-            BinOp::SRem => format!("({a} as {s}).wrapping_rem({b} as {s}) as {t}"),
-            BinOp::And => format!("{a} & {b}"),
-            BinOp::Or => format!("{a} | {b}"),
-            BinOp::Xor => format!("{a} ^ {b}"),
-            BinOp::Shl => format!("{a}.wrapping_shl({b} as u32)"),
-            BinOp::LShr => format!("{a}.wrapping_shr({b} as u32)"),
-            BinOp::AShr => format!("({a} as {s}).wrapping_shr({b} as u32) as {t}"),
-            BinOp::RotL => format!("{a}.rotate_left({b} as u32)"),
-            BinOp::RotR => format!("{a}.rotate_right({b} as u32)"),
+            BinOp::UDiv => infix("/"),
+            BinOp::URem => infix("%"),
+            BinOp::SDiv => format!("({}).wrapping_div({}) as {t}", self.signed(lhs), self.signed(rhs)),
+            BinOp::SRem => format!("({}).wrapping_rem({}) as {t}", self.signed(lhs), self.signed(rhs)),
+            BinOp::And => infix("&"),
+            BinOp::Or => infix("|"),
+            BinOp::Xor => infix("^"),
+            BinOp::Shl => format!("{a}.wrapping_shl({amount})"),
+            BinOp::LShr => format!("{a}.wrapping_shr({amount})"),
+            BinOp::AShr => format!("({}).wrapping_shr({amount}) as {t}", self.signed(lhs)),
+            BinOp::RotL => format!("{a}.rotate_left({amount})"),
+            BinOp::RotR => format!("{a}.rotate_right({amount})"),
         }
+    }
+
+    fn cmp(&self, cc: Cond, lhs: ValueId, rhs: ValueId) -> String {
+        let ty = self.ty(lhs);
+        let (op, sign) = match cc {
+            Cond::Eq => ("==", false),
+            Cond::Ne => ("!=", false),
+            Cond::Ult => ("<", false),
+            Cond::Ule => ("<=", false),
+            Cond::Ugt => (">", false),
+            Cond::Uge => (">=", false),
+            Cond::Slt => ("<", true),
+            Cond::Sle => ("<=", true),
+            Cond::Sgt => (">", true),
+            Cond::Sge => (">=", true),
+        };
+        if !sign || ty == TyId::BOOL {
+            return format!("{} {op} {}", expr::lhs(self.name(lhs), op), self.operand(rhs));
+        }
+        let a = format!("({})", self.signed(lhs));
+        let b = match self.konst(rhs) {
+            // the constant as the signed number it is compared as
+            Some(c) => {
+                let bits = bytes(ty) as u32 * 8;
+                let v = ((c << (64 - bits)) as i64) >> (64 - bits);
+                if (-9..10).contains(&v) { v.to_string() } else if v < 0 { format!("-{:#x}", v.unsigned_abs()) } else { format!("{v:#x}") }
+            }
+            None => format!("({})", self.signed(rhs)),
+        };
+        format!("{a} {op} {b}")
+    }
+
+    /// A cast, skipping an inner cast that the outer one makes redundant:
+    /// `x as u32 as u64 as u8` is `x as u8`.
+    fn cast(&self, kind: CastKind, mut v: ValueId, ty: TyId) -> String {
+        let t = rty(ty);
+        if let CastKind::Trunc | CastKind::ZExt = kind {
+            let trunc = matches!(kind, CastKind::Trunc);
+            while self.inline[v.index()] {
+                let InstKind::Cast { kind: inner, v: w } = self.f.insts[v].kind else { break };
+                let redundant = match inner {
+                    CastKind::ZExt => true,
+                    CastKind::Trunc => trunc,
+                    // only the source's own bits survive
+                    CastKind::SExt => trunc && bytes(ty) <= bytes(self.ty(w)),
+                    _ => false,
+                };
+                if !redundant {
+                    break;
+                }
+                v = w;
+            }
+        }
+        if let Some(c) = self.konst(v) {
+            // fold a cast of a constant
+            if self.ty(v) != TyId::BOOL && ty != TyId::BOOL && matches!(kind, CastKind::Trunc | CastKind::ZExt | CastKind::SExt) {
+                let bits = bytes(self.ty(v)) as u32 * 8;
+                let c = if matches!(kind, CastKind::SExt) { (((c << (64 - bits)) as i64) >> (64 - bits)) as u64 } else { c };
+                let mask = if bytes(ty) >= 8 { u64::MAX } else { (1u64 << (bytes(ty) * 8)) - 1 };
+                return format!("{}_{t}", lit(c & mask));
+            }
+        }
+        if rty(self.ty(v)) == t {
+            return self.name(v);
+        }
+        match kind {
+            CastKind::SExt => format!("{} as {t}", self.signed(v)),
+            _ => format!("{} as {t}", expr::cast(self.name(v))),
+        }
+    }
+
+    /// `v` reinterpreted as the signed integer of its width: `v as i32`, where
+    /// casts inside `v` that don't change its low bits are dropped.
+    fn signed(&self, mut v: ValueId) -> String {
+        let width = bytes(self.ty(v));
+        let s = signed(self.ty(v));
+        while self.inline[v.index()] {
+            let InstKind::Cast { kind, v: w } = self.f.insts[v].kind else { break };
+            let keeps_low_bits = match kind {
+                CastKind::ZExt | CastKind::Trunc => true,
+                CastKind::SExt => width <= bytes(self.ty(w)),
+                _ => false,
+            };
+            if !keeps_low_bits || bytes(self.ty(w)) < width || self.ty(w) == TyId::BOOL {
+                break;
+            }
+            v = w;
+        }
+        format!("{} as {s}", expr::cast(self.name(v)))
     }
 
     /// The safe-mode slice an access through `ptr` can use: the argument's name,
@@ -787,6 +1041,7 @@ impl Emitter<'_> {
 
     fn load(&mut self, ptr: ValueId, ty: TyId) -> String {
         let (t, len, p) = (rty(ty), bytes(ty), self.name(ptr));
+        let (pr, pc) = (expr::recv(p.clone()), expr::cast(p));
         if let Some((root, ArgKind::Slice { nullable, mutbl })) = self.slice_root(ptr, false) {
             self.stats.checked += 1;
             let s = match (nullable, mutbl) {
@@ -794,22 +1049,23 @@ impl Emitter<'_> {
                 (true, false) => format!("{root}_ref.unwrap()"),
                 (true, true) => format!("{root}_ref.as_deref().unwrap()"),
             };
-            return format!("{t}::from_le_bytes({s}[{p}.wrapping_sub({root}_base) as usize..][..{len}].try_into().unwrap())");
+            return format!("{t}::from_le_bytes({s}[{pr}.wrapping_sub({root}_base) as usize..][..{len}].try_into().unwrap())");
         }
         self.stats.raw += 1;
-        format!("unsafe {{ ({p} as *const {t}).read_unaligned() }}")
+        format!("unsafe {{ ({pc} as *const {t}).read_unaligned() }}")
     }
 
     fn store(&mut self, ptr: ValueId, val: ValueId) -> String {
         let vt = self.ty(val);
         let (t, len, p, v) = (rty(vt), bytes(vt), self.name(ptr), self.name(val));
+        let (pr, pc, vr) = (expr::recv(p.clone()), expr::cast(p), expr::recv(v.clone()));
         if let Some((root, ArgKind::Slice { nullable, .. })) = self.slice_root(ptr, true) {
             self.stats.checked += 1;
             let s = if nullable { format!("{root}_ref.as_deref_mut().unwrap()") } else { format!("{root}_ref") };
-            return format!("{s}[{p}.wrapping_sub({root}_base) as usize..][..{len}].copy_from_slice(&{v}.to_le_bytes())");
+            return format!("{s}[{pr}.wrapping_sub({root}_base) as usize..][..{len}].copy_from_slice(&{vr}.to_le_bytes())");
         }
         self.stats.raw += 1;
-        format!("unsafe {{ ({p} as *mut {t}).write_unaligned({v}) }}")
+        format!("unsafe {{ ({pc} as *mut {t}).write_unaligned({v}) }}")
     }
 }
 
@@ -837,5 +1093,11 @@ impl Source for Emitter<'_> {
 
     fn exit(&mut self, b: BlockId) -> Node {
         Node::Exit(self.exit_line(b))
+    }
+
+    fn quiet(&self, b: BlockId) -> bool {
+        let blk = &self.f.blocks[b];
+        blk.params.len == 0
+            && blk.insts.get(&self.f.value_pool).iter().all(|&v| self.skip[v.index()] || self.is_lit(v) || self.inline[v.index()])
     }
 }

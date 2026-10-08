@@ -165,6 +165,8 @@ pub struct Lifter {
     /// Each `Call` and its argument registers plus rsp. The arguments go into
     /// `value_pool` in `finalize`, after every block's instruction list is in place.
     calls: Vec<(ValueId, CallRegs)>,
+    /// The last call that doesn't return, while the code after it is skipped.
+    fall: Option<ValueId>,
     /// The same for each block that ends in a `TailCall`.
     tails: Vec<(BlockId, CallRegs)>,
     /// Each `Exit` and the registers it lists.
@@ -212,6 +214,7 @@ impl Lifter {
             leaders: Vec::with_capacity(256),
             state: Vec::with_capacity(256),
             calls: Vec::with_capacity(64),
+            fall: None,
             tails: Vec::with_capacity(8),
             exits: Vec::with_capacity(8),
             tables: Vec::with_capacity(4),
@@ -269,6 +272,7 @@ impl Lifter {
         let mut dec = Decoder::with_ip(64, code, ip, DecoderOptions::NONE);
         let mut next_leader = 1;
         let mut open = true;
+        self.fall = None;
         self.begin_block(0, f);
         while dec.can_decode() {
             dec.decode_out(&mut self.insn);
@@ -280,6 +284,9 @@ impl Lifter {
                 if open {
                     self.end_block(f, Terminator::Jump { to: BlockId::new(next_leader), args: ListRef::EMPTY });
                 }
+                if let Some(c) = self.fall.take() {
+                    f.noreturn_falls.push((c, BlockId::new(next_leader)));
+                }
                 self.begin_block(next_leader, f);
                 next_leader += 1;
                 open = true;
@@ -289,6 +296,18 @@ impl Lifter {
                     self.switch_index = Some(self.read_full(f, t.index.number()));
                 }
                 open = !self.lift_insn(f, noreturn)?;
+            } else if let Some(c) = self.fall {
+                // Follow the code after a call that doesn't return as if it
+                // did, to where it would have gone (`Function::noreturn_falls`).
+                let i = self.insn;
+                if matches!(i.flow_control(), FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch) && i.op0_kind() == OpKind::NearBranch64 {
+                    if let Some(b) = self.block_at(i.near_branch_target()) {
+                        f.noreturn_falls.push((c, b));
+                    }
+                }
+                if !matches!(i.flow_control(), FlowControl::Next | FlowControl::Call | FlowControl::IndirectCall | FlowControl::ConditionalBranch) {
+                    self.fall = None;
+                }
             }
         }
         if open {
@@ -515,6 +534,7 @@ impl Lifter {
                     _ => None,
                 };
                 if noreturn(self.ip, target) {
+                    self.fall = self.calls.last().map(|c| c.0);
                     self.end_block(f, Terminator::Unreachable);
                     return Ok(true);
                 }

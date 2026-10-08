@@ -367,6 +367,25 @@ impl Program {
                 }
             }
         }
+        // What callers set up and whether there are any, for functions with
+        // calls that don't return (`abi::infer`). A tail call passes on
+        // whatever the callee returns, so it counts as reading rax.
+        let mut set_args = vec![0u8; funcs.len()];
+        let mut called = vec![0u8; funcs.len()];
+        for f in &funcs {
+            for ((t, g), s) in f.targets.iter().zip(&f.guesses).zip(&f.sites) {
+                if let Target::Func(j) = t {
+                    set_args[*j] = set_args[*j].max(g.0);
+                    called[*j] |= abi::CALLED | if matches!(s, Site::Tail(_)) { abi::READ_RAX } else { 0 };
+                }
+            }
+        }
+        for (a, c) in set_args.iter_mut().zip(&called) {
+            if *c == 0 {
+                *a = 6;
+            }
+        }
+        wanted_by.clone_from(&called);
         let mut results: Vec<(Sig, Vec<u8>)> = sigs.iter().map(|&s| (s, Vec::new())).collect();
         let mut dirty = vec![true; funcs.len()];
         for _round in 0..MAX_ROUNDS {
@@ -376,7 +395,7 @@ impl Program {
                 .map(|(i, f)| match &f.ir {
                     Ok(ir) if dirty[i] => {
                         let callee = |k: usize| site_sig(&f.targets[k], f.guesses[k], &sigs, &guessed);
-                        let r = abi::infer(ir, &f.sites, &callee, sigs[i], wanted_by[i]);
+                        let r = abi::infer(ir, &f.sites, &callee, sigs[i], wanted_by[i], set_args[i]);
                         Some((Sig { stack_args: stack_args[i], ..r.sig }, r.reads))
                     }
                     _ => None,
@@ -387,7 +406,7 @@ impl Program {
                     results[i] = r;
                 }
             }
-            let mut wanted = vec![0u8; funcs.len()];
+            let mut wanted = called.clone();
             for (f, (_, read)) in funcs.iter().zip(&results) {
                 for (t, &r) in f.targets.iter().zip(read) {
                     if let Target::Func(j) = t {

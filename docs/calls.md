@@ -34,3 +34,4 @@ A decompiled caller passes addresses, not slices, so in safe mode every function
 - Signatures of indirect calls are guessed from the call site.
 - Values returned in memory (structs larger than 16 bytes) appear as the hidden pointer argument in `rdi` and the same pointer returned in `rax`.
 - A function with no return (every path ends in a call that doesn't return, or a loop) preserves nothing and returns nothing.
+- A call that never returns is evidence of neither a result nor an argument. Where one would have fallen through to code that returns (the lifter records where, `Function::noreturn_falls`), a register that code leaves as it was before that point isn't preserved, and rax there is a result only if a caller reads it; unoptimized code leaves whatever it last computed in rax. A register that is live only because a call that never returns takes it (a panic function's unused payload) is an argument only up to what the callers set up.

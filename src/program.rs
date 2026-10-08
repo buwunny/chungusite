@@ -859,6 +859,24 @@ impl Program {
     /// they use SSE lane ops, and `mod ffi`, declaring every extern the emitted
     /// code calls; empty if none of these.
     pub fn prelude(&self) -> String {
+        let p = self.prelude_parts(false);
+        let mut s = p.structs;
+        if p.simd {
+            s.push_str(crate::simd::PRELUDE);
+        }
+        if !p.ffi.is_empty() {
+            s.push_str("\n/// Functions the decompiled code calls but doesn't define.\npub mod ffi {\n");
+            s.push_str(&p.ffi);
+            s.push_str("}\n");
+        }
+        s
+    }
+
+    /// `prelude`'s pieces, for output split into files (`project.rs`). With
+    /// `stub_own`, a function of the binary that the output calls but doesn't
+    /// define (not selected, or not lifted) is a `todo!()` in `mod ffi` instead
+    /// of an extern, so the output links on its own.
+    pub fn prelude_parts(&self, stub_own: bool) -> PreludeParts {
         let mut roots = Vec::new();
         for f in self.funcs.iter().filter(|f| f.selected && f.ir.is_ok()) {
             let Some(t) = &f.types else { continue };
@@ -869,25 +887,25 @@ impl Program {
         roots.sort_unstable_by_key(|t| t.index());
         roots.dedup();
         let structs = crate::types::render_structs(&self.tys, roots);
-        let mut s = String::new();
-        if !structs.is_empty() {
-            s.push('\n');
-            s.push_str(&structs);
-        }
-        if self.funcs.iter().any(|f| f.selected && f.ir.as_ref().is_ok_and(crate::simd::uses)) {
-            s.push_str(crate::simd::PRELUDE);
-        }
+        let mut p = PreludeParts {
+            structs: if structs.is_empty() { String::new() } else { format!("\n{structs}") },
+            simd: self.funcs.iter().any(|f| f.selected && f.ir.as_ref().is_ok_and(crate::simd::uses)),
+            ffi: String::new(),
+        };
         if self.externs.is_empty() {
-            return s;
+            return p;
         }
-        s.push_str("\n/// Functions the decompiled code calls but doesn't define.\npub mod ffi {\n");
+        let s = &mut p.ffi;
         if self.externs.iter().any(|e| e.sig.ret2) {
             s.push_str("    /// A 16-byte result, returned in rax:rdx.\n    #[repr(C)]\n    pub struct Pair(pub u64, pub u64);\n\n");
         }
-        s.push_str("    extern \"C\" {\n");
+        let own: std::collections::HashSet<&str> =
+            if stub_own { self.funcs.iter().map(|f| f.name.as_str()).collect() } else { Default::default() };
         let mut ext: Vec<&Extern> = self.externs.iter().collect();
         ext.sort_by(|a, b| a.ident.cmp(&b.ident));
-        for e in ext {
+        let (stubs, ext): (Vec<&Extern>, Vec<&Extern>) =
+            ext.into_iter().partition(|e| !e.sig.variadic && own.contains(e.name.as_str()));
+        let decl = |e: &Extern| {
             let mut params: Vec<String> = (0..e.sig.args).map(|k| format!("a{k}: u64")).collect();
             params.extend((0..e.sig.stack_args).map(|k| format!("a{}: u64", 6 + k as usize)));
             // an f32 argument or result travels in the same register as an f64
@@ -895,20 +913,43 @@ impl Program {
             if e.sig.variadic {
                 params.push("...".into());
             }
-            if e.ident != e.name {
-                let _ = writeln!(s, "        #[link_name = {:?}]", e.name);
-            }
             let ret = match (e.sig.ret, e.sig.ret2, e.sig.fret) {
                 (_, true, _) => " -> Pair",
                 (true, _, true) => " -> f64",
                 (true, _, _) => " -> u64",
                 _ => "",
             };
-            let _ = writeln!(s, "        pub fn {}({}){ret};", e.ident, params.join(", "));
+            format!("fn {}({}){ret}", e.ident, params.join(", "))
+        };
+        if !ext.is_empty() {
+            s.push_str("    extern \"C\" {\n");
+            for e in ext {
+                if e.ident != e.name {
+                    let _ = writeln!(s, "        #[link_name = {:?}]", e.name);
+                }
+                let _ = writeln!(s, "        pub {};", decl(e));
+            }
+            s.push_str("    }\n");
         }
-        s.push_str("    }\n}\n");
-        s
+        if !stubs.is_empty() {
+            s.push_str("\n    // Functions of the binary that aren't in the output.\n");
+        }
+        for e in stubs {
+            let why = format!("{} isn't decompiled", e.name);
+            let _ = writeln!(s, "    pub unsafe {} {{\n        todo!({why:?})\n    }}", decl(e));
+        }
+        p
     }
+}
+
+/// What `Program::prelude` is made of.
+pub struct PreludeParts {
+    /// The recovered structs, or empty.
+    pub structs: String,
+    /// Whether to include `simd::PRELUDE`.
+    pub simd: bool,
+    /// The body of `mod ffi`, indented one level, or empty if nothing is extern.
+    pub ffi: String,
 }
 
 /// Safe mode's options for `emit_all_with`.

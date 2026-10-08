@@ -110,11 +110,11 @@ Without a symbol table, `src/discover.rs` finds functions from, most trusted fir
 2. the dynamic symbols (exports), which `strip` keeps and which keep their names;
 3. the entry point and the start of each code section;
 4. targets of direct calls and jumps out of a function, `lea reg, [rip+x]` into code, `mov reg, imm` into code in a non-PIE binary, and code addresses the loader writes into data (vtables, function tables);
-5. code that none of the above covers, if it starts with a prologue (`endbr64`, `push rbp`/`rbx`/`r12`-`r15`, `sub rsp, ..`) or at a 16-byte boundary, after any alignment padding.
+5. code that none of the above covers, after any alignment padding: since a function ends where its control flow ends, nothing reaches that code, so it is a function nothing calls directly. Compilers don't always align functions or give them a prologue (clang -Os packs leaf functions back to back).
 
 This repeats until nothing new turns up. A function without unwind info ends at the last instruction its control flow reaches before the next known start. A candidate strictly inside an FDE's range is rejected. Discovered functions are named `sub_<addr>`, except `_start` (the entry point), `main` (what `_start` passes to `__libc_start_main` in `rdi`), and `_init`/`_fini` (the `.init`/`.fini` sections). Calls into imports are named as before, from the PLT stubs and GOT relocations, which `strip` keeps. The summary on stderr says how many functions were discovered.
 
-On chungusite's own debug build, `strip` keeps none of its 20,025 function symbols, and discovery finds all 20,025 starts. 20,021 sizes match the symbol table exactly; the other 4 are crtstuff's hand-written functions, whose symbol sizes include their trailing padding. Lifting and type-checking give the same results with and without symbols. Known gap: without unwind tables, discovery doesn't know which calls don't return, so a function ending in a call to `__stack_chk_fail` or `abort` can run into the next one (gcc -O2 with `-fno-asynchronous-unwind-tables` merges 1 of the corpus's 88 functions this way).
+On chungusite's own debug build, `strip` keeps none of its 20,025 function symbols, and discovery finds all 20,025 starts. 20,021 sizes match the symbol table exactly; the other 4 are crtstuff's hand-written functions, whose symbol sizes include their trailing padding. Lifting and type-checking give the same results with and without symbols. Without unwind tables, a function's end is where its control flow ends: discovery follows jump tables, and stops at calls to imports that don't return (`__stack_chk_fail`, `abort`, `exit`, ...), so such a function doesn't run into the next one.
 
 ## Tests
 

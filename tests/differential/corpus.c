@@ -22,6 +22,7 @@
  */
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define NOINLINE __attribute__((noinline))
@@ -405,6 +406,57 @@ uint64_t stack_buf(uint64_t a, uint64_t b) {
 // @diff max_of3: i64(i64, i64, i64)
 NOINLINE int64_t max2(int64_t a, int64_t b) { return a > b ? a : b; }
 int64_t max_of3(int64_t a, int64_t b, int64_t c) { return max2(max2(a, b), c); }
+
+/* ---- ownership (docs/ownership.md): borrows of locals, heap allocations ---- */
+
+// @diff add_into: void(buf:8, buf:8)
+NOINLINE void add_into(uint64_t *d, const uint64_t *s) { *d += *s; }
+
+// Two locals lent to one callee, one of them mutably: disjoint parts of the frame.
+// @diff two_locals: u64(u64, u64)
+uint64_t two_locals(uint64_t a, uint64_t b) {
+    uint64_t x = a, y = b;
+    add_into(&x, &y);
+    return x ^ (y << 1);
+}
+
+// @diff add_self: void(buf:8, buf:8)
+NOINLINE void add_self(uint64_t *d, const uint64_t *s) { *d += *s * 2; }
+
+// The same local lent twice, once mutably: safe Rust can't, so it stays raw.
+// @diff same_local_twice: u64(u64)
+uint64_t same_local_twice(uint64_t a) {
+    uint64_t x = a;
+    add_self(&x, &x);
+    return x;
+}
+
+// A heap allocation that is written, lent to a callee and freed: a Box.
+// @diff heap_pair: u64(u64, u64)
+uint64_t heap_pair(uint64_t a, uint64_t b) {
+    uint64_t *p = malloc(2 * sizeof *p);
+    if (!p) return 0;
+    p[0] = a;
+    p[1] = b;
+    add_into(&p[0], &p[1]);
+    uint64_t r = p[0] * 3 + p[1];
+    free(p);
+    return r;
+}
+
+// A local array filled and copied with memset and memcpy, then summed. The
+// lengths are arguments, so these stay calls.
+// @diff local_copy: u64(buf:32, u8, u64:0..49, u64:0..33)
+uint64_t local_copy(const uint8_t *src, uint8_t c, uint64_t n, uint64_t m) {
+    uint8_t t[48];
+    memset(t, c, n);
+    memset(t + n, 0, 48 - n);
+    if (m > 40 - (n > 40 ? 40 : n)) m = 0;
+    memcpy(t + 8, src, m);
+    uint64_t s = 0;
+    for (int i = 0; i < 48; i++) s = s * 31 + t[i];
+    return s;
+}
 
 /* ---- wide multiplies and 16-byte copies ---- */
 

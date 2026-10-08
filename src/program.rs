@@ -14,6 +14,7 @@
 //! that aren't emitted (not selected, or not lifted), are declared in an
 //! `extern "C"` block in `mod ffi` (`prelude`) and called through it.
 use crate::abi::{self, CallShape, Sig, Site};
+use crate::borrow::{analyze_with, Analysis, Callee, Class, Ctx, Pass};
 use crate::emit::{emit_function_in, CallInfo, EmitStats, Env, Mode};
 use crate::ir::*;
 use crate::lift::Lifter;
@@ -78,6 +79,8 @@ pub struct Program {
     pub funcs: Vec<Func>,
     pub externs: Vec<Extern>,
     extern_of: HashMap<String, usize>,
+    /// GOT slot -> the address in the binary the loader fills it with.
+    got_addr: HashMap<u64, u64>,
 }
 
 /// Names for call targets, from the object file.
@@ -90,6 +93,9 @@ struct Symbols {
     plt: HashMap<u64, String>,
     /// GOT slot address -> symbol.
     got: HashMap<u64, String>,
+    /// GOT slot address -> the address the loader puts there (`R_X86_64_RELATIVE`):
+    /// a function or object in the binary itself.
+    got_addr: HashMap<u64, u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +134,15 @@ impl Symbols {
         // GOT slots filled by the dynamic loader, and the PLT stubs that jump through them.
         s.got = crate::discover::got_names(&file);
         s.plt = crate::discover::plt_names(&file, &s.got);
+        // GOT slots the loader fills with an address in the binary itself
+        // (`R_X86_64_RELATIVE`): calls through them reach a decompiled function.
+        for (at, r) in file.dynamic_relocations().into_iter().flatten() {
+            if let RelocationTarget::Absolute = r.target() {
+                if r.size() == 64 || r.size() == 0 {
+                    s.got_addr.insert(at, r.addend() as u64);
+                }
+            }
+        }
         s
     }
 
@@ -226,7 +241,11 @@ impl Program {
                 }
                 // call [rip+slot]
                 InstKind::Load { ptr, .. } => match f.insts[ptr].kind {
-                    InstKind::IntToPtr(s) => konst(f, s).and_then(|s| syms.got.get(&s)).map_or(Target::Indirect, |n| by_symbol(n)),
+                    InstKind::IntToPtr(s) => match konst(f, s) {
+                        Some(s) if syms.got.contains_key(&s) => by_symbol(&syms.got[&s]),
+                        Some(s) => syms.got_addr.get(&s).and_then(|t| by_addr.get(t)).map_or(Target::Indirect, |&i| Target::Func(i)),
+                        None => Target::Indirect,
+                    },
                     _ => Target::Indirect,
                 },
                 _ => Target::Indirect,
@@ -353,55 +372,104 @@ impl Program {
                 externs.push(Extern { name, ident, sig });
             }
         }
-        Program { funcs, externs, extern_of }
+        Program { funcs, externs, extern_of, got_addr: syms.got_addr }
     }
 
-    /// The callee of each call site in function `i`, for the emitter.
-    fn call_info(&self, i: usize, site: Site) -> Option<CallInfo> {
+    /// The callee of each call site in function `i`, for the emitter. With
+    /// `safe`, in safe mode: how the callee takes each argument, or its raw twin
+    /// if this call can't lend it a slice. With `safe` and `fast`, for code
+    /// emitted in fast mode inside a safe program (a twin, or a function that
+    /// `--check` sent back): callees that take slices are called through their
+    /// twins.
+    fn call_info(&self, i: usize, site: Site, safe: Option<&Summaries>, fast: bool) -> Option<CallInfo> {
         let f = &self.funcs[i];
         let k = f.sites.iter().position(|&s| s == site)?;
         let ext = |name: &str| {
             let e = &self.externs[*self.extern_of.get(name)?];
-            Some(CallInfo { path: Some(format!("ffi::{}", e.ident)), ret: e.sig.ret, ret2: e.sig.ret2, foreign: true })
+            Some(CallInfo { path: Some(format!("ffi::{}", e.ident)), ret: e.sig.ret, ret2: e.sig.ret2, foreign: true, ..CallInfo::default() })
         };
-        match &f.targets[k] {
+        let plain = match &f.targets[k] {
             Target::Func(j) => {
                 let g = &self.funcs[*j];
                 if g.selected && g.ir.is_ok() {
-                    Some(CallInfo { path: Some(g.ident.clone()), ret: g.sig.ret, ret2: g.sig.ret2, foreign: false })
+                    Some(CallInfo { path: Some(g.ident.clone()), ret: g.sig.ret, ret2: g.sig.ret2, foreign: false, ..CallInfo::default() })
                 } else {
                     ext(&g.name)
                 }
             }
             Target::Import(n) => ext(n),
             Target::Indirect => None,
+        };
+        let Some(s) = safe else { return plain };
+        let plain = plain?;
+        // a call to a raw twin: integers, and as unsafe as an FFI call
+        let twin = |j: usize| CallInfo { path: Some(s.twin_ident[j].clone()), raw: true, ..plain.clone() };
+        if let Target::Func(j) = f.targets[k] {
+            if s.twin[j] && (fast || s.raw_sites.contains(&(i, site))) {
+                return Some(twin(j));
+            }
         }
+        if fast {
+            return Some(plain);
+        }
+        let name = match &f.targets[k] {
+            Target::Func(j) => Some(self.funcs[*j].name.as_str()),
+            Target::Import(n) => Some(n.as_str()),
+            Target::Indirect => None,
+        };
+        Some(match s.callee(self, i, k) {
+            Some(sum) => CallInfo {
+                args: sum.args.clone(),
+                alloc: sum.alloc,
+                free: sum.args.first() == Some(&Pass::Free),
+                builtin: name.and_then(crate::libc::builtin),
+                ..plain
+            },
+            None => plain,
+        })
     }
 
     /// Emit every selected function that lifted, in parallel: `(source, stats)`,
     /// or `None` for the others. A function is `unsafe` if it does something
     /// unsafe itself or calls a decompiled function that is.
     pub fn emit_all(&self, mode: Mode, global_of: &(dyn Fn(u64) -> Option<String> + Sync)) -> Vec<Option<(String, EmitStats)>> {
-        // In safe mode a decompiled caller can only pass addresses, so functions
-        // that are called take integers.
-        let mut called = vec![false; self.funcs.len()];
-        for f in self.funcs.iter().filter(|f| f.selected && f.ir.is_ok()) {
-            for t in &f.targets {
-                if let Target::Func(j) = t {
-                    called[*j] = true;
-                }
-            }
-        }
+        self.emit_all_with(mode, &Options { global_of, ..Options::default() })
+    }
+
+    /// `emit_all`, with safe mode's view of the binary's globals and the
+    /// functions that `--check` sent back to fast mode. In safe mode a function
+    /// with a raw twin has the twin's source right after its own.
+    pub fn emit_all_with(&self, mode: Mode, opts: &Options) -> Vec<Option<(String, EmitStats)>> {
+        let safe = (mode == Mode::Safe).then(|| self.summaries(opts));
         let mut out: Vec<Option<(String, EmitStats)>> = self
             .funcs
             .par_iter()
             .enumerate()
             .map(|(i, f)| {
                 let ir = f.ir.as_ref().ok().filter(|_| f.selected)?;
-                let call = |s: Site| self.call_info(i, s);
-                let env = Env { sig: Some(f.sig), call: &call, demote: called[i], structure: true, global_of };
+                let fast = mode == Mode::Fast || opts.fast.get(i).copied().unwrap_or(false);
+                let emit = |ident: &str, fast: bool, src: &mut String| {
+                    let call = |site: Site| self.call_info(i, site, safe.as_ref(), fast);
+                    let analysis = safe.as_ref().filter(|_| !fast).and_then(|s| s.analyses[i].as_ref());
+                    let env = Env {
+                        sig: Some(f.sig),
+                        call: &call,
+                        demote: false,
+                        structure: true,
+                        global_of: opts.global_of,
+                        global_slice: opts.global_slice,
+                        analysis,
+                    };
+                    emit_function_in(ir, ident, if fast { Mode::Fast } else { Mode::Safe }, &env, src)
+                };
                 let mut src = String::new();
-                let stats = emit_function_in(ir, &f.ident, mode, &env, &mut src);
+                let mut stats = emit(&f.ident, fast, &mut src);
+                if let Some(s) = safe.as_ref().filter(|s| s.twin[i]) {
+                    src.push_str(&format!("\n/// `{}` taking integers, for callers that can't lend it a slice.\n", f.ident));
+                    let t = emit(&s.twin_ident[i], true, &mut src);
+                    stats.twins += 1;
+                    stats.twin_raw += t.raw_by.iter().sum::<usize>();
+                }
                 Some((src, stats))
             })
             .collect();
@@ -430,6 +498,170 @@ impl Program {
         out
     }
 
+    /// Every function's safe-mode borrow analysis, with call summaries (`None`
+    /// for those not emitted in safe mode).
+    pub fn analyses(&self, opts: &Options) -> Vec<Option<Analysis>> {
+        self.summaries(opts).analyses
+    }
+
+    /// The identifier each function is called by from data (function pointers in
+    /// statics): its raw twin, if safe mode gives it one, since code that calls
+    /// through a pointer passes integers.
+    pub fn pointer_idents(&self, opts: &Options) -> Vec<String> {
+        let s = self.summaries(opts);
+        (0..self.funcs.len()).map(|i| if s.twin[i] { s.twin_ident[i].clone() } else { self.funcs[i].ident.clone() }).collect()
+    }
+
+    /// Safe mode's whole-program pass (docs/ownership.md, stage 5): the borrow
+    /// analysis of every function, with each call seeing its callee's summary,
+    /// iterated until no summary changes.
+    ///
+    /// Summaries start optimistic (a callee ignores every argument) and only get
+    /// worse, so this terminates. A callee takes an argument as a slice if its
+    /// own code allows it. A call that can't lend one (the pointer comes from
+    /// several objects, or from one that isn't safe, or two arguments would
+    /// borrow the same bytes mutably) calls the callee's *raw twin* instead: the
+    /// same function emitted in fast mode, taking integers. So one caller that
+    /// can't lend a slice doesn't take the slice away from the others. Twins are
+    /// also made for functions that data points to (called through pointers,
+    /// with integers) and for the slice-taking callees of every twin and of every
+    /// function emitted in fast mode.
+    fn summaries<'o>(&self, opts: &Options<'o>) -> Summaries<'o> {
+        let n = self.funcs.len();
+        let fast = |i: usize| opts.fast.get(i).copied().unwrap_or(false);
+        let emitted = |i: usize| self.funcs[i].selected && self.funcs[i].ir.is_ok();
+        let safe_fn: Vec<bool> = (0..n).map(|i| emitted(i) && !fast(i)).collect();
+        let by_addr: HashMap<u64, usize> = self.funcs.iter().enumerate().map(|(i, f)| (f.addr, i)).collect();
+        let mut taken = vec![false; n];
+        for f in &self.funcs {
+            if let Ok(ir) = &f.ir {
+                for a in address_taken(ir, &self.got_addr) {
+                    if let Some(&j) = by_addr.get(&a) {
+                        taken[j] = true;
+                    }
+                }
+            }
+        }
+        for a in opts.address_taken {
+            if let Some(&j) = by_addr.get(a) {
+                taken[j] = true;
+            }
+        }
+        let mut demoted: Vec<Vec<bool>> =
+            self.funcs.iter().map(|f| vec![false; f.ir.as_ref().map_or(0, |ir| ir.blocks[ir.entry].params.len as usize)]).collect();
+        let mut callers: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (i, f) in self.funcs.iter().enumerate() {
+            for t in &f.targets {
+                if let Target::Func(j) = t {
+                    if !callers[*j].contains(&i) {
+                        callers[*j].push(i);
+                    }
+                }
+            }
+        }
+        let mut used: std::collections::HashSet<String> = self.funcs.iter().map(|f| f.ident.clone()).collect();
+        let twin_ident = self
+            .funcs
+            .iter()
+            .map(|f| {
+                let mut t = format!("{}_raw", f.ident);
+                while !used.insert(t.clone()) {
+                    t.push('_');
+                }
+                t
+            })
+            .collect();
+        let mut s = Summaries {
+            analyses: (0..n).map(|_| None).collect(),
+            summary: (0..n)
+                .map(|i| safe_fn[i].then(|| Callee { args: vec![Pass::Ignore; 6 + self.funcs[i].sig.stack_args as usize], ..Callee::default() }))
+                .collect(),
+            safe_fn,
+            global_slice: opts.global_slice,
+            raw_sites: std::collections::HashSet::new(),
+            twin: vec![false; n],
+            twin_ident,
+        };
+        let mut dirty: Vec<bool> = s.safe_fn.clone();
+        for round in 0.. {
+            if !dirty.iter().any(|&d| d) {
+                break;
+            }
+            // Give up on precision for whatever still changes after many rounds:
+            // every argument an integer is a fixpoint.
+            if round == MAX_ROUNDS {
+                for i in (0..n).filter(|&i| dirty[i]) {
+                    demoted[i].iter_mut().for_each(|d| *d = true);
+                }
+            }
+            let fresh: Vec<(usize, Analysis)> = (0..n)
+                .into_par_iter()
+                .filter(|&i| dirty[i])
+                .map(|i| {
+                    let ir = self.funcs[i].ir.as_ref().unwrap();
+                    let callee = |site: Site| {
+                        if s.raw_sites.contains(&(i, site)) {
+                            return None;
+                        }
+                        let k = self.funcs[i].sites.iter().position(|&x| x == site)?;
+                        s.callee(self, i, k)
+                    };
+                    let dem = |k: usize| demoted[i].get(k).copied().unwrap_or(false);
+                    let global_ok = |c: u64| (s.global_slice)(c).is_some();
+                    (i, analyze_with(ir, &Ctx { callee: &callee, demoted: &dem, global_ok: &global_ok }))
+                })
+                .collect();
+            dirty = vec![false; n];
+            for (i, a) in fresh {
+                let f = &self.funcs[i];
+                let ir = f.ir.as_ref().unwrap();
+                // calls that can't lend a slice go to the callee's raw twin
+                for &(site, _) in &a.unprovable {
+                    if s.raw_sites.insert((i, site)) {
+                        dirty[i] = true;
+                    }
+                }
+                let new = summarize(ir, f.sig, &a);
+                if s.summary[i].as_ref() != Some(&new) {
+                    s.summary[i] = Some(new);
+                    for &c in &callers[i] {
+                        dirty[c] |= s.safe_fn[c];
+                    }
+                }
+                s.analyses[i] = Some(a);
+            }
+        }
+
+        // Raw twins, and the slice-taking callees of every twin.
+        let lends = |s: &Summaries, j: usize| s.summary[j].as_ref().is_some_and(|c| c.args.iter().any(|p| matches!(p, Pass::Borrow { .. })));
+        let mut work: Vec<usize> = (0..n).filter(|&j| taken[j] && s.safe_fn[j] && lends(&s, j)).collect();
+        for &(i, site) in &s.raw_sites {
+            if let Some(k) = self.funcs[i].sites.iter().position(|&x| x == site) {
+                if let Target::Func(j) = self.funcs[i].targets[k] {
+                    work.push(j);
+                }
+            }
+        }
+        // what fast-mode code calls
+        work.extend((0..n).filter(|&i| emitted(i) && fast(i)));
+        while let Some(j) = work.pop() {
+            if s.safe_fn[j] && lends(&s, j) {
+                if s.twin[j] {
+                    continue;
+                }
+                s.twin[j] = true;
+            }
+            // a twin (or a fast function) calls its callees in fast mode too
+            for t in &self.funcs[j].targets {
+                if let Target::Func(h) = *t {
+                    if s.safe_fn[h] && lends(&s, h) && !s.twin[h] {
+                        work.push(h);
+                    }
+                }
+            }
+        }
+        s
+    }
     /// `mod ffi`, declaring every extern the emitted code calls; empty if none.
     pub fn prelude(&self) -> String {
         if self.externs.is_empty() {
@@ -461,6 +693,157 @@ impl Program {
         s.push_str("    }\n}\n");
         s
     }
+}
+
+/// Safe mode's options for `emit_all_with`.
+pub struct Options<'a> {
+    /// Rust expression for a constant address into the binary's data.
+    pub global_of: &'a (dyn Fn(u64) -> Option<String> + Sync),
+    /// The read-only `Bytes` static an address is in, which safe code can index.
+    pub global_slice: &'a (dyn Fn(u64) -> Option<String> + Sync),
+    /// Functions to emit in fast mode even in safe mode (by index), because
+    /// their safe output didn't borrow-check (`--check`).
+    pub fast: &'a [bool],
+    /// Addresses of functions that data points to (vtables, callbacks): callable
+    /// from anywhere, so their arguments stay integers.
+    pub address_taken: &'a [u64],
+}
+
+impl Default for Options<'_> {
+    fn default() -> Self {
+        Options { global_of: &|_| None, global_slice: &|_| None, fast: &[], address_taken: &[] }
+    }
+}
+
+/// The result of `Program::summaries`.
+struct Summaries<'a> {
+    /// Each safe-mode function's borrow analysis, with call summaries.
+    analyses: Vec<Option<Analysis>>,
+    /// What each safe-mode function does with its arguments.
+    summary: Vec<Option<Callee>>,
+    /// Emitted in safe mode.
+    safe_fn: Vec<bool>,
+    global_slice: &'a (dyn Fn(u64) -> Option<String> + Sync),
+    /// Calls (caller, site) that can't lend the callee a slice: they call its
+    /// raw twin.
+    raw_sites: std::collections::HashSet<(usize, Site)>,
+    /// Functions emitted a second time in fast mode, as `twin_ident`.
+    twin: Vec<bool>,
+    twin_ident: Vec<String>,
+}
+
+impl Summaries<'_> {
+    /// The summary of the callee of call site `k` in function `i`.
+    fn callee(&self, p: &Program, i: usize, k: usize) -> Option<Callee> {
+        match &p.funcs[i].targets[k] {
+            Target::Func(j) => crate::libc::summary(&p.funcs[*j].name).or_else(|| self.summary[*j].clone()),
+            Target::Import(name) => crate::libc::summary(name),
+            Target::Indirect => None,
+        }
+    }
+}
+
+/// The entry parameter index holding argument position `k`, if the function uses it.
+fn entry_index(f: &Function, k: usize) -> Option<usize> {
+    let p = abi::arg_param(f, k)?;
+    f.blocks[f.entry].params.get(&f.value_pool).iter().position(|&x| x == p)
+}
+
+/// What a function does with each argument, from its borrow analysis.
+fn summarize(f: &Function, sig: Sig, a: &Analysis) -> Callee {
+    let n = sig.args as usize + sig.stack_args as usize;
+    let mut c = Callee { args: Vec::with_capacity(n), ..Callee::default() };
+    for k in 0..n {
+        let pos = if k < sig.args as usize { k } else { 6 + k - sig.args as usize };
+        let pass = match entry_index(f, pos) {
+            None => Pass::Ignore,
+            Some(e) => {
+                let p = &a.params[e];
+                if p.returned && pos < 64 {
+                    c.ret_from |= 1 << pos;
+                }
+                match p.class {
+                    Class::Shared | Class::Mut if p.reg != crate::borrow::RSP => {
+                        Pass::Borrow { mutbl: p.class == Class::Mut, nullable: p.nullable }
+                    }
+                    Class::NotPointer if !a.escaped.get(e).copied().unwrap_or(true) => Pass::Ignore,
+                    _ => Pass::Escape,
+                }
+            }
+        };
+        if pos >= c.args.len() {
+            c.args.resize(pos, Pass::Ignore);
+            c.args.push(pass);
+        } else {
+            c.args[pos] = pass;
+        }
+    }
+    c
+}
+
+/// Addresses used as values other than to call them (function pointers),
+/// directly or loaded from a GOT slot.
+fn address_taken(f: &Function, got: &HashMap<u64, u64>) -> Vec<u64> {
+    let mut callees = std::collections::HashSet::new();
+    for (_, blk) in f.blocks.iter() {
+        for &id in blk.insts.get(&f.value_pool) {
+            if let InstKind::Call { callee, .. } = f.insts[id].kind {
+                callees.insert(callee);
+            }
+        }
+        if let Terminator::TailCall { callee, .. } = blk.term {
+            callees.insert(callee);
+        }
+    }
+    let mut out = Vec::new();
+    for (_, blk) in f.blocks.iter() {
+        for &id in blk.insts.get(&f.value_pool) {
+            match f.insts[id].kind {
+                InstKind::IntToPtr(v) => {
+                    if let (Some(a), false) = (konst(f, v), callees.contains(&id)) {
+                        out.push(a);
+                    }
+                }
+                // `mov rax, [rip+slot]`, then something other than `call rax`
+                InstKind::Load { ptr, .. } if !used_only_as_callee(f, id, &callees) => {
+                    if let InstKind::IntToPtr(s) = f.insts[ptr].kind {
+                        if let Some(&a) = konst(f, s).and_then(|s| got.get(&s)) {
+                            out.push(a);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Is `v` used only as the callee of calls (directly or through `IntToPtr`)?
+fn used_only_as_callee(f: &Function, v: ValueId, callees: &std::collections::HashSet<ValueId>) -> bool {
+    let mut ok = true;
+    for (_, blk) in f.blocks.iter() {
+        for &id in blk.insts.get(&f.value_pool) {
+            let k = f.insts[id].kind;
+            let mut uses = false;
+            crate::verify::for_each_operand(k, f, |o| uses |= o == v);
+            if !uses {
+                continue;
+            }
+            let as_callee = match k {
+                InstKind::Call { callee, args } => callee == v && !args.get(&f.value_pool).contains(&v),
+                InstKind::IntToPtr(_) => callees.contains(&id),
+                _ => false,
+            };
+            ok &= as_callee;
+        }
+        let mut in_term = false;
+        crate::emit::term_operands(f, blk.term, |o| in_term |= o == v);
+        if in_term {
+            ok &= matches!(blk.term, Terminator::TailCall { callee, args } if callee == v && !args.get(&f.value_pool).contains(&v));
+        }
+    }
+    ok
 }
 
 fn site_sig(t: &Target, guess: u8, sigs: &[Sig], guessed: &HashMap<Target, Sig>) -> Sig {

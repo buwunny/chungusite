@@ -50,6 +50,12 @@ type CallRegs = [ValueId; CALL_ARGS];
 pub const EXIT_REGS: [Register; 8] = [
     Register::RCX, Register::RDX, Register::RSI, Register::RDI, Register::R8, Register::R9, Register::R10, Register::R11,
 ];
+/// `BlockParam` register number of a condition (a `Bool`) that a block reads from
+/// the flags its predecessors left.
+pub const FLAG_PARAM: u8 = 0xfe;
+/// Condition codes, indexed by `ConditionCode as usize`.
+const NCC: usize = 17;
+type CondFile = [Option<ValueId>; NCC];
 
 /// Lazy flags: remember what set them, and only build a `Cmp` when a Jcc, CMOVcc or
 /// SETcc reads them. `cmp` itself therefore emits nothing, and flags that are never
@@ -57,6 +63,9 @@ pub const EXIT_REGS: [Register; 8] = [
 #[derive(Copy, Clone)]
 enum Flags {
     Unknown,
+    /// Nothing in this block has set them yet: they are whatever the predecessors
+    /// left, and a condition read from them becomes a block parameter.
+    Entry,
     /// cmp / sub / neg: every integer condition is derivable from the operands.
     Sub { lhs: ValueId, rhs: ValueId },
     /// test / and / or / xor: ZF and SF from the result, CF = OF = 0.
@@ -69,6 +78,10 @@ enum Flags {
     Mul { lhs: ValueId, rhs: ValueId, lo: ValueId, signed: bool },
     /// bt: only CF is defined.
     Carry { cf: ValueId },
+    /// dec: the flags of `lhs - one` except CF, which is left alone.
+    Dec { lhs: ValueId, one: ValueId },
+    /// inc: the flags of `lhs + one = res` except CF.
+    Inc { lhs: ValueId, one: ValueId, res: ValueId },
 }
 
 /// How many instructions before an indirect `jmp` pass 1 keeps, to recognize the
@@ -100,9 +113,21 @@ struct BlockState {
     out: RegFile,
     /// `BlockParam` created for each live-in GPR.
     params: RegFile,
+    /// `BlockParam` created for each condition read before the block sets the flags.
+    cparams: CondFile,
+    /// Each condition's value at block exit, filled in `finalize` for the ones a
+    /// successor reads.
+    cout: CondFile,
+    /// The flags at block exit.
+    flags: Flags,
+    /// Where the block ends, for the instructions `finalize` adds to it.
+    exit_ip: u64,
+    /// The instruction that first needed a `cparams` entry, for errors.
+    flags_read: u64,
 }
 
-const EMPTY_STATE: BlockState = BlockState { out: [None; NGPR], params: [None; NGPR] };
+const EMPTY_STATE: BlockState =
+    BlockState { out: [None; NGPR], params: [None; NGPR], cparams: [None; NCC], cout: [None; NCC], flags: Flags::Unknown, exit_ip: 0, flags_read: 0 };
 
 /// Where an instruction's destination operand lives.
 #[derive(Copy, Clone)]
@@ -142,6 +167,10 @@ pub struct Lifter {
     /// Record the caller-saved registers at each return in an `Exit` instruction,
     /// for whole-program register summaries (`program.rs` sets this).
     pub track_exits: bool,
+    /// What `fs:0` holds, so that thread-locals (`fs:[-k]`) become addresses in
+    /// the block `load::tls` lays out (`program.rs` sets this). `None` leaves
+    /// them unsupported.
+    pub thread_pointer: Option<u64>,
     cur: usize,
     flags: Flags,
     ip: u64,
@@ -169,6 +198,7 @@ impl Lifter {
             switches: Vec::with_capacity(4),
             xmm: [None; 16],
             track_exits: false,
+            thread_pointer: None,
             cur: 0,
             flags: Flags::Unknown,
             ip: 0,
@@ -238,8 +268,7 @@ impl Lifter {
         if open {
             self.end_block(f, Terminator::Unreachable); // ran off the end of the bytes
         }
-        self.finalize(f);
-        Ok(())
+        self.finalize(f)
     }
 
     /// The 64-bit value `reg` holds when block `b` exits, if the block reads or
@@ -424,7 +453,7 @@ impl Lifter {
 
     fn begin_block(&mut self, idx: usize, f: &mut Function) {
         self.cur = idx;
-        self.flags = Flags::Unknown;
+        self.flags = Flags::Entry;
         self.switch_index = None;
         self.xmm = [None; 16];
         f.blocks[BlockId::new(idx)].insts.start = f.value_pool.len() as u32;
@@ -435,6 +464,9 @@ impl Lifter {
         let b = &mut f.blocks[BlockId::new(self.cur)];
         b.insts.len = len - b.insts.start;
         b.term = term;
+        let s = &mut self.state[self.cur];
+        s.flags = self.flags;
+        s.exit_ip = self.ip;
     }
 
     /// Lift `self.insn`. Returns true if it ended the block.
@@ -515,7 +547,8 @@ impl Lifter {
 
     fn lift_data(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
         match i.mnemonic() {
-            Mnemonic::Nop | Mnemonic::Endbr64 => {} // endbr64: CET landing pad, no effect on data
+            // endbr64: CET landing pad; pause: a spin-loop hint. Neither touches data.
+            Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Pause => {}
             Mnemonic::Mov => match (i.op0_kind(), i.op1_kind()) {
                 // mov rax, rcx: no instruction at all, just rename in the register file
                 (OpKind::Register, OpKind::Register) => {
@@ -713,8 +746,8 @@ impl Lifter {
                 self.put(f, dst, res)?;
                 self.flags = Flags::Res { res }; // ZF and SF; the carry out isn't modelled
             }
-            // bt: CF = bit n of the operand
-            Mnemonic::Bt => {
+            // bt: CF = bit n of the operand; bts / btr / btc then set, clear or flip it
+            Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => {
                 let sz = self.op_size(i, 0)?;
                 let ty = TyId::unknown(sz);
                 let n = match i.op1_kind() {
@@ -734,6 +767,16 @@ impl Lifter {
                 let bit = self.emit(f, InstKind::Bin { op: BinOp::And, lhs: sh, rhs: one }, ty);
                 let zero = self.konst(f, 0, ty);
                 let cf = self.emit(f, InstKind::Cmp { cc: Cond::Ne, lhs: bit, rhs: zero }, TyId::BOOL);
+                if i.mnemonic() != Mnemonic::Bt {
+                    let mask = self.emit(f, InstKind::Bin { op: BinOp::Shl, lhs: one, rhs: n }, ty);
+                    let (op, mask) = match i.mnemonic() {
+                        Mnemonic::Bts => (BinOp::Or, mask),
+                        Mnemonic::Btr => (BinOp::And, self.emit(f, InstKind::Un { op: UnOp::Not, v: mask }, ty)),
+                        _ => (BinOp::Xor, mask),
+                    };
+                    let res = self.emit(f, InstKind::Bin { op, lhs: v, rhs: mask }, ty);
+                    self.put(f, dst, res)?;
+                }
                 self.flags = Flags::Carry { cf };
             }
             // xchg: swap (with memory it is atomic; the lifted code is not)
@@ -903,10 +946,20 @@ impl Lifter {
         let dst = self.dst(f, i)?;
         let v = self.get(f, dst, sz)?;
         let (kind, flags) = match i.mnemonic() {
-            Mnemonic::Inc | Mnemonic::Dec => {
+            // CF is left as it was; the rest are the flags of the add or sub
+            Mnemonic::Inc => {
                 let one = self.konst(f, 1, ty);
-                let op = if i.mnemonic() == Mnemonic::Inc { BinOp::Add } else { BinOp::Sub };
-                (InstKind::Bin { op, lhs: v, rhs: one }, None) // CF is left as it was: model ZF/SF only
+                let res = self.emit(f, InstKind::Bin { op: BinOp::Add, lhs: v, rhs: one }, ty);
+                self.put(f, dst, res)?;
+                self.flags = Flags::Inc { lhs: v, one, res };
+                return Ok(());
+            }
+            Mnemonic::Dec => {
+                let one = self.konst(f, 1, ty);
+                let res = self.emit(f, InstKind::Bin { op: BinOp::Sub, lhs: v, rhs: one }, ty);
+                self.put(f, dst, res)?;
+                self.flags = Flags::Dec { lhs: v, one };
+                return Ok(());
             }
             // neg sets the flags of `0 - v`
             Mnemonic::Neg => {
@@ -1014,7 +1067,7 @@ impl Lifter {
         let (lo, hi) = match sz {
             8 => (Register::RAX, Register::RDX),
             4 => (Register::EAX, Register::EDX),
-            _ => return Err(self.unsupported()), // 8/16-bit divide ax / dx:ax
+            _ => return self.div_narrow(f, i, sz),
         };
         let l = self.read(f, lo)?;
         let h = self.read(f, hi)?;
@@ -1043,14 +1096,57 @@ impl Lifter {
         Ok(())
     }
 
-    /// One-operand mul / imul: rdx:rax = rax * src (edx:eax for 32 bits).
+    /// 8-bit div: al, ah = ax / src, ax % src; 16-bit: ax, dx = dx:ax / src, dx:ax % src.
+    /// The dividend is twice the operand's width, so divide at that width (a
+    /// quotient that doesn't fit traps on x86; here it is truncated).
+    fn div_narrow(&mut self, f: &mut Function, i: &Instruction, sz: usize) -> Result<(), LiftError> {
+        let signed = i.mnemonic() == Mnemonic::Idiv;
+        let ext = if signed { CastKind::SExt } else { CastKind::ZExt };
+        let (wide, n) = (TyId::unknown(2 * sz), self.konst(f, 8 * sz as u64, TyId::B1));
+        let dividend = if sz == 1 {
+            self.read(f, Register::AX)?
+        } else {
+            let (lo, hi) = (self.read(f, Register::AX)?, self.read(f, Register::DX)?);
+            let lo = self.emit(f, InstKind::Cast { kind: CastKind::ZExt, v: lo }, wide);
+            let hi = self.emit(f, InstKind::Cast { kind: CastKind::ZExt, v: hi }, wide);
+            let hi = self.emit(f, InstKind::Bin { op: BinOp::Shl, lhs: hi, rhs: n }, wide);
+            self.emit(f, InstKind::Bin { op: BinOp::Or, lhs: hi, rhs: lo }, wide)
+        };
+        let d = self.operand(f, i, 0, sz)?;
+        let d = self.emit(f, InstKind::Cast { kind: ext, v: d }, wide);
+        let (qop, rop) = if signed { (BinOp::SDiv, BinOp::SRem) } else { (BinOp::UDiv, BinOp::URem) };
+        let q = self.emit(f, InstKind::Bin { op: qop, lhs: dividend, rhs: d }, wide);
+        let r = self.emit(f, InstKind::Bin { op: rop, lhs: dividend, rhs: d }, wide);
+        let ty = TyId::unknown(sz);
+        let q = self.emit(f, InstKind::Cast { kind: CastKind::Trunc, v: q }, ty);
+        let r = self.emit(f, InstKind::Cast { kind: CastKind::Trunc, v: r }, ty);
+        let (qr, rr) = if sz == 1 { (Register::AL, Register::AH) } else { (Register::AX, Register::DX) };
+        self.write(f, qr, q)?;
+        self.write(f, rr, r)?;
+        self.flags = Flags::Unknown;
+        Ok(())
+    }
+
+    /// One-operand mul / imul: rdx:rax = rax * src (edx:eax, dx:ax for narrower
+    /// operands, and ax = al * src for bytes).
     fn mul_wide(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
         let sz = self.op_size(i, 0)?;
         let signed = i.mnemonic() == Mnemonic::Imul;
         let (lo_reg, hi_reg) = match sz {
             8 => (Register::RAX, Register::RDX),
             4 => (Register::EAX, Register::EDX),
-            _ => return Err(self.unsupported()), // 8/16-bit forms write ax / dx:ax
+            2 => (Register::AX, Register::DX),
+            _ => {
+                // ax = al * src: the whole product in one register
+                let a = self.read(f, Register::AL)?;
+                let b = self.operand(f, i, 0, 1)?;
+                let p = self.wide_product(f, a, b, signed);
+                let ax = self.emit(f, InstKind::Cast { kind: CastKind::Trunc, v: p }, TyId::B2);
+                let lo = self.emit(f, InstKind::Cast { kind: CastKind::Trunc, v: p }, TyId::B1);
+                self.write(f, Register::AX, ax)?;
+                self.flags = Flags::Mul { lhs: a, rhs: b, lo, signed };
+                return Ok(());
+            }
         };
         let a = self.read(f, lo_reg)?;
         let b = self.operand(f, i, 0, sz)?;
@@ -1062,7 +1158,7 @@ impl Lifter {
         } else {
             // the 64-bit product of the extended operands, then its high half
             let p = self.wide_product(f, a, b, signed);
-            let k = self.konst(f, 32, TyId::B1);
+            let k = self.konst(f, 8 * sz as u64, TyId::B1);
             let h = self.emit(f, InstKind::Bin { op: BinOp::LShr, lhs: p, rhs: k }, TyId::B8);
             self.emit(f, InstKind::Cast { kind: CastKind::Trunc, v: h }, ty)
         };
@@ -1255,6 +1351,14 @@ impl Lifter {
             OpKind::Register => self.read(f, i.op_register(op)),
             k if is_imm(k) => Ok(self.konst(f, imm(i, op, size), TyId::unknown(size))),
             OpKind::Memory if is_canary(i) => Ok(self.konst(f, CANARY, TyId::B8)),
+            // mov rax, fs:0: the thread pointer, which points at itself
+            OpKind::Memory if is_fs_abs(i) && i.memory_displacement64() == 0 && self.thread_pointer.is_some() => {
+                if i.memory_size().size() != 8 {
+                    return Err(self.unsupported());
+                }
+                let tp = self.konst(f, self.thread_pointer.unwrap_or_default(), TyId::B8);
+                Ok(self.emit(f, InstKind::IntToPtr(tp), TyId::PTR))
+            }
             OpKind::Memory => {
                 let sz = self.op_size(i, op)?;
                 let ptr = self.ea(f, i)?;
@@ -1298,6 +1402,21 @@ impl Lifter {
         use ConditionCode as C;
         let (cond, lhs, rhs) = match self.flags {
             Flags::Unknown => return Err(LiftError::FlagsNotInBlock { ip: self.ip }),
+            Flags::Entry => return Ok(self.cond_in(f, self.cur, cc, self.ip)),
+            // inc / dec: add / sub of 1, without the carry conditions
+            Flags::Dec { .. } | Flags::Inc { .. } if matches!(cc, C::b | C::ae | C::be | C::a) => return Err(self.unsupported()),
+            Flags::Dec { lhs, one } => {
+                self.flags = Flags::Sub { lhs, rhs: one };
+                let c = self.condition(f, cc);
+                self.flags = Flags::Dec { lhs, one };
+                return c;
+            }
+            Flags::Inc { lhs, one, res } => {
+                self.flags = Flags::Add { lhs, rhs: one, res };
+                let c = self.condition(f, cc);
+                self.flags = Flags::Inc { lhs, one, res };
+                return c;
+            }
             Flags::Sub { lhs, rhs } => {
                 let cond = match cc {
                     C::e => Cond::Eq, C::ne => Cond::Ne,
@@ -1339,6 +1458,19 @@ impl Lifter {
                 let cond = match cc {
                     C::e => Cond::Eq, C::ne => Cond::Ne,
                     C::s | C::ns => return Ok(self.sign(f, res, cc == C::s)),
+                    // signed order of the exact sum, when rhs is a constant k:
+                    // lhs + k < 0 is lhs < -k (-k fits unless k is the minimum)
+                    C::l | C::ge | C::le | C::g => {
+                        let ty = f.insts[res].ty;
+                        let mask = width_mask(ty);
+                        let Some(k) = const_of(f, rhs).map(|k| k & mask) else { return Err(self.unsupported()) };
+                        if k == 0 || k == mask / 2 + 1 {
+                            return Err(self.unsupported());
+                        }
+                        let neg = self.konst(f, k.wrapping_neg() & mask, ty);
+                        let cond = match cc { C::l => Cond::Slt, C::ge => Cond::Sge, C::le => Cond::Sle, _ => Cond::Sgt };
+                        return Ok(self.emit(f, InstKind::Cmp { cc: cond, lhs, rhs: neg }, TyId::BOOL));
+                    }
                     // carry: the sum wrapped
                     C::b => return Ok(self.emit(f, InstKind::Cmp { cc: Cond::Ult, lhs: res, rhs: lhs }, TyId::BOOL)),
                     C::ae => return Ok(self.emit(f, InstKind::Cmp { cc: Cond::Uge, lhs: res, rhs: lhs }, TyId::BOOL)),
@@ -1410,8 +1542,13 @@ impl Lifter {
 
     /// Effective address of the memory operand as one `PtrOffset` node.
     fn ea(&mut self, f: &mut Function, i: &Instruction) -> Result<ValueId, LiftError> {
+        // a thread-local at a constant offset from the thread pointer
+        if let (true, Some(tp)) = (is_fs_abs(i), self.thread_pointer) {
+            let a = self.konst(f, tp.wrapping_add(i.memory_displacement64()), TyId::B8);
+            return Ok(self.emit(f, InstKind::IntToPtr(a), TyId::PTR));
+        }
         if matches!(i.memory_segment(), Register::FS | Register::GS) {
-            return Err(self.unsupported()); // TLS
+            return Err(self.unsupported()); // TLS through a register (initial-exec), or gs:
         }
         if i.is_ip_rel_memory_operand() {
             let a = self.konst(f, i.ip_rel_memory_address(), TyId::B8);
@@ -1519,6 +1656,56 @@ impl Lifter {
         id
     }
 
+    /// Condition `cc` of the flags block `b` was entered with: a `Bool` block
+    /// parameter, which `finalize` has each predecessor compute.
+    /// `read` is the instruction that needs it.
+    fn cond_in(&mut self, f: &mut Function, b: usize, cc: ConditionCode, read: u64) -> ValueId {
+        let st = &mut self.state[b];
+        if let Some(v) = st.cparams[cc as usize] {
+            return v;
+        }
+        if st.cparams.iter().all(Option::is_none) {
+            st.flags_read = read;
+        }
+        let id = f.insts.push(Inst { kind: InstKind::BlockParam(FLAG_PARAM), ty: TyId::BOOL });
+        f.origin.push(self.leaders[b]);
+        self.state[b].cparams[cc as usize] = Some(id);
+        id
+    }
+
+    /// Condition `cc` of the flags block `b` exits with, computed at its end.
+    /// Called from `finalize`, after every block is lifted: `b`'s instructions are
+    /// moved to the end of the pool first if another block's follow them. `read`
+    /// is the instruction in a successor that needs it, for the error when `b`
+    /// leaves flags that don't give `cc`.
+    fn cond_out(&mut self, f: &mut Function, b: usize, cc: ConditionCode, read: u64) -> Result<ValueId, LiftError> {
+        let st = self.state[b];
+        if let Some(v) = st.cout[cc as usize] {
+            return Ok(v);
+        }
+        let v = match st.flags {
+            Flags::Entry => self.cond_in(f, b, cc, read),
+            Flags::Unknown => return Err(LiftError::FlagsNotInBlock { ip: read }),
+            flags => {
+                let id = BlockId::new(b);
+                let l = f.blocks[id].insts;
+                let (start, end) = (l.start as usize, (l.start + l.len) as usize);
+                if end != f.value_pool.len() {
+                    let at = f.value_pool.len() as u32;
+                    f.value_pool.extend_from_within(start..end);
+                    f.blocks[id].insts.start = at;
+                }
+                (self.cur, self.flags, self.ip) = (b, flags, st.exit_ip);
+                let before = f.value_pool.len();
+                let v = self.condition(f, cc).map_err(|_| LiftError::FlagsNotInBlock { ip: read })?;
+                f.blocks[id].insts.len += (f.value_pool.len() - before) as u32;
+                v
+            }
+        };
+        self.state[b].cout[cc as usize] = Some(v);
+        Ok(v)
+    }
+
     // ---------- emission ----------
 
     #[inline]
@@ -1569,8 +1756,31 @@ impl Lifter {
         self.switches.iter().find(|s| s.0.index() == b).expect("a switch block").1
     }
 
-    fn finalize(&mut self, f: &mut Function) {
+    fn finalize(&mut self, f: &mut Function) -> Result<(), LiftError> {
         let n = self.state.len();
+        // 0. A condition read from flags a predecessor set is a live-in like a
+        //    register (step 1): each predecessor computes it at its end from the
+        //    flags it leaves, or passes on a parameter of its own if it doesn't
+        //    touch them. Nothing sets the flags before the entry.
+        loop {
+            let mut changed = false;
+            for b in 0..n {
+                for k in 0..self.succ_count(f, b) {
+                    let s = self.succ_at(f, b, k);
+                    for (c, &cc) in CC.iter().enumerate() {
+                        if self.state[s].cparams[c].is_some() && self.state[b].cout[c].is_none() {
+                            let new_param = matches!(self.state[b].flags, Flags::Entry) && self.state[b].cparams[c].is_none();
+                            self.cond_out(f, b, cc, self.state[s].flags_read)?;
+                            changed |= new_param;
+                        }
+                    }
+                }
+            }
+            if !changed { break; }
+        }
+        if self.state[0].cparams.iter().any(Option::is_some) {
+            return Err(LiftError::FlagsNotInBlock { ip: self.state[0].flags_read });
+        }
         // 1. A successor's live-in must be defined at the end of each predecessor;
         //    if the predecessor never touched that register it becomes a live-in there too.
         //    A switch's successors here are its case targets.
@@ -1601,8 +1811,8 @@ impl Lifter {
                     Some(j) => f.value_pool[table + j],
                     None => {
                         let to = self.block_at(target).expect("case targets are leaders");
-                        let out = self.state[b.index()].out;
-                        self.state.push(BlockState { out, params: [None; NGPR] });
+                        let BlockState { out, cout, .. } = self.state[b.index()];
+                        self.state.push(BlockState { out, cout, ..EMPTY_STATE });
                         let term = Terminator::Jump { to, args: ListRef::EMPTY };
                         f.blocks.push(Block { insts: ListRef::EMPTY, params: ListRef::EMPTY, term }).as_value()
                     }
@@ -1644,6 +1854,7 @@ impl Lifter {
         for b in 0..n {
             let start = f.value_pool.len();
             f.value_pool.extend(self.state[b].params.iter().flatten());
+            f.value_pool.extend(self.state[b].cparams.iter().flatten());
             f.blocks[BlockId::new(b)].params = ListRef { start: start as u32, len: (f.value_pool.len() - start) as u32 };
         }
         // 4. Write edge arguments in the same order (Branch: true args, then false args).
@@ -1655,6 +1866,11 @@ impl Lifter {
                         f.value_pool.push(self.state[b].out[r].expect("filled by step 1"));
                     }
                 }
+                for c in 0..NCC {
+                    if self.state[s.index()].cparams[c].is_some() {
+                        f.value_pool.push(self.state[b].cout[c].expect("filled by step 0"));
+                    }
+                }
             }
             let list = ListRef { start: start as u32, len: (f.value_pool.len() - start) as u32 };
             if let Terminator::Jump { args, .. } | Terminator::Branch { args, .. } = &mut f.blocks[BlockId::new(b)].term {
@@ -1663,8 +1879,22 @@ impl Lifter {
         }
         // Trivial parameters (same value on every edge) are left in; a later
         // cleanup pass removes them (Braun et al., "trivial phi" removal).
+        Ok(())
     }
 }
+
+/// `ConditionCode` by its number.
+const CC: [ConditionCode; NCC] = {
+    use ConditionCode as C;
+    [C::None, C::o, C::no, C::b, C::ae, C::e, C::ne, C::be, C::a, C::s, C::ns, C::p, C::np, C::l, C::ge, C::le, C::g]
+};
+const _: () = {
+    let mut c = 0;
+    while c < NCC {
+        assert!(CC[c] as usize == c);
+        c += 1;
+    }
+};
 
 /// Successors of a `Jump` or `Branch`, in edge-argument order.
 fn succs(t: Terminator) -> [Option<BlockId>; 2] {
@@ -1692,7 +1922,7 @@ fn handled(i: &Instruction) -> bool {
                     | Leave | Movups | Movaps | Movdqu | Movdqa | Xorps | Xorpd | Pxor | Punpcklqdq | Movq | Movd
                     | Movsd | Movupd | Movapd | Lddqu | Andps | Andpd | Pand | Orps | Orpd | Por | Pcmpeqb | Pcmpeqw
                     | Pcmpeqd | Pcmpeqq | Movlhps | Movsb | Movsw | Movsq | Bswap | Tzcnt | Lzcnt | Popcnt | Bsf | Bsr
-                    | Shld | Shrd | Rol | Ror | Adc | Sbb | Bt | Xchg | Xadd | Cmpxchg
+                    | Shld | Shrd | Rol | Ror | Adc | Sbb | Bt | Bts | Btr | Btc | Xchg | Xadd | Cmpxchg | Pause
             ) || cmov_or_setcc(m).is_some()
         }
         FlowControl::ConditionalBranch => i.condition_code() != ConditionCode::None,
@@ -1708,8 +1938,12 @@ fn handled(i: &Instruction) -> bool {
 const CANARY: u64 = 0x2f8a_61c3_9d0e_7b00;
 
 fn is_canary(i: &Instruction) -> bool {
+    is_fs_abs(i) && i.memory_displacement64() == 0x28 && i.memory_size().size() == 8
+}
+
+/// `fs:[disp]`, with no base or index register.
+fn is_fs_abs(i: &Instruction) -> bool {
     i.memory_segment() == Register::FS && i.memory_base() == Register::None && i.memory_index() == Register::None
-        && i.memory_displacement64() == 0x28 && i.memory_size().size() == 8
 }
 
 /// `len` bytes at `addr` in one of `data`'s (address, bytes) sections.
@@ -1743,6 +1977,16 @@ fn is_high_byte(r: Register) -> bool {
 /// The bits an 8/16/32-bit register write replaces.
 fn low_mask(size: usize) -> u64 {
     (1u64 << (size * 8)) - 1
+}
+
+/// All ones in the width of the integer type `ty`.
+fn width_mask(ty: TyId) -> u64 {
+    match ty {
+        TyId::B1 => 0xff,
+        TyId::B2 => 0xffff,
+        TyId::B4 => 0xffff_ffff,
+        _ => u64::MAX,
+    }
 }
 
 fn const_of(f: &Function, v: ValueId) -> Option<u64> {

@@ -3,8 +3,8 @@
 [`src/lift.rs`](../src/lift.rs) turns decoded `iced_x86::Instruction`s into the IR from [ir.md](ir.md). It covers:
 
 - data movement: `MOV` in every register, immediate and memory form, including 8 and 16-bit writes (merged into the old value) and `AH`-style high bytes; `MOVZX`, `MOVSX`, `MOVSXD`, `LEA`, `CDQE`/`CWDE`;
-- arithmetic: `ADD/SUB/AND/OR/XOR/CMP/TEST`, `INC/DEC/NEG/NOT`, `SHL/SHR/SAR` (immediate or `CL` count), `IMUL` in all three forms, one-operand `MUL`, and `DIV`/`IDIV` when `rdx` only extends `rax` (`xor edx, edx` or `CQO`/`CDQ` first). Any of them can take a memory operand: the lifter loads it, and a memory destination is stored back. A 64-bit one-operand `MUL`/`IMUL` writes `rax = a * b` and `rdx = UMulHi(a, b)` (`SMulHi` for `IMUL`), the high half of the 128-bit product, which the emitter prints as `((a as u128 * b as u128) >> 64) as u64`; the 32-bit form multiplies the zero- or sign-extended halves in 64 bits;
-- flags: `Jcc`, `CMOVcc` (`Select`) and `SETcc` (`Cmp` zero-extended to a byte) all read the same lazy flags, including carry and overflow after `ADD`/`SUB`/`CMP`, and after `MUL`/`IMUL`, where CF = OF = "the product doesn't fit" (`seto` after an overflow-checked multiply);
+- arithmetic: `ADD/SUB/AND/OR/XOR/CMP/TEST`, `INC/DEC/NEG/NOT`, `SHL/SHR/SAR` (immediate or `CL` count), `IMUL` in all three forms, one-operand `MUL`, and `DIV`/`IDIV` when `rdx` only extends `rax` (`xor edx, edx` or `CQO`/`CDQ` first). The 8 and 16-bit one-operand `MUL`/`IMUL`/`DIV`/`IDIV` (`ax = al * src`, `al, ah = ax / src`, `dx:ax`) compute at twice the operand's width, where nothing can overflow. Any of them can take a memory operand: the lifter loads it, and a memory destination is stored back. A 64-bit one-operand `MUL`/`IMUL` writes `rax = a * b` and `rdx = UMulHi(a, b)` (`SMulHi` for `IMUL`), the high half of the 128-bit product, which the emitter prints as `((a as u128 * b as u128) >> 64) as u64`; the 32-bit form multiplies the zero- or sign-extended halves in 64 bits;
+- flags: `Jcc`, `CMOVcc` (`Select`) and `SETcc` (`Cmp` zero-extended to a byte) all read the same lazy flags, including carry and overflow after `ADD`/`SUB`/`CMP`, after `MUL`/`IMUL`, where CF = OF = "the product doesn't fit" (`seto` after an overflow-checked multiply), and the signed conditions after `INC`/`DEC` (which are an add or subtract of 1 that leaves CF alone) and after an `ADD` of a constant. Flags set in one block and read in another become block parameters (below);
 - 16-byte copies: `MOVUPS`/`MOVAPS`/`MOVDQU`/`MOVDQA` between memory and xmm registers, `MOVUPD`/`MOVAPD`/`LDDQU`, `XORPS`/`XORPD`/`PXOR` (zeroing, or xor of known values) and the other bitwise ops (`ANDPS`, `ORPS`, `PAND`, `POR`, ...), `PCMPEQ x, x` (all ones), `MOVQ`/`MOVD`/`MOVSD` between xmm registers, general registers and memory, and `PUNPCKLQDQ`/`MOVLHPS`. An xmm register is a pair of 64-bit values (low, high), so a copy is two loads and two stores. Those values are tracked within a block only: an xmm register read before the block writes it is unsupported (SSE arithmetic and floating point aren't lifted yet);
 - bit instructions, `adc`/`sbb`, double shifts, rotates, atomics and `rep movs` (below);
 - jump tables, as a `Terminator::Switch` (below);
@@ -13,6 +13,10 @@
 - `JMP`, `RET`, `NOP`/`ENDBR64`, and `UD2`/`INT3`/`HLT`, which end the block as `Unreachable`.
 
 Anything else returns `LiftError::Unsupported` so the caller can decide what to do. It never guesses. Pass 1 already checks each mnemonic (`handled`), so a function with an instruction the lifter has no case for fails before any IR is built; pass 2 still rejects unsupported operand forms.
+
+## Flags across blocks
+
+A condition read before the block sets the flags (`cmp; je A; jl B`, where the `jl` starts a block of its own, or a loop head that tests the flags of whichever block jumped to it) can't come from the block's own lazy flags. The block starts with `Flags::Entry` instead, and the read becomes a `Bool` block parameter for that condition (`BlockParam(FLAG_PARAM)`), one per condition code the block reads. `finalize` then has each predecessor supply it, the same way it wires live-in registers: a predecessor that set the flags computes the condition from them at its end (its instructions are moved to the end of the pool so the new ones can follow them), and one that didn't touch the flags passes on a parameter of its own. With one predecessor the parameter is trivial and `opt::clean` replaces it with that predecessor's `Cmp`, so `cmp; je; jl` reads as `if a == b { .. } else if a < b { .. }`. It is still `LiftError::FlagsNotInBlock` when a predecessor leaves flags that don't give the condition (a call, a division, a shift by `cl`), or when the flags reach the entry.
 
 ## Jump tables
 
@@ -117,7 +121,7 @@ bb0():
 [`src/verify.rs`](../src/verify.rs) checks the structure of a lifted function: no dangling value or block ids, every edge passes exactly as many arguments as its target has parameters, nothing uses a store as a value, and every value belongs to a block. Dominance isn't checked yet. The tests run it on everything they lift:
 
 - `tests/spike.rs` checks the spike's exact IR and register mapping, and that each of the 16 GPRs lands in its own slot.
-- `tests/robust.rs` covers bad branch targets: into the middle of an instruction, past the end, a fall-through off the end, and flags coming from another block. Each returns a `LiftError`. It also lifts 20,000 random byte strings without a panic, and 2,000 random programs built from supported instructions with random jumps, all of which must pass the verifier.
+- `tests/robust.rs` covers bad branch targets: into the middle of an instruction, past the end, a fall-through off the end, and flags that nothing before the read set, at the entry or after a call. Each returns a `LiftError`. It also lifts 20,000 random byte strings without a panic, and 2,000 random programs built from supported instructions with random jumps, all of which must pass the verifier.
 
 After lifting, `opt::clean` removes trivial block params and dead code; see [ownership.md](ownership.md) for that pass and the safe-mode analyses built on it.
 
@@ -125,16 +129,17 @@ After lifting, `opt::clean` removes trivial block params and dead code; see [own
 
 - **`adc`/`sbb`** add or subtract the carry the previous instruction left (`cmp; sbb eax, eax` and 128-bit `add; adc` chains). The carry out of them isn't modelled.
 - **`shld`/`shrd`** are `d << n | s >> (w - n)` (the other way round for `shrd`), with a count of 0 selecting `d` unchanged. **8/16-bit shifts** by `cl` or by 8 or more shift a 32-bit copy, since x86 masks the count to 5 bits, not to the operand width.
-- **`bt`** (CF only, `Flags::Carry`), **`bsf`/`bsr`/`tzcnt`/`lzcnt`/`popcnt`**, **`bswap`**, **`rol`/`ror`**, **`xchg`**, **`xadd`** and **`cmpxchg`**. The atomics are lifted as plain loads and stores, which is right for one thread.
-- **`rep movs`** is a `MemCopy` of `rcx` elements, with the direction flag assumed clear.
-- **The stack protector's canary** `fs:[0x28]` reads as a constant, so the check at the end of the function always passes. Other `fs:`/`gs:` accesses (thread-locals) stay unsupported.
+- **`bt`** (CF only, `Flags::Carry`), **`bts`/`btr`/`btc`** with a register (which also set, clear or flip the bit), **`bsf`/`bsr`/`tzcnt`/`lzcnt`/`popcnt`**, **`bswap`**, **`rol`/`ror`**, **`xchg`**, **`xadd`** and **`cmpxchg`**. The atomics are lifted as plain loads and stores, which is right for one thread.
+- **`rep movs`** is a `MemCopy` of `rcx` elements, with the direction flag assumed clear. **`pause`** (a spin-loop hint) is a no-op.
+- **The stack protector's canary** `fs:[0x28]` reads as a constant, so the check at the end of the function always passes.
+- **Thread-locals** of an executable sit just below the thread pointer, which `fs:0` holds (x86-64 TLS variant II), so code reads them as `fs:[-k]`, or loads `fs:0` and indexes down from it. `load::tls` gives the thread-local block (`.tdata`, then `.tbss`) an address range of its own above every section (`.tbss` has none: it overlaps the sections after it), and `Lifter::thread_pointer` is its end. `fs:[k]` becomes the constant address `thread_pointer + k`, and `fs:0` that address itself, so globals turn them into the static `THREAD_LOCALS` like any other data ([cli.md](cli.md#globals)). Thread-locals reached through a register (`mov rax, [rip+x]; mov eax, fs:[rax]`, the initial-exec model in shared objects), `__tls_get_addr` and `gs:` stay unsupported.
 - **Calls that don't return** (`abort`, `exit`, `__stack_chk_fail`, `__cxa_throw`, ...; `discover::noreturn`) end their block, so a caller doesn't merge their undefined `rax` into its return value. `lift_full` takes a callback that `program.rs` answers from the relocation or PLT entry at the call.
 
 ## Not handled yet
 
 - SSE beyond 16-byte copies and bitwise ops: vector compares and shuffles (`PCMPEQB` other than the all-ones idiom, `PSHUFD`, `PUNPCKLBW`, `PMOVMSKB`, ...), scalar floating point (`UCOMISD`, `CVTSI2SS`), xmm values that cross blocks or calls, and AVX.
 - `rep stos` (there is no memset instruction in the IR yet).
-- `DIV` with a real 128-bit dividend, and 8/16-bit `MUL`/`DIV`.
-- Flags that cross blocks (`LiftError::FlagsNotInBlock`), parity, the carry out of `adc`/`sbb`, and the signed conditions after `ADD`.
-- Thread-locals (`fs:`/`gs:` other than the canary).
+- `DIV` with a real 128-bit dividend.
+- Parity, the carry out of `adc`/`sbb`, the signed conditions after an `ADD` of two registers, and `CF|ZF` (`ja`/`jbe`) after `ADD`.
+- Thread-locals through a register, and `gs:`.
 - Conditional branches into another function (gcc's `.cold` parts).

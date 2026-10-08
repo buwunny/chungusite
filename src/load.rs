@@ -2,9 +2,10 @@
 //! and find the functions and data in it from the symbol table, or, for a stripped
 //! binary, from unwind tables and control flow (`discover.rs`).
 use object::{
-    Architecture, Object, ObjectKind, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationFlags, RelocationTarget,
+    Architecture, BinaryFormat, Object, ObjectKind, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationFlags, RelocationTarget,
     SectionKind, SymbolKind,
 };
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use rayon::prelude::*;
 
@@ -30,8 +31,9 @@ pub struct DataSection<'a> {
     pub name: String,
     pub addr: u64,
     pub size: u64,
-    /// The file contents; `None` for zero-initialized sections (`.bss`).
-    pub bytes: Option<&'a [u8]>,
+    /// The file contents; `None` for zero-initialized sections (`.bss`). Owned
+    /// only for the thread-local block (`Tls`), which is assembled.
+    pub bytes: Option<Cow<'a, [u8]>>,
     /// Writable at run time (`.data`, `.bss`), so its static must be `static mut`.
     pub writable: bool,
 }
@@ -135,7 +137,7 @@ impl<'a> Binary<'a> {
                 let bytes = match sec.kind() {
                     SectionKind::UninitializedData => None,
                     _ => match sec.data() {
-                        Ok(d) if d.len() as u64 == sec.size() => Some(d),
+                        Ok(d) if d.len() as u64 == sec.size() => Some(Cow::Borrowed(d)),
                         _ => continue,
                     },
                 };
@@ -171,7 +173,13 @@ impl<'a> Binary<'a> {
         funcs.par_iter_mut().for_each(|f| f.demangled = demangle(&f.name));
         data_syms.par_iter_mut().for_each(|s| s.demangled = demangle(&s.name));
 
-        let data: Vec<DataSection> = sections.into_iter().map(|(_, s)| s).collect();
+        let mut data: Vec<DataSection> = sections.into_iter().map(|(_, s)| s).collect();
+        // The thread-local block goes above everything else, so it stays last.
+        if let Some(t) = tls(&file) {
+            let mut block = vec![0; t.size as usize];
+            block[..t.image.len()].copy_from_slice(t.image);
+            data.push(DataSection { name: TLS_SECTION.into(), addr: t.addr, size: t.size, bytes: Some(Cow::Owned(block)), writable: true });
+        }
         let pointers = if data.is_empty() { BTreeMap::new() } else { pointers(&file, &data) };
 
         // Stripped: no function in the static symbol table, at most the dynamic exports.
@@ -263,7 +271,7 @@ fn pointers(file: &object::File, data: &[DataSection]) -> BTreeMap<u64, u64> {
         if relocated || !matches!(sec.name.as_str(), ".got" | ".got.plt" | "__got") {
             continue;
         }
-        let Some(bytes) = sec.bytes else { continue };
+        let Some(bytes) = &sec.bytes else { continue };
         for (k, w) in bytes.chunks_exact(8).enumerate() {
             let at = sec.addr + 8 * k as u64;
             let v = u64::from_le_bytes(w.try_into().unwrap());
@@ -301,6 +309,52 @@ pub fn demangle(sym: &str) -> Option<String> {
     let d = cpp_demangle::Symbol::new(s).ok()?;
     let opts = cpp_demangle::DemangleOptions::new().no_params().no_return_type();
     d.demangle_with_options(&opts).ok()
+}
+
+/// Name of the data section `Binary::parse` makes for the thread-local block.
+pub const TLS_SECTION: &str = ".tls";
+
+/// An executable's thread-local block (`.tdata`, then `.tbss`) as the decompiled
+/// code sees it. The x86-64 ABI puts the main program's block just below the
+/// thread pointer, which `fs:0` holds (variant II), so a thread-local is read as
+/// `fs:[-k]`. The lifter turns those into addresses in this block, which becomes
+/// one `static`: every thread of the decompiled program shares it, which is right
+/// for one thread (as the atomics are).
+///
+/// `.tbss` has no addresses of its own (it overlaps the sections after `.tdata`),
+/// so the block is placed above every section.
+pub struct Tls<'a> {
+    pub addr: u64,
+    /// The block, then the 8-byte word at the thread pointer.
+    pub size: u64,
+    /// `.tdata`'s bytes, at the start of the block; the rest is zero.
+    pub image: &'a [u8],
+    /// What `fs:0` holds: the end of the block.
+    pub thread_pointer: u64,
+}
+
+/// The thread-local block of a linked ELF file that has one.
+pub fn tls<'a>(file: &object::File<'a>) -> Option<Tls<'a>> {
+    if file.format() != BinaryFormat::Elf || file.kind() == ObjectKind::Relocatable {
+        return None;
+    }
+    let is_tls = |k: SectionKind| matches!(k, SectionKind::Tls | SectionKind::UninitializedTls);
+    let secs: Vec<_> = file.sections().filter(|s| is_tls(s.kind()) && s.size() != 0).collect();
+    let start = secs.iter().map(|s| s.address()).min()?;
+    let end = secs.iter().map(|s| s.address() + s.size()).max()?;
+    let align = secs.iter().map(|s| s.align()).max().unwrap_or(1).max(16);
+    // The initialized part: one `.tdata` at the start (what linkers produce).
+    let image = match secs.iter().filter(|s| s.kind() == SectionKind::Tls).collect::<Vec<_>>()[..] {
+        [] => &[][..],
+        [d] if d.address() == start => d.data().ok().filter(|b| b.len() as u64 == d.size())?,
+        _ => return None,
+    };
+    // The block's size rounded up to its alignment is how far below the thread
+    // pointer it starts (glibc's `l_tls_offset` for the executable).
+    let offset = (end - start).next_multiple_of(align);
+    let top = file.sections().map(|s| s.address() + s.size()).max()?;
+    let addr = top.checked_add(0x1000)?.next_multiple_of(align.max(0x1000));
+    Some(Tls { addr, size: offset + 8, image, thread_pointer: addr + offset })
 }
 
 #[cfg(test)]

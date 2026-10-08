@@ -619,3 +619,30 @@ uint64_t jump_table(uint64_t i, uint64_t x) {
     default: return 5;
     }
 }
+
+/* ---- flags read in another block ---- */
+
+// gcc tests `==` and then `<` of the same cmp in the next block.
+// @diff cmp3: i32(i64, i64)
+int cmp3(int64_t a, int64_t b) { if (a == b) return 0; if (a < b) return -1; return 1; }
+
+// @diff count_down: u64(i32:-5..100, u64)
+uint64_t count_down(int32_t n, uint64_t k) {
+    uint64_t s = 0;
+    while (--n > 0) s += n * k + (s >> 3);
+    return s;
+}
+
+/* ---- thread-locals ---- */
+
+static __thread uint64_t tls_counter = 7;
+static __thread uint32_t tls_zero;
+
+// Initialized (.tdata) and zeroed (.tbss) thread-locals, read and written at
+// fixed offsets below the thread pointer.
+// @diff tls_bump: u64(u64)
+uint64_t tls_bump(uint64_t x) {
+    tls_counter += x;
+    tls_zero ^= (uint32_t)x;
+    return tls_counter * 3 + tls_zero;
+}

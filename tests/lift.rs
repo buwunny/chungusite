@@ -269,3 +269,82 @@ fn indirect_jump_without_a_table_is_a_tail_call() {
     });
     assert!(out.contains("tailcall"), "{out}");
 }
+
+#[test]
+fn flags_set_in_another_block_become_a_parameter() {
+    // cmp ; je ; jl in the fall-through block: one predecessor computes `<` for it
+    let out = ir(|a| {
+        let mut eq = a.create_label();
+        let mut lt = a.create_label();
+        a.cmp(rdi, rsi).unwrap();
+        a.je(eq).unwrap();
+        a.jl(lt).unwrap();
+        a.mov(eax, 1).unwrap();
+        a.ret().unwrap();
+        a.set_label(&mut eq).unwrap();
+        a.xor(eax, eax).unwrap();
+        a.ret().unwrap();
+        a.set_label(&mut lt).unwrap();
+        a.mov(rax, -1i64).unwrap();
+        a.ret().unwrap();
+    });
+    assert!(out.starts_with("bb0(v1, v0):\n  v2 = cmp.Eq v0, v1\n  v9 = cmp.Slt v0, v1\n  br v2 bb3() bb1(v9)\nbb1(v3):\n  br v3 bb4() bb2()\n"), "{out}");
+    // a loop whose head reads flags from before the loop and from itself
+    let out = ir(|a| {
+        let mut l = a.create_label();
+        a.cmp(rdi, rsi).unwrap();
+        a.jmp(l).unwrap();
+        a.set_label(&mut l).unwrap();
+        a.je(l).unwrap();
+        a.ret().unwrap();
+    });
+    assert!(out.contains("  v4 = cmp.Eq v0, v1\n  jump bb1(v6, v4)\nbb1(v5, v2):\n  br v2 bb1(v5, v2) bb2(v5)\n"), "{out}");
+}
+
+#[test]
+fn inc_and_dec_give_the_signed_conditions() {
+    let out = ir(|a| {
+        a.dec(rdi).unwrap();
+        a.setg(al).unwrap();
+        a.inc(rsi).unwrap();
+        a.setl(cl).unwrap();
+        a.ret().unwrap();
+    });
+    // dec: rdi - 1 > 0 is rdi > 1; inc: rsi + 1 < 0 is rsi < -1
+    assert!(out.contains("cmp.Sgt v0, v1"), "{out}");
+    assert!(out.contains("const 0xffffffffffffffff\n") && out.contains("cmp.Slt"), "{out}");
+    // the carry conditions are left alone by inc and dec
+    let mut f = Function::with_capacity(16, 2);
+    let code = [0x48, 0xFF, 0xC7, 0x0F, 0x92, 0xC0, 0xC3]; // inc rdi ; setb al ; ret
+    assert!(Lifter::new().lift(&code, 0x1000, &mut f).is_err());
+}
+
+#[test]
+fn narrow_mul_div_and_bit_set() {
+    let out = ir(|a| {
+        a.mov(eax, edi).unwrap();
+        a.div(sil).unwrap(); // al, ah = ax / sil, ax % sil
+        a.mul(cx).unwrap(); // dx:ax = ax * cx
+        a.bts(r8, r9).unwrap();
+        a.pause().unwrap();
+        a.ret().unwrap();
+    });
+    assert!(out.contains("UDiv") && out.contains("URem"), "{out}");
+    assert!(out.contains("Mul"), "{out}");
+    assert!(out.contains("Shl") && out.contains("Or"), "{out}");
+}
+
+#[test]
+fn thread_locals_are_addresses_below_the_thread_pointer() {
+    // mov rax, fs:[0] ; mov ecx, fs:[-8] ; add eax, ecx ; ret
+    let code = [0x64, 0x48, 0x8B, 0x04, 0x25, 0, 0, 0, 0, 0x64, 0x8B, 0x0C, 0x25, 0xF8, 0xFF, 0xFF, 0xFF, 0x01, 0xC8, 0xC3];
+    let mut f = Function::with_capacity(16, 2);
+    // without a thread-local block, unsupported
+    assert!(Lifter::new().lift(&code, 0x1000, &mut f).is_err());
+    let mut l = Lifter::new();
+    l.thread_pointer = Some(0x8000);
+    l.lift(&code, 0x1000, &mut f).unwrap();
+    verify(&f).unwrap();
+    let out = dump(&f);
+    assert!(out.contains("const 0x8000\n") && out.contains("const 0x7ff8\n"), "{out}");
+}

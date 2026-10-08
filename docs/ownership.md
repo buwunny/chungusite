@@ -169,6 +169,8 @@ unsafe { let __s = &mut heap23[v23.wrapping_sub(heap23_base) as usize..];
 
 **Raw twins.** A call that can't lend a slice (the pointer has no origin, comes from several objects, from one that isn't safe, from a nullable argument, or conflicts with another loan) calls the callee's *raw twin*: `f_raw`, the same function emitted in fast mode, taking integers. So one caller that can't lend a slice doesn't take the slice away from all the others. Twins are also made for functions that data points to (vtables, callbacks: whoever calls through the pointer passes integers, so the static holds `f_raw`), and for the slice-taking callees of every twin and every function emitted in fast mode, since fast-mode code passes integers. A twin is emitted right after its function.
 
+The twin still only accesses its arguments during the call (its summary says so), so the caller's objects don't escape through it: an argument the twin borrows whose root is safe in the caller is a `RawLend` fact, a read (and write) of the object that the loan rules leave alone, and the emitter passes a pointer made from the object's slice at the call, `(frame.0.as_mut_ptr() as u64).wrapping_add(off)`, instead of the address kept from earlier. Only the arguments that made the call raw lose their slices.
+
 **Moves: `malloc` and `free` as `Box`.** An allocation that is safe (stage 3) and passes the move check (stage 6) is a `Box<[u8]>`:
 
 ```rust
@@ -181,7 +183,7 @@ heap22 = Box::default(); // free(p)
 
 `free` is a move out of the box (dropping it). An allocation that is never freed and never escapes is dropped at the end of the function, which nothing can observe. A function that frees its argument doesn't consume a `Box` yet: that needs passing `Box<[u8]>` by value, so such an argument escapes.
 
-**Builtins.** `memcpy`/`memmove` and `memset` whose pointer arguments all have safe roots become `copy_from_slice`, `copy_within` (same root) and `fill`; if any of them hasn't, the call stays an FFI call and all its pointer arguments escape.
+**Builtins.** `memcpy`/`memmove` and `memset` whose pointer arguments all have safe roots become `copy_from_slice`, `copy_within` (same root) and `fill`; if any of them hasn't, the call stays an FFI call, and each pointer argument with a safe root is a pointer made from its slice at the call, as for raw twins (one into a read-only static can't be written, so that one escapes).
 
 Calls through GOT slots that the loader fills with a function in the binary (`R_X86_64_RELATIVE`, how PIE code calls a local function through the GOT) are direct calls to that function; they used to be indirect, which made every pointer passed to them escape.
 

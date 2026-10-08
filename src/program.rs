@@ -574,7 +574,14 @@ impl Program {
         let Some(s) = safe else { return plain };
         let plain = plain?;
         // a call to a raw twin: integers, and as unsafe as an FFI call
-        let twin = |j: usize| CallInfo { path: Some(s.twin_ident[j].clone()), raw: true, ..plain.clone() };
+        // (with the callee's summary: the arguments it borrows are passed as
+        // pointers made from the caller's slices)
+        let twin = |j: usize| CallInfo {
+            path: Some(s.twin_ident[j].clone()),
+            raw: true,
+            args: s.callee(self, i, k).map(|c| c.args).unwrap_or_default(),
+            ..plain.clone()
+        };
         if let Target::Func(j) = f.targets[k] {
             if s.twin[j] && (fast || s.raw_sites.contains(&(i, site))) {
                 return Some(twin(j));

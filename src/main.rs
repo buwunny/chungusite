@@ -502,7 +502,7 @@ fn borrows(func: &Function, a: &Analysis, out: &mut String) {
     }
     for (r, root) in a.roots.iter().enumerate() {
         // only objects something reads, writes or lends (not call targets)
-        let used = a.facts.iter().any(|x| x.root as usize == r && matches!(x.kind, FactKind::Read | FactKind::Write | FactKind::Borrow { .. }));
+        let used = a.facts.iter().any(|x| x.root as usize == r && matches!(x.kind, FactKind::Read | FactKind::Write | FactKind::Borrow { .. } | FactKind::RawLend { .. }));
         if !used {
             continue;
         }

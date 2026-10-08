@@ -320,6 +320,29 @@ fn an_escaping_local_leaves_the_rest_of_the_frame_safe() {
     assert!(src[1].contains("u64::from_le_bytes(frame.0["), "{}", src[1]);
 }
 
+#[test]
+fn a_local_lent_to_a_raw_twin_stays_safe() {
+    // add(p, &x) where p escapes: the call goes to `add_raw`, which gets a
+    // pointer made from the frame's slice, and x is still read through it
+    let (p, _) = program(&[
+        ("add", &add_into),
+        ("caller", &|a| {
+            a.sub(rsp, 24).unwrap();
+            a.mov(qword_ptr(rsp + 8), rsi).unwrap();
+            a.mov(qword_ptr(0x9000), rdi).unwrap();
+            a.lea(rsi, qword_ptr(rsp + 8)).unwrap();
+            a.call(addr(0)).unwrap();
+            a.mov(rax, qword_ptr(rsp + 8)).unwrap();
+            a.add(rsp, 24).unwrap();
+            a.ret().unwrap();
+        }),
+    ]);
+    let src = emitted(&p, Mode::Safe);
+    assert!(src[1].contains("add_raw("), "{}", src[1]);
+    assert!(src[1].contains("frame.0.as_ptr() as u64"), "{}", src[1]);
+    assert!(src[1].contains("u64::from_le_bytes(frame.0["), "{}", src[1]);
+}
+
 /// Stand-ins for `malloc`, `free` and `memcpy`: safe mode goes by their names,
 /// and the program by the arguments they read.
 fn stub_malloc(a: &mut CodeAssembler) {

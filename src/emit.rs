@@ -1570,14 +1570,15 @@ impl Emitter<'_> {
         let a = typed.join(", ");
         let rty = info.as_ref().and_then(|c| c.ret_ty).unwrap_or(self.u64_ty);
         match info {
-            Some(CallInfo { path: Some(p), ret, ret2, foreign: false, args: pass, .. }) if pass.iter().any(|x| matches!(x, Pass::Borrow { .. })) => {
+            Some(CallInfo { path: Some(p), ret, ret2, foreign: false, raw: false, args: pass, .. }) if pass.iter().any(|x| matches!(x, Pass::Borrow { .. })) => {
                 let (lets, a) = self.call_args(args, &pass, typed);
                 (format!("unsafe {{ {lets}{p}({}) }}", a.join(", ")), ret, ret2, rty)
             }
-            Some(CallInfo { path: Some(p), ret, ret2, foreign, raw, .. }) => {
+            Some(CallInfo { path: Some(p), ret, ret2, foreign, raw, args: pass, arg_tys, .. }) => {
                 if foreign || raw {
                     self.stats.raw += 1;
                 }
+                let a = self.raw_lends(args, &pass, &arg_tys, typed).join(", ");
                 if ret2 && foreign {
                     // an extern returns `ffi::Pair`, which is FFI-safe; a tuple isn't
                     return (format!("unsafe {{ let pair_ = {p}({a}); (pair_.0, pair_.1) }}"), ret, ret2, rty);
@@ -2095,6 +2096,30 @@ impl Emitter<'_> {
     /// (the borrow analysis downgrades the others); they are split apart with
     /// `split_at_mut`. Returns the statements that do the splitting, and the
     /// argument expressions.
+    /// The arguments of a call to a raw twin or a C function: an argument it
+    /// borrows or accesses whose root is safe is a pointer made from the root's
+    /// slice at the call (`borrow::FactKind::RawLend`), not the address kept
+    /// from earlier.
+    fn raw_lends(&self, args: &[ValueId], pass: &[Pass], tys: &[Option<TyId>], mut out: Vec<String>) -> Vec<String> {
+        let Some(a) = self.borrow else { return out };
+        for (k, &v) in args.iter().enumerate() {
+            let mutbl = match pass.get(k) {
+                Some(&Pass::Borrow { mutbl, .. }) => mutbl,
+                Some(&Pass::Access { write }) => write,
+                _ => continue,
+            };
+            let Some(place) = a.safe_root(v).and_then(|r| self.places.get(r as usize)).and_then(|p| p.as_ref()) else { continue };
+            let slice = match (&place.write, mutbl) {
+                (Some(w), true) => format!("{w}.as_mut_ptr()"),
+                (_, false) => format!("{}.as_ptr()", place.read),
+                (None, true) => continue,
+            };
+            let addr = format!("({slice} as u64).wrapping_add({}.wrapping_sub({}))", expr::recv(self.as_u64(v)), place.base);
+            out[k] = self.conv(&addr, self.u64_ty, tys.get(k).copied().flatten().unwrap_or(self.u64_ty));
+        }
+        out
+    }
+
     fn call_args(&mut self, args: &[ValueId], pass: &[Pass], typed: Vec<String>) -> (String, Vec<String>) {
         let mut out = typed;
         let mut lets = String::new();

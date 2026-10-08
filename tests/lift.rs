@@ -297,7 +297,7 @@ fn relative_jump_tables_at_o0() {
     a.set_label(&mut done).unwrap();
     a.ret().unwrap();
     let r = a.assemble_options(common::BASE, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS).unwrap();
-    let table: Vec<u8> = cases.iter().flat_map(|l| ((r.label_ip(l).unwrap() - TABLE) as i32).to_le_bytes()).collect();
+    let table: Vec<u8> = cases.iter().flat_map(|l| (r.label_ip(l).unwrap().wrapping_sub(TABLE) as i32).to_le_bytes()).collect();
     let mut f = Function::with_capacity(64, 8);
     Lifter::new().lift_with_data(&r.inner.code_buffer, common::BASE, &[(TABLE, &table)], &mut f).unwrap();
     verify(&f).unwrap();

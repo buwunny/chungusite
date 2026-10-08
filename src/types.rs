@@ -337,11 +337,7 @@ pub fn render_structs(table: &TyTable, roots: impl IntoIterator<Item = TyId>) ->
                 work.extend(table.structs[s].fields.iter().map(|f| f.ty));
             }
             Ty::Array { elem, .. } | Ty::Slice { elem } => work.push(elem),
-            Ty::RawPtr { pointee, .. } | Ty::Ref { pointee, .. } => {
-                if !matches!(table.tys[pointee], Ty::Struct(_)) {
-                    work.push(pointee)
-                }
-            }
+            Ty::RawPtr { pointee, .. } | Ty::Ref { pointee, .. } if !matches!(table.tys[pointee], Ty::Struct(_)) => work.push(pointee),
             _ => {}
         }
     }
@@ -722,9 +718,7 @@ fn facts(f: &Function) -> Facts {
             let c = pts.find(base.index());
             let s = &mut pts.shape[c];
             s.written |= write;
-            if scale != bytes {
-                s.conflict = true;
-            } else if s.elem.is_some_and(|e| e != bytes) {
+            if scale != bytes || s.elem.is_some_and(|e| e != bytes) {
                 s.conflict = true;
             } else {
                 s.elem = Some(bytes);
@@ -980,7 +974,7 @@ impl Classes<'_> {
     fn scalar(&self, c: u32) -> Option<(u8, Option<Slot>)> {
         let s = &self.fa.shape[c as usize];
         let w = s.fields.values().next().map(|x| x.bytes);
-        let walk = w.filter(|&w| s.stride != 0 && s.stride % w as u64 == 0 && s.fields.values().all(|x| x.bytes == w));
+        let walk = w.filter(|&w| s.stride != 0 && s.stride.is_multiple_of(w as u64) && s.fields.values().all(|x| x.bytes == w));
         match s.elem.or(walk) {
             Some(w) => s.fields.iter().all(|(o, x)| x.bytes == w && o % w as i64 == 0).then(|| (w, s.fields.get(&0).cloned())),
             None if s.fields.len() == 1 => s.fields.get(&0).map(|x| (x.bytes, Some(x.clone()))),

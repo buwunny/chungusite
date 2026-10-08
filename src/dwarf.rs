@@ -508,5 +508,5 @@ pub fn natural_layout(t: &TyTable, fields: &[Field], size: u32) -> bool {
         }
         align = align.max(a);
     }
-    size % align == 0
+    size.is_multiple_of(align)
 }

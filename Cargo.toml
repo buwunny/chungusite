@@ -8,7 +8,10 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 cpp_demangle = "0.5.1"
+datafrog = "2"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
+# DWARF: parameter and struct types when the binary has debug info (types.rs).
+gimli = { version = "0.33", default-features = false, features = ["read", "std"] }
 memmap2 = "0.9.11"
 object = { version = "0.40.0", default-features = false, features = ["read_core", "elf", "macho", "pe", "coff", "std"] }
 # ML refinement (names/types). load-dynamic: libonnxruntime is loaded at runtime from

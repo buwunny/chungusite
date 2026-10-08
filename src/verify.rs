@@ -67,27 +67,36 @@ pub fn verify(f: &Function) -> Result<(), VerifyError> {
             err?;
         }
 
-        let (args, cond) = match blk.term {
-            Terminator::Jump { args, .. } => (args, None),
-            Terminator::Branch { c, args, .. } => (args, Some(c)),
-            Terminator::Switch { v, table, args } => {
-                if !in_pool(table) || table.len == 0 {
-                    return Err(VerifyError::ListOutOfRange { block: b });
-                }
-                (args, Some(v))
-            }
-            Terminator::Return(r) => (ListRef::EMPTY, r),
-            Terminator::TailCall { callee, args } => (args, Some(callee)),
-            Terminator::Unreachable => (ListRef::EMPTY, None),
+        let (targets, args, cond) = match blk.term {
+            Terminator::Jump { to, args } => ([Some(to), None], args, None),
+            Terminator::Branch { c, t, f: e, args } => ([Some(t), Some(e)], args, Some(c)),
+            Terminator::Switch { v, .. } => ([None, None], ListRef::EMPTY, Some(v)),
+            Terminator::Return(r) => ([None, None], ListRef::EMPTY, r),
+            Terminator::TailCall { callee, args } => ([None, None], args, Some(callee)),
+            Terminator::Unreachable => ([None, None], ListRef::EMPTY, None),
         };
         if let Some(c) = cond {
             use_ok(None, c)?;
+        }
+        // switch edges carry no arguments, so their targets take no parameters
+        if let Terminator::Switch { table, default, .. } = blk.term {
+            if !in_pool(table) {
+                return Err(VerifyError::ListOutOfRange { block: b });
+            }
+            for t in table.get(&f.value_pool).iter().map(|&v| BlockId::from_value(v)).chain([default]) {
+                if t.index() >= f.blocks.len() {
+                    return Err(VerifyError::DanglingBlock { block: b, target: t });
+                }
+                if f.blocks[t].params.len != 0 {
+                    return Err(VerifyError::EdgeArity { block: b, expected: f.blocks[t].params.len as usize, got: 0 });
+                }
+            }
         }
         if !in_pool(args) {
             return Err(VerifyError::ListOutOfRange { block: b });
         }
         let mut expected = 0;
-        for t in blk.term.successors(&f.value_pool) {
+        for t in targets.into_iter().flatten() {
             if t.index() >= f.blocks.len() {
                 return Err(VerifyError::DanglingBlock { block: b, target: t });
             }
@@ -112,7 +121,7 @@ pub fn verify(f: &Function) -> Result<(), VerifyError> {
         }
         let term_uses = match blk.term {
             Terminator::Jump { args, .. } | Terminator::TailCall { args, .. } => args.get(&f.value_pool),
-            Terminator::Branch { args, .. } | Terminator::Switch { args, .. } => args.get(&f.value_pool),
+            Terminator::Branch { args, .. } => args.get(&f.value_pool),
             _ => &[],
         };
         let extra = match blk.term {

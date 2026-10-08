@@ -16,8 +16,9 @@
 //! vtables, tables of string pointers) are emitted as pointers to the target's
 //! static or function, so code that loads an address out of the GOT and follows it
 //! lands in the right static. Each GOT slot is its own 8-byte item, so only the
-//! slots the code uses are emitted. A slot whose target is outside the output (an
-//! import, or a function not selected) is null.
+//! slots the code uses are emitted. A slot whose target is outside the output is
+//! null if it is an import, and keeps its bytes from the file if it is a function
+//! of the binary that isn't emitted (not selected, or skipped by `--skip-failed`).
 use crate::ir::{Function, Idx, InstKind};
 use crate::load::Binary;
 use std::collections::{HashMap, HashSet};
@@ -122,6 +123,34 @@ impl<'b, 'a> Globals<'b, 'a> {
         })
     }
 
+    /// The static holding `addr`, if safe code can read it as a slice: a
+    /// read-only item emitted as `Bytes<N>` (no pointer slots in it).
+    pub fn slice(&self, addr: u64) -> Option<String> {
+        let item = self.item_at(addr)?;
+        let sec = &self.bin.data[item.section];
+        let words = self.bin.pointers.range(item.start..item.start + item.len).next().is_some();
+        (!sec.writable && !words).then(|| self.ident(&item))
+    }
+
+    /// Is `item` emitted as `Words` (it holds pointer slots), not `Bytes`?
+    fn words(&self, item: &Item) -> bool {
+        let end = item.start + item.len;
+        let mut slots = self.bin.pointers.range(item.start..end).peekable();
+        slots.peek().is_some() && item.start.is_multiple_of(8) && slots.all(|(&a, _)| a.is_multiple_of(8) && a + 8 <= end)
+    }
+
+    /// `item`'s static with the right name and type but zero contents, which
+    /// rustc checks much faster than the real initializer (`--check`).
+    pub fn emit_static_stub(&self, item: &Item, out: &mut String) {
+        let m = if self.bin.data[item.section].writable { "mut " } else { "" };
+        let name = self.ident(item);
+        let n = item.len;
+        let _ = match self.words(item) {
+            true => writeln!(out, "pub static {m}{name}: Words<{k}> = Words {{ w: [Word {{ b: [0; 8] }}; {k}] }};", k = n.div_ceil(8)),
+            false => writeln!(out, "pub static {m}{name}: Bytes<{n}> = Bytes {{ b: [0; {n}] }};"),
+        };
+    }
+
     /// A raw pointer to `item`'s static.
     fn addr_of(&self, item: &Item) -> String {
         let name = self.ident(item);
@@ -132,17 +161,20 @@ impl<'b, 'a> Globals<'b, 'a> {
     }
 
     /// The initializer of a pointer slot holding `target`: the function or static
-    /// it points to (adding that static to `more`), or null.
-    fn pointer(&self, target: u64, more: &mut Vec<Item>) -> String {
+    /// it points to (adding that static to `more`), or null; `None` for a function
+    /// of the binary that isn't in the output, whose slot keeps its file bytes.
+    fn pointer(&self, target: u64, more: &mut Vec<Item>) -> Option<String> {
         if let Some(f) = self.funcs.get(&target) {
-            return format!("{f} as *const u8");
+            return Some(format!("{f} as *const u8"));
         }
-        let Some(item) = self.item_at(target) else { return "core::ptr::null()".into() };
+        let Some(item) = self.item_at(target) else {
+            return self.bin.func_at(target).is_none().then(|| "core::ptr::null()".into());
+        };
         more.push(item);
-        match target - item.start {
+        Some(match target - item.start {
             0 => format!("{} as *const u8", self.addr_of(&item)),
             off => format!("({} as *const u8).wrapping_add({off:#x})", self.addr_of(&item)),
-        }
+        })
     }
 
     /// Items that `f` uses as pointers, the same addresses `expr` rewrites.
@@ -176,8 +208,7 @@ impl<'b, 'a> Globals<'b, 'a> {
         let m = if sec.writable { "mut " } else { "" };
         let end = item.start + n;
         let slots: Vec<(u64, u64)> = self.bin.pointers.range(item.start..end).map(|(&a, &t)| (a, t)).collect();
-        let words = !slots.is_empty() && item.start.is_multiple_of(8) && slots.iter().all(|&(a, _)| a.is_multiple_of(8) && a + 8 <= end);
-        if !words {
+        if !self.words(item) {
             let init = match bytes {
                 Some(b) if b.iter().any(|&c| c != 0) => byte_string(b),
                 _ => format!("[0; {n}]"),
@@ -194,8 +225,10 @@ impl<'b, 'a> Globals<'b, 'a> {
             out.push_str(if j % 4 == 0 { "\n    " } else { " " });
             if slots.peek().is_some_and(|&(a, _)| a == at) {
                 let (_, t) = slots.next().unwrap();
-                let _ = write!(out, "Word {{ p: {} }},", self.pointer(t, more));
-                continue;
+                if let Some(p) = self.pointer(t, more) {
+                    let _ = write!(out, "Word {{ p: {p} }},");
+                    continue;
+                }
             }
             let mut w = [0u8; 8];
             if let Some(b) = bytes {

@@ -405,10 +405,17 @@ fn undefined_values(f: &Function, cfg: &Cfg, sites: &[Site], callee: &dyn Fn(usi
 
 /// Edge argument `k` on every edge from `p` into `b`.
 pub(crate) fn incoming(f: &Function, p: BlockId, b: BlockId, k: usize, mut cb: impl FnMut(ValueId)) {
-    for (s, args) in f.edges(p) {
-        if s == b {
-            cb(args[k]);
+    match f.blocks[p].term {
+        Terminator::Jump { to, args } if to == b => cb(f.value_pool[args.start as usize + k]),
+        Terminator::Branch { t, f: e, args, .. } => {
+            if t == b {
+                cb(f.value_pool[args.start as usize + k]);
+            }
+            if e == b {
+                cb(f.value_pool[args.start as usize + f.blocks[t].params.len as usize + k]);
+            }
         }
+        _ => {}
     }
 }
 
@@ -532,7 +539,7 @@ pub(crate) fn bytes(ty: TyId) -> usize {
         TyId::B1 | TyId::BOOL => 1,
         TyId::B2 => 2,
         TyId::B4 => 4,
-        TyId::PAIR | TyId::B16 => 16,
+        TyId::PAIR => 16,
         _ => 8,
     }
 }

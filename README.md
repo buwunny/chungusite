@@ -8,7 +8,7 @@ chungusite ./prog --list                  # which functions lift
 chungusite ./prog --mode safe -o prog.rs  # decompile to Rust
 ```
 
-`--mode fast` emits raw pointers in `unsafe`. `--mode safe` turns pointer arguments it can prove into `&[u8]` / `&mut [u8]` with bounds-checked accesses, and leaves the rest raw.
+`--mode fast` emits raw pointers in `unsafe`. `--mode safe` turns the objects it can prove things about (pointer arguments, the stack frame, read-only globals, `malloc`'d buffers) into `&[u8]` / `&mut [u8]` / `Box<[u8]>` with bounds-checked accesses, lends them across calls, and leaves the rest raw; `--check` compiles the result with rustc and falls back to fast mode for whatever it rejects.
 
 - [docs/cli.md](docs/cli.md): the command and what its output looks like
 - [docs/roadmap.md](docs/roadmap.md): what's left before it handles real-world binaries

@@ -3,13 +3,40 @@
 [`src/lift.rs`](../src/lift.rs) turns decoded `iced_x86::Instruction`s into the IR from [ir.md](ir.md). It covers:
 
 - data movement: `MOV` in every register, immediate and memory form, including 8 and 16-bit writes (merged into the old value) and `AH`-style high bytes; `MOVZX`, `MOVSX`, `MOVSXD`, `LEA`, `CDQE`/`CWDE`;
-- arithmetic: `ADD/SUB/AND/OR/XOR/CMP/TEST`, `INC/DEC/NEG/NOT`, `SHL/SHR/SAR` (immediate or `CL` count), two and three-operand `IMUL`, and `DIV`/`IDIV` when `rdx` only extends `rax` (`xor edx, edx` or `CQO`/`CDQ` first). Any of them can take a memory operand: the lifter loads it, and a memory destination is stored back;
-- flags: `Jcc`, `CMOVcc` (`Select`) and `SETcc` (`Cmp` zero-extended to a byte) all read the same lazy flags, including carry and overflow after `ADD`/`SUB`/`CMP`;
+- arithmetic: `ADD/SUB/AND/OR/XOR/CMP/TEST`, `INC/DEC/NEG/NOT`, `SHL/SHR/SAR` (immediate or `CL` count), `IMUL` in all three forms, one-operand `MUL`, and `DIV`/`IDIV` when `rdx` only extends `rax` (`xor edx, edx` or `CQO`/`CDQ` first). Any of them can take a memory operand: the lifter loads it, and a memory destination is stored back. A 64-bit one-operand `MUL`/`IMUL` writes `rax = a * b` and `rdx = UMulHi(a, b)` (`SMulHi` for `IMUL`), the high half of the 128-bit product, which the emitter prints as `((a as u128 * b as u128) >> 64) as u64`; the 32-bit form multiplies the zero- or sign-extended halves in 64 bits;
+- flags: `Jcc`, `CMOVcc` (`Select`) and `SETcc` (`Cmp` zero-extended to a byte) all read the same lazy flags, including carry and overflow after `ADD`/`SUB`/`CMP`, and after `MUL`/`IMUL`, where CF = OF = "the product doesn't fit" (`seto` after an overflow-checked multiply);
+- 16-byte copies: `MOVUPS`/`MOVAPS`/`MOVDQU`/`MOVDQA` between memory and xmm registers, `MOVUPD`/`MOVAPD`/`LDDQU`, `XORPS`/`XORPD`/`PXOR` (zeroing, or xor of known values) and the other bitwise ops (`ANDPS`, `ORPS`, `PAND`, `POR`, ...), `PCMPEQ x, x` (all ones), `MOVQ`/`MOVD`/`MOVSD` between xmm registers, general registers and memory, and `PUNPCKLQDQ`/`MOVLHPS`. An xmm register is a pair of 64-bit values (low, high), so a copy is two loads and two stores. Those values are tracked within a block only: an xmm register read before the block writes it is unsupported (SSE arithmetic and floating point aren't lifted yet);
+- bit instructions, `adc`/`sbb`, double shifts, rotates, atomics and `rep movs` (below);
+- jump tables, as a `Terminator::Switch` (below);
 - the stack: `PUSH`, `POP` and `LEAVE` move `rsp` with a `PtrOffset` and a store or load;
-- calls: `CALL` (direct, register or memory) becomes `InstKind::Call` with the System V argument registers; `JMP [RIP+x]` is a tail call through the GOT;
+- calls: `CALL` (direct, register or memory) becomes `InstKind::Call` with the System V argument registers; an indirect `JMP` that isn't a jump table (`jmp [rip+x]` through the GOT, `jmp rax`, `jmp [rax+8]` through a vtable) is a tail call through that pointer;
 - `JMP`, `RET`, `NOP`/`ENDBR64`, and `UD2`/`INT3`/`HLT`, which end the block as `Unreachable`.
 
-Anything else returns `LiftError::Unsupported` so the caller can decide what to do. It never guesses.
+Anything else returns `LiftError::Unsupported` so the caller can decide what to do. It never guesses. Pass 1 already checks each mnemonic (`handled`), so a function with an instruction the lifter has no case for fails before any IR is built; pass 2 still rejects unsupported operand forms.
+
+## Jump tables
+
+`switch` statements and Rust `match`es compile to an indirect jump through a table of case addresses. Pass 1 recognizes the two shapes gcc and clang (and rustc, through LLVM) emit:
+
+```asm
+    cmp    edi, 7                 ; bounds check: case count 8
+    ja     default
+    jmp    [table + rdi*8]        ; non-PIC: absolute addresses
+
+    cmp    edi, 7
+    ja     default
+    mov    eax, edi
+    lea    rdx, [rip + table]
+    movsxd rax, dword [rdx + rax*4]
+    add    rax, rdx               ; PIC: offsets from the table
+    jmp    rax
+```
+
+It keeps the last 12 decoded instructions in a ring (no allocation), matches the table load, and reads the table from the binary's sections (`lift_with_data`; `lift` alone looks in the code bytes). The case count comes from the bounds check, a `cmp`/`sub` with an immediate followed by `ja`/`jae`/`jbe`/`jb`, when it tests the index register or a register moved into it. A `match` on an enum has no bounds check, since the discriminant can't be out of range, so the table is read until an entry leaves the function and cut before the first one that isn't the start of an instruction. Every case target becomes a block leader.
+
+In pass 2 the index is the index register's value at the table load, and the jump becomes `Switch { v, table, default }`: case `k` goes to `table[k]`, anything else to `default`, which is the target the most cases share. Switch edges carry no block arguments, so each distinct target is reached through a new block that has no parameters and jumps on to it, passing the registers the target needs. The structurer prints a switch as `if v == 0 { .. } else if matches!(v, 1 | 3..=5) { .. } else { .. }`, and the state machine as a `match`.
+
+A jump that looks like a table but whose table can't be read (a relocatable object, whose tables are relocations) is unsupported rather than taken for a tail call.
 
 ## Calls
 
@@ -94,31 +121,18 @@ bb0():
 
 After lifting, `opt::clean` removes trivial block params and dead code; see [ownership.md](ownership.md) for that pass and the safe-mode analyses built on it.
 
-## Jump tables
+## Bit instructions, atomics and the rest
 
-An indirect `jmp` is a jump table when the instructions just before it, in the same straight-line run, compute its target from a table:
-
-- `lea b, [rip+T]; movsxd e, dword [b+x*4]; add e, b; jmp e` (position-independent code: entries are 32-bit offsets from `T`), or
-- `jmp [x*8+T]` and `mov r, [x*8+T]; jmp r` (absolute addresses).
-
-Pass 1 recognizes these from a window of the last 8 instructions and reads the table through `lift::Context`, which `program.rs` backs with the linked program's sections (`load::Image`). Nothing bounds the table: Rust's `match` on an enum discriminant has no range check before the jump. So entries are read until one isn't the start of an instruction in this function, or the table runs into another table of the same function. Extra entries past the real end are harmless, since no index reaches them. Every target becomes a leader, and the `jmp` becomes `Terminator::Switch { v, table, args }`, where `v` is the index register read at the table load. The table lists one block per case (`ir::block_of` decodes an entry), edge arguments go per entry in table order like `Branch`'s, and `Terminator::successors` and `Function::edges` walk them. The emitter prints a `match` with one arm per target; the target with the most cases becomes `_`.
-
-Any other indirect `jmp` (through a register, a vtable slot or the GOT) leaves the function, so it is a tail call. A jump that looks like a table but can't be read (no `Context`, or a relocatable object whose sections aren't laid out) is unsupported rather than a guess.
-
-## SSE, wide multiplies and the rest
-
-- **xmm registers** are tracked within a block only: `movups`/`movdqu`/`movaps`/`movdqa` loads, stores and copies, `xorps`/`pxor` zeroing and the other bitwise ops, `pcmpeq x, x` (all ones), `movq`/`movd` to and from GPRs and memory, and `punpcklqdq`/`movlhps` (two qwords into one register). Values are 16 bytes (`TyId::B16`, a `u128` in Rust). That covers struct copies and zeroing, which are almost all the SSE in integer code. A block that reads an xmm register it didn't write, or reads one after a call, is unsupported: there are no xmm block parameters or float arguments yet.
-- **One-operand `mul`/`imul`** (32 and 64-bit) compute the double-width product, and `rdx` (`edx`) gets the high half. The flags after any `mul`/`imul` are `Flags::Mul`: `jo`/`jc` and `seto`/`setc` rebuild the overflow check from the operands only if something reads them.
 - **`adc`/`sbb`** add or subtract the carry the previous instruction left (`cmp; sbb eax, eax` and 128-bit `add; adc` chains). The carry out of them isn't modelled.
-- **`shld`/`shrd`** shift the register pair as one double-width value. **8/16-bit shifts** by `cl` or by 8 or more shift a 32-bit copy, since x86 masks the count to 5 bits, not to the operand width.
-- **`bt`** (CF only), **`bsf`/`bsr`/`tzcnt`/`lzcnt`/`popcnt`**, **`bswap`**, **`rol`/`ror`**, **`xchg`**, **`xadd`** and **`cmpxchg`**. The atomics are lifted as plain loads and stores, which is right for one thread.
+- **`shld`/`shrd`** are `d << n | s >> (w - n)` (the other way round for `shrd`), with a count of 0 selecting `d` unchanged. **8/16-bit shifts** by `cl` or by 8 or more shift a 32-bit copy, since x86 masks the count to 5 bits, not to the operand width.
+- **`bt`** (CF only, `Flags::Carry`), **`bsf`/`bsr`/`tzcnt`/`lzcnt`/`popcnt`**, **`bswap`**, **`rol`/`ror`**, **`xchg`**, **`xadd`** and **`cmpxchg`**. The atomics are lifted as plain loads and stores, which is right for one thread.
 - **`rep movs`** is a `MemCopy` of `rcx` elements, with the direction flag assumed clear.
 - **The stack protector's canary** `fs:[0x28]` reads as a constant, so the check at the end of the function always passes. Other `fs:`/`gs:` accesses (thread-locals) stay unsupported.
-- **Calls that don't return** (`abort`, `exit`, `__stack_chk_fail`, `__cxa_throw`, ...; `libc::noreturn`) end their block, so a caller doesn't merge their undefined `rax` into its return value. `Context::noreturn` names the callee from the relocation or PLT entry at the call.
+- **Calls that don't return** (`abort`, `exit`, `__stack_chk_fail`, `__cxa_throw`, ...; `discover::noreturn`) end their block, so a caller doesn't merge their undefined `rax` into its return value. `lift_full` takes a callback that `program.rs` answers from the relocation or PLT entry at the call.
 
 ## Not handled yet
 
-- Scalar float and vector arithmetic (`movsd`, `addsd`, `cvtsi2sd`, `pshufd`, `pcmpeqb`, ...), and xmm values across blocks and calls.
+- SSE beyond 16-byte copies and bitwise ops: vector compares and shuffles (`PCMPEQB` other than the all-ones idiom, `PSHUFD`, `PUNPCKLBW`, `PMOVMSKB`, ...), scalar floating point (`UCOMISD`, `CVTSI2SS`), xmm values that cross blocks or calls, and AVX.
 - `rep stos` (there is no memset instruction in the IR yet).
 - `DIV` with a real 128-bit dividend, and 8/16-bit `MUL`/`DIV`.
 - Flags that cross blocks (`LiftError::FlagsNotInBlock`), parity, the carry out of `adc`/`sbb`, and the signed conditions after `ADD`.

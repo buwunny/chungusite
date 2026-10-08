@@ -44,9 +44,9 @@ Done: `src/structure.rs` turns every CFG into `if`/`else`, `while`, `loop` with 
 
 [types.md](types.md): integer widths and signedness from how values are used, prototypes, parameter names and structs from DWARF when present, structs inferred from field accesses otherwise (with recursive pointers like `next: *mut S2`), `&S`/`&mut S` struct arguments in safe mode, and a `TypeModel` hook whose proposals are checked against the facts before they are used. Pointee classes span the whole program, so a callee's struct types what its callers pass it. On chungusite's debug build 45,587 of 63,944 arguments get a type (42,546 without debug info; 29,392 and 23,922 before pointee classes crossed calls), with 7,175 prototypes from DWARF and 1,938 inferred structs. Still open:
 
-- Pointer values inside bodies are still `u64` addresses; only arguments and fields are typed pointers.
+- ~~Pointer values inside bodies are still `u64` addresses; only arguments and fields are typed pointers.~~ Done: struct pointers loaded or carried through the body are `*mut S` (`(*v7).next`, `v7.is_null()`).
 - ~~Interprocedural pointee types: a callee's `*mut S` should type the caller's value it is passed.~~ Done.
-- Indexed arguments in safe mode as `&[T]` instead of `&[u8]`.
+- ~~Indexed arguments in safe mode as `&[T]` instead of `&[u8]`.~~ Done, for arguments no decompiled function calls; callers still lend byte slices.
 - Wiring a trained model into the CLI through `TypeModel` (`--refine`).
 
 ## 6. Globals and data

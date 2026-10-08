@@ -377,26 +377,71 @@ pub enum Proj { Field(u32), Index(ValueId), ConstIndex(u32), Deref, Subslice { f
 pub enum Terminator {
     Jump { to: BlockId, args: ListRef },
     Branch { c: ValueId, t: BlockId, f: BlockId, args: ListRef /* t args then f args */ },
-    Switch { v: ValueId, table: ListRef /* BlockIds in value_pool */, default: BlockId },
+    /// A jump table: case `k` goes to block `table[k]` (block ids stored in
+    /// `value_pool`, see `BlockId::as_value`), any other value to `default`. Its
+    /// edges carry no arguments, so every successor of a `Switch` has no block
+    /// parameters (the lifter routes each case through a parameterless block).
+    Switch { v: ValueId, table: ListRef, default: BlockId },
     Return(Option<ValueId>),
     TailCall { callee: ValueId, args: ListRef },
     Unreachable,
 }
 
-impl Terminator {
-    /// Successor blocks, in edge-argument order (Branch: true edge, then false edge).
-    /// `Switch` tables are not produced by the lifter yet and are not listed.
+impl BlockId {
+    /// A block id stored in `value_pool`, for `Switch` tables.
     #[inline]
-    pub fn successors(self) -> [Option<BlockId>; 2] {
-        match self {
-            Terminator::Jump { to, .. } => [Some(to), None],
-            Terminator::Branch { t, f, .. } => [Some(t), Some(f)],
-            _ => [None, None],
-        }
+    pub fn as_value(self) -> ValueId { ValueId(self.0) }
+    #[inline]
+    pub fn from_value(v: ValueId) -> BlockId { BlockId(v.0) }
+}
+
+impl Terminator {
+    /// Successor blocks, each once for a `Switch` (its default first), and in
+    /// edge-argument order for the others (Branch: true edge, then false edge).
+    /// `pool` is the function's `value_pool`, which holds `Switch` tables.
+    #[inline]
+    pub fn successors(self, pool: &[ValueId]) -> Succs<'_> {
+        let (two, table) = match self {
+            Terminator::Jump { to, .. } => ([Some(to), None], &[][..]),
+            Terminator::Branch { t, f, .. } => ([Some(t), Some(f)], &[][..]),
+            Terminator::Switch { table, default, .. } => ([Some(default), None], table.get(pool)),
+            _ => ([None, None], &[][..]),
+        };
+        Succs { two, i: 0, table, k: 0 }
     }
 }
 
-#[derive(Copy, Clone, Debug)] pub enum BinOp { Add, Sub, Mul, UDiv, SDiv, URem, SRem, And, Or, Xor, Shl, LShr, AShr, RotL, RotR }
+/// Iterator over a terminator's successors; see `Terminator::successors`.
+pub struct Succs<'a> {
+    two: [Option<BlockId>; 2],
+    i: usize,
+    table: &'a [ValueId],
+    k: usize,
+}
+
+impl Iterator for Succs<'_> {
+    type Item = BlockId;
+    fn next(&mut self) -> Option<BlockId> {
+        while self.i < 2 {
+            self.i += 1;
+            if let Some(b) = self.two[self.i - 1] {
+                return Some(b);
+            }
+        }
+        // switch cases: each target the first time it appears, unless it's the default
+        while self.k < self.table.len() {
+            let v = self.table[self.k];
+            self.k += 1;
+            if Some(BlockId::from_value(v)) != self.two[0] && !self.table[..self.k - 1].contains(&v) {
+                return Some(BlockId::from_value(v));
+            }
+        }
+        None
+    }
+}
+
+/// `UMulHi`/`SMulHi`: the high 64 bits of the full 128-bit product (one-operand `MUL`/`IMUL`).
+#[derive(Copy, Clone, Debug)] pub enum BinOp { Add, Sub, Mul, UMulHi, SMulHi, UDiv, SDiv, URem, SRem, And, Or, Xor, Shl, LShr, AShr, RotL, RotR }
 #[derive(Copy, Clone, Debug)] pub enum UnOp { Neg, Not, Bswap, Popcnt, Ctz, Clz }
 #[derive(Copy, Clone, Debug)] pub enum Cond { Eq, Ne, Ult, Ule, Ugt, Uge, Slt, Sle, Sgt, Sge }
 #[derive(Copy, Clone, Debug)] pub enum CastKind { Trunc, ZExt, SExt, Bitcast, IntToFloat, FloatToInt }

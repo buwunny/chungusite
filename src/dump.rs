@@ -55,6 +55,10 @@ fn write_fn(s: &mut String, f: &Function) -> fmt::Result {
             }
             Terminator::Return(r) => format!("ret {}", r.map(v).unwrap_or_default()),
             Terminator::TailCall { callee, args } => format!("tailcall {}({})", v(callee), list(f, args)),
+            Terminator::Switch { v: x, table, default } => {
+                let cases: Vec<String> = table.get(&f.value_pool).iter().map(|&c| format!("bb{}", BlockId::from_value(c).index())).collect();
+                format!("switch {} [{}] default bb{}", v(x), cases.join(", "), default.index())
+            }
             other => format!("{other:?}"),
         };
         writeln!(s, "  {t}")?;

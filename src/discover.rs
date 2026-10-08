@@ -8,17 +8,19 @@
 //! * the entry point and the start of each code section (`_init`, `_fini`);
 //! * targets of direct calls, `lea reg, [rip+x]` into code (function pointers,
 //!   `main` in `_start`), and code addresses stored in data (vtables, tables);
-//! * a function prologue at the start of code that nothing above covers.
+//! * code that nothing above covers, after alignment padding.
 //!
 //! Functions without unwind info end where control flow from their start stops
-//! (the last instruction reached before the next known start), so the padding
+//! (the last instruction reached before the next known start, following jump
+//! tables and stopping at calls to imports that don't return, like
+//! `__stack_chk_fail`), so the padding
 //! after them is not included and whatever follows the padding is checked for
 //! a prologue. A candidate strictly inside an FDE's range is rejected: unwind
 //! info is authoritative, and such addresses are mostly the cold half of a
 //! split function or a misread of something that isn't a call.
 use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
-use object::{Object, ObjectSection, SectionKind};
-use std::collections::{BTreeMap, BTreeSet};
+use object::{Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationTarget, SectionKind};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// A function found without the symbol table.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,6 +47,7 @@ pub fn functions(file: &object::File, known: &[(u64, u64)], pointers: impl IntoI
         .collect();
     code.sort_by_key(|c| c.addr);
     let in_code = |a: u64| code.iter().position(|c| a >= c.addr && a < c.addr + c.bytes.len() as u64);
+    let img = Image::new(file);
 
     // Exact ranges: unwind tables and exported symbols.
     let mut exact: BTreeMap<u64, u64> = BTreeMap::new();
@@ -91,7 +94,7 @@ pub fn functions(file: &object::File, known: &[(u64, u64)], pointers: impl IntoI
     }
 
     // Grow to a fixpoint: walk every function, add what it calls or points to,
-    // then look for prologues in what is still uncovered.
+    // then look for code in what is still uncovered.
     let mut walked: BTreeMap<u64, Walk> = BTreeMap::new();
     loop {
         let mut new = Vec::new();
@@ -107,7 +110,7 @@ pub fn functions(file: &object::File, known: &[(u64, u64)], pointers: impl IntoI
                 Some(w) if w.limit == limit => w,
                 _ => {
                     let bytes = &c.bytes[(a - c.addr) as usize..(limit - c.addr) as usize];
-                    walked.insert(a, walk(bytes, a, limit, exact.contains_key(&a)));
+                    walked.insert(a, walk(&img, bytes, a, limit, exact.contains_key(&a)));
                     &walked[&a]
                 }
             };
@@ -127,7 +130,7 @@ pub fn functions(file: &object::File, known: &[(u64, u64)], pointers: impl IntoI
                 let i = covered.partition_point(|r| r.0 < end);
                 for &(s, e) in covered[..i].iter().filter(|r| r.1 > c.addr).chain(std::iter::once(&(end, end))) {
                     if s > at {
-                        if let Some(p) = prologue_after_padding(&c.bytes[(at - c.addr) as usize..(s - c.addr) as usize], at) {
+                        if let Some(p) = code_after_padding(&c.bytes[(at - c.addr) as usize..(s - c.addr) as usize], at) {
                             if !interior(p) {
                                 new.push(p);
                             }
@@ -184,7 +187,7 @@ struct Walk {
 
 /// Follow control flow from `start` without leaving `[start, limit)`. If
 /// `exact`, the range is known to be one function, so it is decoded in full.
-fn walk(bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk {
+fn walk(img: &Image, bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk {
     let mut dec = Decoder::with_ip(64, bytes, start, DecoderOptions::NONE);
     let mut seen = BTreeSet::new();
     let mut todo = vec![start];
@@ -192,6 +195,8 @@ fn walk(bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk {
     let mut end = start;
     let mut rdi = None;
     let mut rdi_done = false;
+    // rip-relative addresses taken with `lea`: candidate jump table bases.
+    let mut leas = Vec::new();
     let mut insn = Instruction::default();
     while let Some(at) = todo.pop() {
         let mut ip = at;
@@ -209,6 +214,7 @@ fn walk(bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk {
             if insn.mnemonic() == Mnemonic::Lea && insn.is_ip_rel_memory_operand() {
                 let t = insn.ip_rel_memory_address();
                 refs.push(t);
+                leas.push(t);
                 if matches!(insn.op0_register(), Register::RDI | Register::EDI) && !rdi_done {
                     rdi = Some(t);
                 }
@@ -227,8 +233,23 @@ fn walk(bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk {
                 }
             }
             match insn.flow_control() {
-                FlowControl::Call if insn.op0_kind() == OpKind::NearBranch64 => refs.push(insn.near_branch_target()),
-                FlowControl::IndirectCall => rdi_done = true,
+                FlowControl::Call if insn.op0_kind() == OpKind::NearBranch64 => {
+                    let t = insn.near_branch_target();
+                    refs.push(t);
+                    if img.noreturn.contains(&t) {
+                        break;
+                    }
+                }
+                FlowControl::IndirectCall => {
+                    rdi_done = true;
+                    if insn.is_ip_rel_memory_operand() && img.noreturn.contains(&insn.ip_rel_memory_address()) {
+                        break;
+                    }
+                }
+                FlowControl::IndirectBranch => {
+                    todo.extend(jump_table(&insn, img, &leas, start, limit));
+                    break;
+                }
                 FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch
                     if insn.op0_kind() == OpKind::NearBranch64 =>
                 {
@@ -242,7 +263,7 @@ fn walk(bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk {
                         break;
                     }
                 }
-                FlowControl::Return | FlowControl::IndirectBranch | FlowControl::Interrupt => break,
+                FlowControl::Return | FlowControl::Interrupt => break,
                 FlowControl::Exception if insn.mnemonic() == Mnemonic::Ud2 => break,
                 _ if insn.mnemonic() == Mnemonic::Hlt => break,
                 _ => {}
@@ -255,10 +276,130 @@ fn walk(bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk {
     Walk { limit, end, refs, rdi_code_ref: rdi }
 }
 
+/// The cases of a jump table behind the indirect `jmp` `insn`, as far as they
+/// land in `[start, limit)`: `jmp [table + idx*8]` with absolute entries
+/// (non-PIE), or `jmp reg` after adding a 32-bit entry to a table base the
+/// function `lea`s (PIE). The table's length isn't known here, so it is read
+/// until an entry lands outside the function. Empty for a tail call through a
+/// register or the GOT.
+fn jump_table(insn: &Instruction, img: &Image, leas: &[u64], start: u64, limit: u64) -> Vec<u64> {
+    let inside = |t: u64| t >= start && t < limit;
+    let mut out = Vec::new();
+    if insn.op0_kind() == OpKind::Memory && insn.memory_base() == Register::None && insn.memory_index_scale() == 8 {
+        let table = insn.memory_displacement64();
+        for k in 0..1024 {
+            match img.read(table + 8 * k, 8).map(|b| u64::from_le_bytes(b.try_into().unwrap())) {
+                Some(t) if inside(t) => out.push(t),
+                _ => break,
+            }
+        }
+    } else if insn.op0_kind() == OpKind::Register {
+        for &table in leas.iter().rev() {
+            for k in 0..1024 {
+                match img.read(table + 4 * k, 4).map(|b| table.wrapping_add(i32::from_le_bytes(b.try_into().unwrap()) as u64)) {
+                    Some(t) if inside(t) => out.push(t),
+                    _ => break,
+                }
+            }
+            if !out.is_empty() {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// What `walk` needs from the rest of the binary.
+struct Image<'a> {
+    /// Loaded sections, sorted by address, for reading jump tables.
+    mem: Vec<(u64, &'a [u8])>,
+    /// PLT stubs and GOT slots of imports that don't return.
+    noreturn: HashSet<u64>,
+}
+
+impl<'a> Image<'a> {
+    fn new(file: &object::File<'a>) -> Image<'a> {
+        let mut mem: Vec<(u64, &[u8])> = file
+            .sections()
+            .filter(|s| s.address() != 0 && !matches!(s.kind(), SectionKind::UninitializedData | SectionKind::Metadata))
+            .filter_map(|s| Some((s.address(), s.data().ok().filter(|d| !d.is_empty())?)))
+            .collect();
+        mem.sort_by_key(|s| s.0);
+        let got = got_names(file);
+        let plt = plt_names(file, &got);
+        let noreturn = plt.iter().chain(&got).filter(|(_, n)| noreturn(n)).map(|(&a, _)| a).collect();
+        Image { mem, noreturn }
+    }
+
+    fn read(&self, addr: u64, n: usize) -> Option<&[u8]> {
+        let k = self.mem.partition_point(|s| s.0 <= addr).checked_sub(1)?;
+        let (a, d) = self.mem[k];
+        d.get((addr - a) as usize..)?.get(..n)
+    }
+}
+
+/// Imports that don't return: code after a call to one belongs to the next function.
+fn noreturn(name: &str) -> bool {
+    let name = name.split('@').next().unwrap_or(name);
+    matches!(
+        name,
+        "abort" | "exit" | "_exit" | "_Exit" | "quick_exit" | "__stack_chk_fail" | "__assert_fail"
+            | "__assert_perror_fail" | "__fortify_fail" | "__chk_fail" | "err" | "errx" | "verr" | "verrx"
+            | "longjmp" | "siglongjmp" | "__longjmp_chk" | "pthread_exit" | "__cxa_throw" | "__cxa_rethrow"
+            | "__cxa_bad_cast" | "__cxa_bad_typeid" | "__cxa_throw_bad_array_new_length" | "_Unwind_Resume"
+            | "__cxa_pure_virtual" | "__cxa_call_unexpected" | "_ZSt9terminatev"
+    )
+}
+
+/// GOT slot -> the symbol the dynamic loader puts there, from the dynamic relocations.
+pub fn got_names(file: &object::File) -> HashMap<u64, String> {
+    let mut got = HashMap::new();
+    let dynsyms = file.dynamic_symbol_table();
+    for (at, r) in file.dynamic_relocations().into_iter().flatten() {
+        let RelocationTarget::Symbol(i) = r.target() else { continue };
+        let Some(sym) = dynsyms.as_ref().and_then(|t| t.symbol_by_index(i).ok()) else { continue };
+        if let Ok(n) = sym.name() {
+            if !n.is_empty() {
+                got.insert(at, n.to_string());
+            }
+        }
+    }
+    got
+}
+
+/// PLT stub -> the import it jumps to. A stub is `[endbr64;] jmp [rip+slot]`
+/// with `slot` in `got` (from `got_names`).
+pub fn plt_names(file: &object::File, got: &HashMap<u64, String>) -> HashMap<u64, String> {
+    let mut plt = HashMap::new();
+    for sec in file.sections() {
+        if !is_stub_section(sec.name().unwrap_or("")) {
+            continue;
+        }
+        let Ok(code) = sec.data() else { continue };
+        let mut entry = None;
+        for i in Decoder::with_ip(64, code, sec.address(), DecoderOptions::NONE).iter() {
+            if i.mnemonic() == Mnemonic::Endbr64 {
+                entry = Some(i.ip());
+                continue;
+            }
+            if i.flow_control() == FlowControl::IndirectBranch && i.is_ip_rel_memory_operand() {
+                if let Some(n) = got.get(&i.ip_rel_memory_address()) {
+                    plt.insert(entry.unwrap_or(i.ip()), n.clone());
+                }
+            }
+            entry = None;
+        }
+    }
+    plt
+}
+
 /// Skip alignment padding (`nop`s, `int3`, zero bytes) at the start of `gap`;
-/// if what follows looks like the start of a function (a prologue, or 16-byte
-/// aligned), its address.
-fn prologue_after_padding(gap: &[u8], addr: u64) -> Option<u64> {
+/// if valid code follows, its address. The gap starts where the function before
+/// it ends, which follows jump tables and stops at calls that don't return, so
+/// nothing reaches this code from there: it is a function nothing calls
+/// directly. Compilers don't always align functions or give them a prologue
+/// (clang -Os packs leaf functions with at most a few bytes between them).
+fn code_after_padding(gap: &[u8], addr: u64) -> Option<u64> {
     let mut dec = Decoder::with_ip(64, gap, addr, DecoderOptions::NONE);
     let mut insn = Instruction::default();
     while dec.can_decode() {
@@ -275,33 +416,25 @@ fn prologue_after_padding(gap: &[u8], addr: u64) -> Option<u64> {
         if insn.is_invalid() {
             return None;
         }
-        match insn.mnemonic() {
-            Mnemonic::Nop | Mnemonic::Int3 => continue,
-            // `xchg ax, ax` and `data16 cs nop` forms decode as Nop; anything else is code.
-            // Compilers align functions to 16 bytes, so uncovered code at a 16-byte
-            // boundary starts one even without a recognizable prologue.
-            _ => {
-                let ip = insn.ip();
-                return (ip.is_multiple_of(16) || looks_like_prologue(&gap[pos..], ip)).then_some(ip);
-            }
+        // `xchg ax, ax` and `data16 cs nop` forms decode as Nop; anything else is code.
+        if !matches!(insn.mnemonic(), Mnemonic::Nop | Mnemonic::Int3) {
+            return decodes(&gap[pos..], insn.ip()).then_some(insn.ip());
         }
     }
     None
 }
 
-/// The first instruction (or two) of a typical compiled function.
-fn looks_like_prologue(bytes: &[u8], ip: u64) -> bool {
-    let mut dec = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
-    let first = dec.decode();
-    match first.mnemonic() {
-        Mnemonic::Endbr64 => true,
-        Mnemonic::Push => matches!(
-            first.op0_register(),
-            Register::RBP | Register::RBX | Register::R12 | Register::R13 | Register::R14 | Register::R15
-        ),
-        Mnemonic::Sub => first.op0_register() == Register::RSP,
-        _ => false,
+/// The first few instructions of `b` are valid code, not padding.
+fn decodes(b: &[u8], ip: u64) -> bool {
+    for i in Decoder::with_ip(64, b, ip, DecoderOptions::NONE).iter().take(4) {
+        if i.is_invalid() || i.mnemonic() == Mnemonic::Int3 {
+            return false;
+        }
+        if matches!(i.flow_control(), FlowControl::Return | FlowControl::UnconditionalBranch) {
+            break;
+        }
     }
+    true
 }
 
 /// (start, length) of every function with unwind info.
@@ -519,11 +652,14 @@ mod tests {
     }
 
     #[test]
-    fn prologue_after_nops() {
+    fn code_after_nops() {
         // nopw 0(%rax,%rax); int3; push rbp
         let gap = [0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00, 0xcc, 0x55, 0x48, 0x89, 0xe5];
-        assert_eq!(prologue_after_padding(&gap, 0x100), Some(0x107));
-        // padding then something that isn't a prologue
-        assert_eq!(prologue_after_padding(&[0x90, 0x48, 0x89, 0xf8], 0x100), None);
+        assert_eq!(code_after_padding(&gap, 0x100), Some(0x107));
+        // nop; mov rax, rdi; ret
+        assert_eq!(code_after_padding(&[0x90, 0x48, 0x89, 0xf8, 0xc3], 0x100), Some(0x101));
+        // padding, then bytes that aren't code
+        assert_eq!(code_after_padding(&[0x90, 0x06, 0x07], 0x100), None);
+        assert_eq!(code_after_padding(&[0x90, 0xcc, 0x00, 0x00], 0x100), None);
     }
 }

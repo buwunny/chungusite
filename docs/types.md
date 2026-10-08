@@ -61,7 +61,7 @@ Every type is a claim the emitted code relies on, so each one keeps what the mac
 
 - Signatures carry the types and debug names. The prologue converts typed arguments back to the `u64` register variables the body was written against, so bodies need no type-directed rewriting; values inside a body are typed integers and pointer values are still `u64` addresses.
 - 8- and 16-bit arguments are widened by their own signedness, matching clang's caller-side extension, so a debug `i8` parameter sees the same register value the original did.
-- In fast mode an access that is exactly a field of a typed pointer argument reads `(*p).field`; in safe mode an argument `borrow::analyze` classifies as a reference, all of whose accesses are exact fields, is `&S`/`&mut S` and accesses are `p.field`. A field access never replaces a bounds-checked slice access.
+- In fast mode an access that is exactly a field of a typed pointer argument reads `(*p).field`; in safe mode an argument `borrow::analyze` classifies as a reference, all of whose accesses are exact fields, is `&S`/`&mut S` and accesses are `p.field`, unless decompiled code calls the function or it lends the argument to a callee as a slice (callers lend byte slices, not structs). A field access never replaces a bounds-checked slice access.
 - Calls between decompiled functions pass and receive the callee's types.
 
 The stderr summary adds a line: `types: A of B arguments typed, N structs inferred from field accesses, K prototypes from debug info`. On chungusite's own debug build: 19,922 of 43,024 arguments typed, 957 inferred structs, 5,362 prototypes from debug info; without debug info, 15,872 typed. The output type-checks in both modes.

@@ -152,3 +152,155 @@ fn stack_arguments_past_the_sixth() {
     let src = emitted(&p, Mode::Fast);
     assert!(src[0].contains("arg6: u64") && !src[0].contains("frame"), "{}", src[0]);
 }
+
+// ---- safe mode across calls (docs/ownership.md, stages 5-6) ----
+
+#[test]
+fn a_local_lent_to_a_callee_is_a_borrow_of_the_frame() {
+    let (p, _) = program(&[
+        ("load", &|a| {
+            a.mov(rax, qword_ptr(rdi)).unwrap();
+            a.ret().unwrap();
+        }),
+        ("caller", &|a| {
+            a.sub(rsp, 24).unwrap();
+            a.mov(qword_ptr(rsp + 8), rdi).unwrap();
+            a.lea(rdi, qword_ptr(rsp + 8)).unwrap();
+            a.call(addr(0)).unwrap();
+            a.add(rsp, 24).unwrap();
+            a.ret().unwrap();
+        }),
+    ]);
+    let src = emitted(&p, Mode::Safe);
+    assert!(src[0].starts_with("pub fn load(rdi_ref: &[u8])"), "{}", src[0]);
+    assert!(src[1].starts_with("pub fn caller("), "{}", src[1]);
+    assert!(src[1].contains("struct Frame([u8; 32]);"), "{}", src[1]);
+    assert!(src[1].contains("load(&frame.0["), "{}", src[1]);
+}
+
+/// `add(d, s)`: `*d += *s`, and a caller lending it two stack slots.
+fn add_into(a: &mut CodeAssembler) {
+    a.mov(rax, qword_ptr(rsi)).unwrap();
+    a.add(qword_ptr(rdi), rax).unwrap();
+    a.ret().unwrap();
+}
+
+fn lend_two(second: i32) -> impl Fn(&mut CodeAssembler) {
+    move |a| {
+        a.sub(rsp, 24).unwrap();
+        a.mov(qword_ptr(rsp), rdi).unwrap();
+        a.mov(qword_ptr(rsp + 8), rsi).unwrap();
+        a.mov(rdi, rsp).unwrap();
+        a.lea(rsi, qword_ptr(rsp + second)).unwrap();
+        a.call(addr(0)).unwrap();
+        a.mov(rax, qword_ptr(rsp)).unwrap();
+        a.add(rsp, 24).unwrap();
+        a.ret().unwrap();
+    }
+}
+
+#[test]
+fn two_locals_lent_at_once_are_split() {
+    let caller = lend_two(8);
+    let (p, _) = program(&[("add", &add_into), ("caller", &caller)]);
+    let src = emitted(&p, Mode::Safe);
+    assert!(src[0].starts_with("pub fn add(rdi_ref: &mut [u8], rsi_ref: &[u8])"), "{}", src[0]);
+    assert!(src[1].contains("split_at_mut"), "{}", src[1]);
+    assert!(src[1].starts_with("pub fn caller("), "{}", src[1]);
+}
+
+#[test]
+fn the_same_local_lent_twice_calls_the_raw_twin() {
+    // add(&x, &x): a mutable and a shared borrow of the same bytes. The callee
+    // keeps its slices for other callers; this one calls `add_raw`.
+    let caller = lend_two(0);
+    let (p, _) = program(&[("add", &add_into), ("caller", &caller)]);
+    let src = emitted(&p, Mode::Safe);
+    assert!(src[0].starts_with("pub fn add(rdi_ref: &mut [u8], rsi_ref: &[u8])"), "{}", src[0]);
+    // fast mode, with the pointee types recovered from the accesses
+    assert!(src[0].contains("pub unsafe fn add_raw(rdi_p: *mut u64, rsi_p: *const u64)"), "{}", src[0]);
+    assert!(src[1].contains("add_raw(") && !src[1].contains("&mut"), "{}", src[1]);
+}
+
+/// Stand-ins for `malloc`, `free` and `memcpy`: safe mode goes by their names,
+/// and the program by the arguments they read.
+fn stub_malloc(a: &mut CodeAssembler) {
+    a.mov(rax, rdi).unwrap();
+    a.ret().unwrap();
+}
+
+fn stub_free(a: &mut CodeAssembler) {
+    a.mov(rax, rdi).unwrap();
+    a.ret().unwrap();
+}
+
+fn stub_memcpy(a: &mut CodeAssembler) {
+    a.lea(rax, qword_ptr(rdi + rsi)).unwrap();
+    a.add(rax, rdx).unwrap();
+    a.ret().unwrap();
+}
+
+/// p = malloc(16); *p = rdi; r = *p; free(p); (optionally r = *p again); return r
+fn use_heap(read_after_free: bool) -> impl Fn(&mut CodeAssembler) {
+    move |a| {
+        a.push(rbx).unwrap();
+        a.push(r12).unwrap();
+        a.push(rbx).unwrap();
+        a.mov(rbx, rdi).unwrap();
+        a.mov(edi, 16).unwrap();
+        a.call(addr(0)).unwrap();
+        a.mov(r12, rax).unwrap();
+        a.mov(qword_ptr(r12), rbx).unwrap();
+        a.mov(rbx, qword_ptr(r12)).unwrap();
+        a.mov(rdi, r12).unwrap();
+        a.call(addr(1)).unwrap();
+        if read_after_free {
+            a.add(rbx, qword_ptr(r12)).unwrap();
+        }
+        a.mov(rax, rbx).unwrap();
+        a.pop(rbx).unwrap();
+        a.pop(r12).unwrap();
+        a.pop(rbx).unwrap();
+        a.ret().unwrap();
+    }
+}
+
+#[test]
+fn an_allocation_used_then_freed_is_a_box() {
+    let user = use_heap(false);
+    let (p, _) = program(&[("malloc", &stub_malloc), ("free", &stub_free), ("user", &user)]);
+    let src = emitted(&p, Mode::Safe);
+    assert!(src[2].contains(": Box<[u8]> = Box::default();"), "{}", src[2]);
+    assert!(src[2].contains("vec![0u8; "), "{}", src[2]);
+    assert!(src[2].contains("= Box::default(); //"), "free drops the box: {}", src[2]);
+    assert!(src[2].starts_with("pub fn user("), "{}", src[2]);
+}
+
+#[test]
+fn a_use_after_free_keeps_the_allocation_raw() {
+    let user = use_heap(true);
+    let (p, _) = program(&[("malloc", &stub_malloc), ("free", &stub_free), ("user", &user)]);
+    let src = emitted(&p, Mode::Safe);
+    assert!(!src[2].contains("Box<[u8]>"), "{}", src[2]);
+    assert!(src[2].contains("malloc("), "{}", src[2]);
+    assert!(src[2].starts_with("pub unsafe fn user("), "{}", src[2]);
+}
+
+#[test]
+fn memcpy_between_safe_roots_is_a_slice_copy() {
+    // copy 16 bytes from the argument into a local, return the second word
+    let user = |a: &mut CodeAssembler| {
+        a.sub(rsp, 40).unwrap();
+        a.mov(rsi, rdi).unwrap();
+        a.mov(rdi, rsp).unwrap();
+        a.mov(edx, 16).unwrap();
+        a.call(addr(0)).unwrap();
+        a.mov(rax, qword_ptr(rsp + 8)).unwrap();
+        a.add(rsp, 40).unwrap();
+        a.ret().unwrap();
+    };
+    let (p, _) = program(&[("memcpy", &stub_memcpy), ("user", &user)]);
+    let src = emitted(&p, Mode::Safe);
+    assert!(src[1].contains(".copy_from_slice(&rdi_ref["), "{}", src[1]);
+    assert!(src[1].starts_with("pub fn user(rdi_ref: &[u8])"), "{}", src[1]);
+}

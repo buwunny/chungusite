@@ -35,7 +35,7 @@ bb3(v17):
 #[test]
 fn reports_unsupported_instead_of_guessing() {
     let mut a = CodeAssembler::new(64).unwrap();
-    a.mul(rcx).unwrap(); // rdx:rax = rax * rcx needs a 128-bit product, not handled yet
+    a.bsr(rax, rcx).unwrap(); // not handled yet
     a.ret().unwrap();
     let code = a.assemble(0).unwrap();
     let mut f = Function::with_capacity(8, 2);
@@ -200,4 +200,63 @@ fn traps_end_the_block() {
         a.ud2().unwrap();
     });
     assert_eq!(out, "bb0():\n  Unreachable\n");
+}
+
+#[test]
+fn one_operand_mul_writes_both_halves() {
+    let out = ir(|a| {
+        a.mov(rax, rdi).unwrap();
+        a.mul(rsi).unwrap();
+        a.seto(cl).unwrap(); // CF = OF = the high half isn't zero
+        a.add(rax, rdx).unwrap();
+        a.ret().unwrap();
+    });
+    assert!(out.contains("v2 = Mul v0, v1\n  v3 = UMulHi v0, v1\n"), "{out}");
+    assert!(out.contains("cmp.Ne"), "{out}");
+    assert!(out.contains("Add v2, v3"), "{out}");
+}
+
+#[test]
+fn sixteen_byte_copies_and_zeroing() {
+    let out = ir(|a| {
+        a.movups(xmm0, xmmword_ptr(rsi)).unwrap();
+        a.movups(xmmword_ptr(rdi), xmm0).unwrap();
+        a.xorps(xmm1, xmm1).unwrap();
+        a.movaps(xmmword_ptr(rdi + 16), xmm1).unwrap();
+        a.ret().unwrap();
+    });
+    let expected = "\
+bb0(v15, v0, v5):
+  v1 = ptr v0 + 0
+  v2 = load v1
+  v3 = ptr v1 + 8
+  v4 = load v3
+  v6 = ptr v5 + 0
+  v7 = ptr v6 + 8
+  store v6 <- v2
+  store v7 <- v4
+  v10 = const 0x0
+  v11 = ptr v5 + 16
+  v12 = ptr v11 + 8
+  store v11 <- v10
+  store v12 <- v10
+  ret v15
+";
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn jump_tables_become_switches() {
+    let (code, table) = common::jump_table(0x3000);
+    let mut f = Function::with_capacity(64, 8);
+    Lifter::new().lift_with_data(&code, common::BASE, &[(0x3000, &table)], &mut f).unwrap();
+    verify(&f).unwrap();
+    let out = dump(&f);
+    // one parameterless block per case target (bb7..bb9) passes the registers on
+    assert!(out.contains("switch v6 [bb7, bb8, bb9] default bb9"), "{out}");
+    assert!(out.contains("bb7():\n  jump bb2(v4)"), "{out}");
+
+    // Without the table the jump can't be followed: unsupported, not a tail call.
+    let err = Lifter::new().lift(&code, common::BASE, &mut f).unwrap_err();
+    assert!(matches!(err, LiftError::Unsupported { mnemonic: iced_x86::Mnemonic::Jmp, .. }), "{err:?}");
 }

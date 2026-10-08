@@ -5,6 +5,7 @@ cargo install --path .            # or: cargo run --release -- <args>
 
 chungusite ./prog                          # every function, fast mode, to stdout
 chungusite ./prog --mode safe -o prog.rs   # safe mode, to a file
+chungusite ./prog --mode safe --check      # ... and compile it with rustc, fast mode for what fails
 chungusite ./prog -f parse -f main         # only these symbols (mangled or demangled)
 chungusite ./prog --addr 0x401136          # the function starting there
 chungusite ./prog --addr 0x401136 --size 0x40   # no symbol there: lift exactly these bytes
@@ -27,9 +28,9 @@ Functions are lifted, cleaned and emitted in parallel with `rayon`, one `Lifter`
 | `rust` (default) | Rust source, one `pub fn` per function |
 | `ir` | cleaned SSA IR, which is what the emitter sees |
 | `raw-ir` | IR straight from the lifter, before `opt::clean` |
-| `borrows` | safe mode's verdict for each argument (`&T`, `Option<&mut T>`, raw...) |
+| `borrows` | safe mode's verdict for each argument (`&T`, `Option<&mut T>`, raw and why) and for the frame, globals and allocations |
 
-A summary goes to stderr: how many functions lifted, how many memory accesses are safe (a bounds-checked slice access or a struct field) versus raw, how many arguments got a type, and the failures grouped by cause, most common first. That table is the to-do list for the lifter. The exit code is 0 if every selected function lifted, 1 if some did not, and 2 for usage or file errors.
+A summary goes to stderr: how many functions lifted, how many memory accesses are safe (a bounds-checked slice access or a struct field) versus raw (and what the raw ones go through: the frame, a global, an argument, or another pointer), how many functions have no raw pointer, how many arguments got a type, and the failures grouped by cause, most common first. That table is the to-do list for the lifter. The exit code is 0 if every selected function lifted, 1 if some did not, and 2 for usage or file errors.
 
 A function that fails to lift still appears in the output as a stub whose body is `todo!("not lifted: <reason>")`, so the file always compiles. `--skip-failed` leaves the stubs out.
 
@@ -49,52 +50,50 @@ pub struct S1 {
 
 pub unsafe fn get_count(rdi_p: *const S1) -> u64 {
     let mut rdi: u64 = rdi_p as u64;
-    let v1: u64 = rdi.wrapping_add(0x8); // 0x1129
-    let v2: u64 = unsafe { (*rdi_p).f8 }; // 0x1129
-    return v2;
+    return unsafe { (*rdi_p).f8 };
 }
 ```
 
 With debug info (`gcc -g`) the struct, its field names and the parameter names come from the source: `pub unsafe fn bump(p: *mut Node, d: i32) -> i64` reads `(*p).count`.
 
-**Safe mode** asks `borrow::analyze` about each argument. An argument it classifies as `&T` or `&mut T`, whose every access is a field of its recovered struct, arrives as `&S` or `&mut S` and its accesses become field reads and writes (`p.count = v9;`). Any other such argument arrives as a byte slice (`&[u8]` or `&mut [u8]`), wrapped in `Option` when the code null-checks it. Any access whose pointer derives from exactly one such argument becomes a bounds-checked slice access. So a wrong size guess panics instead of reading out of bounds. Every other access stays raw, and the function is `unsafe` only if one does:
+**Safe mode** asks the borrow analysis ([ownership.md](ownership.md)) which objects each pointer points into, across the whole program. An argument it classifies as `&T` or `&mut T` arrives as `&S` or `&mut S` if every access through it is a field of its recovered struct and no decompiled code calls the function; its accesses become field reads and writes (`p.count = v9;`). Any other such argument arrives as a byte slice (`&[u8]` or `&mut [u8]`), wrapped in `Option` when the code null-checks it; the stack frame becomes a byte array, a read-only global its static's bytes, and a `malloc`'d buffer a `Box<[u8]>`. Any access whose pointer derives from exactly one such object becomes a bounds-checked slice access. So a wrong size guess panics instead of reading out of bounds. Calls lend slices to callees that take them; a caller that can't calls the callee's *raw twin*, `name_raw`, the same function in fast mode. Every other access stays raw, and the function is `unsafe` only if one does:
 
 ```rust
 pub fn maybe_count(rdi_ref: Option<&[u8]>) -> u64 {
     let rdi_base: u64 = rdi_ref.as_deref().map_or(0, |s| s.as_ptr() as u64);
     let mut rdi: u64 = rdi_base;
     ...
-    let v7: u64 = u64::from_le_bytes(rdi_ref.unwrap()[v6.wrapping_sub(rdi_base) as usize..][..8].try_into().unwrap());
+    return u64::from_le_bytes(rdi_ref.unwrap()[rdi.wrapping_add(8).wrapping_sub(rdi_base) as usize..][..8].try_into().unwrap());
 ```
 
-Each function header says how many of its accesses are safe. Byte slices remain for arguments that are indexed or whose accesses don't all match a struct field; typed slices (`&[T]`) are next.
+Each function header says how many of its accesses are safe. Byte slices remain for arguments that are indexed, whose accesses don't all match a struct field, or that callers lend; typed slices (`&[T]`) are next.
 
-Control flow is structured ([`src/structure.rs`](../src/structure.rs)): branches become `if`/`else`, loops become `loop` with `break`, `continue` and early `return`, and block parameters become mutable variables assigned on each edge. A loop's exits are emitted after it, so leaving it is a `break`:
+`--check` compiles the safe-mode output with rustc (in parallel batches; about two minutes for 18,000 functions on 4 cores) and emits every function rustc rejects in fast mode instead, which always compiles, then checks again.
+
+Control flow is structured ([`src/structure.rs`](../src/structure.rs)): branches become `if`/`else`, loops become `while` or `loop` with `break`, `continue` and early `return`, and block parameters become mutable variables assigned on each edge. A loop's exits are emitted after it, so leaving it is a `break`. A value used once, in the block that computes it, is written into its use instead of getting a `let` (a load only when nothing between the two writes memory or calls), and constants are literals, so a loop whose test comes first reads as a `while`:
 
 ```rust
 pub unsafe fn find(mut rdi: u64, mut rsi: u64, mut rdx: u64) -> u64 {
-    let mut v2: u64 = 0;
-    ...
-    v2 = v1;
-    loop {
-        let v4: bool = v2 >= rsi; // 0x5
-        if v4 {
-            break;
+    let mut v6: u64 = 0;
+    let mut v36: u64 = 0;
+    if rsi == 0 {
+        v36 = rsi;
+    } else {
+        v6 = 0_u64;
+        while (unsafe { (rdi.wrapping_add(v6.wrapping_mul(8)) as *const u64).read_unaligned() }) != rdx {
+            let v13: u64 = v6.wrapping_add(1); // 0x17
+            if rsi == v13 {
+                return rsi;
+            }
+            v6 = v13;
         }
-        let v7: u64 = rdi.wrapping_add(v2.wrapping_mul(8)); // 0x7
-        let v8: u64 = unsafe { (v7 as *const u64).read_unaligned() }; // 0x7
-        let v10: bool = v8 == rdx; // 0xe
-        if v10 {
-            break;
-        }
-        ...
-        v2 = v13;
+        v36 = v6;
     }
-    return v2 as u64;
+    return v36;
 }
 ```
 
-Where the nesting needs it (two paths into the same `else`, as in `if a || b`), a labeled block (`'b7: { .. break 'b7; .. }`) stands in. A function whose CFG is irreducible (a cycle with two entries) has no such nesting and stays a `loop { match bb { ... } }` state machine; the summary on stderr counts those.
+A block that only tests a condition joins its predecessor's test, so `a || b` and `a && b` stay one `if`. Where the nesting still needs it (two paths with code of their own into the same block), a labeled block (`'b7: { .. break 'b7; .. }`) stands in. An irreducible cycle (one with two entries) has no nesting: just its blocks become a `loop { match bb { ... } }`, and edges into it set `bb`; the rest of the function is structured around it. The summary on stderr counts the functions that have one.
 
 Every statement ends with the address of the instruction it came from.
 
@@ -111,7 +110,7 @@ pub static TABLE: Bytes<16> = Bytes { b: *b"\n\0\0\0\x14\0\0\0\x1e\0\0\0(\0\0\0"
 
 Each static is the data symbol covering the address, sized by the symbol table. Without one (string literals, anonymous constants) it is the whole gap between the neighbouring symbols, so indexing from the referenced address stays inside the static. Writable sections become `static mut`, `.bss` is `[0; N]`, and a comment gives the section, the address and, for text, the string.
 
-Slots the dynamic loader fills with an address (GOT entries, vtables, pointer tables, from the binary's dynamic relocations) are emitted as pointers to the static or function they point to, and those statics are emitted too. Each GOT slot is its own 8-byte static, so only the slots the code uses appear. A slot pointing at an import or at a function not in the output is null. Only data the selected functions reach is emitted; `tests/globals.rs` builds a cdylib, decompiles it and runs the result against the original's statics.
+Slots the dynamic loader fills with an address (GOT entries, vtables, pointer tables, from the binary's dynamic relocations) are emitted as pointers to the static or function they point to, and those statics are emitted too. Each GOT slot is its own 8-byte static, so only the slots the code uses appear. A slot pointing at an import is null, and one pointing at a function of the binary that isn't in the output (not selected, or left out by `--skip-failed`) keeps its bytes from the file, so the output compiles either way. Only data the selected functions reach is emitted; `tests/globals.rs` builds a cdylib, decompiles it and runs the result against the original's statics.
 
 ## Stripped binaries
 
@@ -121,11 +120,11 @@ Without a symbol table, `src/discover.rs` finds functions from, most trusted fir
 2. the dynamic symbols (exports), which `strip` keeps and which keep their names;
 3. the entry point and the start of each code section;
 4. targets of direct calls and jumps out of a function, `lea reg, [rip+x]` into code, `mov reg, imm` into code in a non-PIE binary, and code addresses the loader writes into data (vtables, function tables);
-5. code that none of the above covers, if it starts with a prologue (`endbr64`, `push rbp`/`rbx`/`r12`-`r15`, `sub rsp, ..`) or at a 16-byte boundary, after any alignment padding.
+5. code that none of the above covers, after any alignment padding: since a function ends where its control flow ends, nothing reaches that code, so it is a function nothing calls directly. Compilers don't always align functions or give them a prologue (clang -Os packs leaf functions back to back).
 
 This repeats until nothing new turns up. A function without unwind info ends at the last instruction its control flow reaches before the next known start. A candidate strictly inside an FDE's range is rejected. Discovered functions are named `sub_<addr>`, except `_start` (the entry point), `main` (what `_start` passes to `__libc_start_main` in `rdi`), and `_init`/`_fini` (the `.init`/`.fini` sections). Calls into imports are named as before, from the PLT stubs and GOT relocations, which `strip` keeps. The summary on stderr says how many functions were discovered.
 
-On chungusite's own debug build, `strip` keeps none of its 20,025 function symbols, and discovery finds all 20,025 starts. 20,021 sizes match the symbol table exactly; the other 4 are crtstuff's hand-written functions, whose symbol sizes include their trailing padding. Lifting and type-checking give the same results with and without symbols. Known gap: without unwind tables, discovery doesn't know which calls don't return, so a function ending in a call to `__stack_chk_fail` or `abort` can run into the next one (gcc -O2 with `-fno-asynchronous-unwind-tables` merges 1 of the corpus's 88 functions this way).
+On chungusite's own debug build, `strip` keeps none of its 20,025 function symbols, and discovery finds all 20,025 starts. 20,021 sizes match the symbol table exactly; the other 4 are crtstuff's hand-written functions, whose symbol sizes include their trailing padding. Lifting and type-checking give the same results with and without symbols. Without unwind tables, a function's end is where its control flow ends: discovery follows jump tables, and stops at calls to imports that don't return (`__stack_chk_fail`, `abort`, `exit`, ...), so such a function doesn't run into the next one.
 
 ## Tests
 
@@ -133,7 +132,7 @@ On chungusite's own debug build, `strip` keeps none of its 20,025 function symbo
 
 - the `sum` loop from `tests/common`, in both modes, linked into a program that runs it and checks the results, including that safe mode panics on a too-short slice;
 - 400 random programs built from supported instructions, in both modes, which must all type-check;
-- 300 random register-only programs emitted both structured and as the state machine, run on the same random inputs, which must return the same values (programs that don't terminate run out of fuel and are skipped);
+- 300 random register-only programs emitted both structured and as the whole-function state machine, run on the same random inputs, which must return the same values (programs that don't terminate run out of fuel and are skipped); the irreducible ones exercise the per-region `match bb`;
 - the real binary on a small ELF built in the test: `--list`, both modes, `-f`, `--emit ir` and the exit codes.
 
 `tests/discover.rs` links `tests/differential/corpus.c` with each C compiler found, with and without unwind tables and as a non-PIE, strips a copy, and checks that `--list` on the stripped copy finds the same function starts as the symbol table (and the same sizes, except the crt functions), names `main`, and that the stripped copy's output type-checks in both modes.

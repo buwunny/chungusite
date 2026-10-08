@@ -1137,7 +1137,7 @@ fn one(
             }
             args.push(ArgTy { reg, ty: Some(ty), name: Some(param_ident(name, &mut used)) });
         }
-        if x.sig.ret && !x.sig.ret2 {
+        if x.sig.rax() && !x.sig.ret2 {
             ret = d.ret.filter(|&t| scalar(table, t));
         }
         // Pointer fields of debug-info structs type the values loaded from them.
@@ -1163,12 +1163,15 @@ fn one(
             let ty = param(reg).and_then(|p| infer_arg(p, fa, &pointee_of, table));
             args.push(ArgTy { reg, ty, name: None });
         }
-        if x.sig.ret && !x.sig.ret2 {
+        if x.sig.rax() && !x.sig.ret2 {
             ret = fa.ret.as_ref().and_then(|r| infer_ret(r, fa, &pointee_of, table));
         }
         if let Some(m) = model {
             ask(m, x, fa, &pointee_of, &regs, &mut args, &mut ret, table, stats);
         }
+    }
+    if x.sig.fret {
+        ret = Some(TyId::F64);
     }
     stats.args += args.len();
     stats.typed_args += args.iter().filter(|a| a.ty.is_some()).count();
@@ -1223,7 +1226,7 @@ fn ask(
 ) {
     let param = |reg: u8| fa.params.iter().find(|p| p.reg == reg);
     let mut vars: Vec<Var> = regs.iter().enumerate().map(|(j, &r)| Var::Arg { j, value: param(r).map(|p| p.value) }).collect();
-    let want_ret = x.sig.ret && !x.sig.ret2;
+    let want_ret = x.sig.rax() && !x.sig.ret2;
     if let (true, Some(r)) = (want_ret, &fa.ret) {
         vars.push(Var::Ret { value: r.value });
     }

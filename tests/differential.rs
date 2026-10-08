@@ -85,6 +85,8 @@ impl Int {
 #[derive(Clone, Debug, PartialEq)]
 enum Arg {
     Int(Int, Option<(i128, i128)>),
+    /// `f32` or `f64` (bits).
+    Float(u32),
     Buf(usize),
     Str(usize),
 }
@@ -94,6 +96,7 @@ enum Ret {
     Void,
     Bool,
     Int(Int),
+    Float(u32),
     Ptr(usize),
 }
 
@@ -115,6 +118,8 @@ fn parse_corpus(src: &str) -> Vec<Case> {
         let ret = match ret.trim() {
             "void" => Ret::Void,
             "bool" => Ret::Bool,
+            "f32" => Ret::Float(32),
+            "f64" => Ret::Float(64),
             r => match r.strip_prefix("ptr:") {
                 Some(k) => Ret::Ptr(k.parse().unwrap_or_else(|_| bad("bad ptr:K"))),
                 None => Ret::Int(Int::parse(r).unwrap_or_else(|| bad("bad return type"))),
@@ -130,6 +135,11 @@ fn parse_corpus(src: &str) -> Vec<Case> {
                 }
                 if let Some(n) = a.strip_prefix("str:") {
                     return Arg::Str(n.parse().unwrap_or_else(|_| bad("bad str:N")));
+                }
+                match a {
+                    "f32" => return Arg::Float(32),
+                    "f64" => return Arg::Float(64),
+                    _ => {}
                 }
                 let (ty, range) = match a.split_once(':') {
                     Some((ty, r)) => {
@@ -245,11 +255,25 @@ fn call_args(src: &str, case: &Case) -> Result<String, String> {
         let (name, ty) = p.split_once(": ").ok_or_else(|| format!("unexpected parameter `{p}`"))?;
         // `_rdx`, `_n`: an argument the decompiled function takes but doesn't use
         let name = name.strip_prefix('_').unwrap_or(name);
+        // float argument j: the j-th `f32`/`f64` of the C function
+        if let Some(j) = name.strip_prefix("xmm").and_then(|j| j.parse::<usize>().ok()) {
+            let i = case.args.iter().enumerate().filter(|(_, a)| matches!(a, Arg::Float(_))).nth(j).map(|(i, _)| i);
+            out.push(match i {
+                Some(i) => format!("f64::from_bits(a.reg({i}))"),
+                None => "f64::from_bits(a.junk())".to_string(),
+            });
+            continue;
+        }
         let reg = name.strip_suffix("_ref").or_else(|| name.strip_suffix("_p")).unwrap_or(name);
         let by_reg = SYSV.iter().position(|&r| r == reg).or_else(|| reg.strip_prefix("arg").and_then(|n| n.parse().ok()));
         let named = by_reg.is_none() && reg != "rsp";
         let idx = if named { Some(pos) } else { by_reg }.filter(|&i| i < case.args.len());
         let buf = |i: usize| matches!(case.args[i], Arg::Buf(_) | Arg::Str(_));
+        // integer argument registers count the integer arguments only
+        let idx = match (named, idx) {
+            (false, Some(k)) => case.args.iter().enumerate().filter(|(_, a)| !matches!(a, Arg::Float(_))).nth(k).map(|(i, _)| i),
+            _ => idx,
+        };
         out.push(match (ty, idx) {
             (_, None) if reg == "rsp" => "a.stack()".to_string(),
             (_, None) => format!("a.junk() as {}", if ty.starts_with('*') { "_" } else { ty }),
@@ -283,6 +307,7 @@ fn arg_spec(a: &Arg) -> String {
             };
             format!("A::Int {{ bits: {}, signed: {}, lo: {lo}, hi: {hi}, full: {} }}", t.bits(), t.signed(), r.is_none())
         }
+        Arg::Float(b) => format!("A::Float({b})"),
         Arg::Buf(n) => format!("A::Buf({n})"),
         Arg::Str(n) => format!("A::Str({n})"),
     }
@@ -306,6 +331,7 @@ fn runner_source(funcs: &[&Decompiled], prelude: &[String; 2]) -> (String, Strin
             .enumerate()
             .map(|(i, a)| match a {
                 Arg::Int(t, _) => format!("a{i}: {}", t.rust()),
+                Arg::Float(b) => format!("a{i}: f{b}"),
                 _ => format!("a{i}: *mut u8"),
             })
             .collect();
@@ -313,6 +339,7 @@ fn runner_source(funcs: &[&Decompiled], prelude: &[String; 2]) -> (String, Strin
             Ret::Void => String::new(),
             Ret::Bool => " -> u8".into(),
             Ret::Int(t) => format!(" -> {}", t.rust()),
+            Ret::Float(b) => format!(" -> f{b}"),
             Ret::Ptr(_) => " -> *mut u8".into(),
         };
         let _ = writeln!(externs, "        pub fn {}({}){ret_ty};", c.name, params.join(", "));
@@ -322,15 +349,21 @@ fn runner_source(funcs: &[&Decompiled], prelude: &[String; 2]) -> (String, Strin
             .enumerate()
             .map(|(i, a)| match a {
                 Arg::Int(t, _) => format!("a.val({i}) as {}", t.rust()),
+                Arg::Float(b) => format!("f{b}::from_bits(a.val({i}) as u{b})"),
                 _ => format!("a.reg({i}) as *mut u8"),
             })
             .collect();
         let c_call = format!("c::{}({})", c.name, c_args.join(", "));
-        let c_call = if c.ret == Ret::Void { format!("{{ {c_call}; 0 }}") } else { format!("{c_call} as u64") };
+        let c_call = match c.ret {
+            Ret::Void => format!("{{ {c_call}; 0 }}"),
+            Ret::Float(_) => format!("{c_call}.to_bits() as u64"),
+            _ => format!("{c_call} as u64"),
+        };
         let ret = match c.ret {
             Ret::Void => "R::Void".to_string(),
             Ret::Bool => "R::Bits(8)".to_string(),
             Ret::Int(t) => format!("R::Bits({})", t.bits()),
+            Ret::Float(b) => format!("R::Bits({b})"),
             Ret::Ptr(k) => format!("R::Ptr({k})"),
         };
         let spec: Vec<String> = c.args.iter().map(arg_spec).collect();
@@ -374,8 +407,10 @@ ret!(u8 => u8, u16 => u16, u32 => u32, u64 => u64, i8 => u8, i16 => u16, i32 => 
 impl<T> Ret for *mut T { fn bits(self) -> u64 { self as u64 } }
 impl<T> Ret for *const T { fn bits(self) -> u64 { self as u64 } }
 impl Ret for (u64, u64) { fn bits(self) -> u64 { self.0 } }
+/// A float result: an f32's bits are the low half, as in xmm0.
+impl Ret for f64 { fn bits(self) -> u64 { self.to_bits() } }
 
-enum A { Int { bits: u32, signed: bool, lo: i128, hi: i128, full: bool }, Buf(usize), Str(usize) }
+enum A { Int { bits: u32, signed: bool, lo: i128, hi: i128, full: bool }, Float(u32), Buf(usize), Str(usize) }
 #[derive(Clone, Copy)]
 enum R { Void, Bits(u32), Ptr(usize) }
 
@@ -422,6 +457,16 @@ impl Args {
                     let _ = bits;
                     (v as i64 as u64, Vec::new())
                 }
+                A::Float(bits) => {
+                    // mostly small values with a fraction, some special ones, some random bits
+                    let x: f64 = match rng.below(8) {
+                        0 => [0.0, -0.0, 1.0, -1.5, 0.5, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, 1e300, -3e-310][rng.below(10) as usize],
+                        1 => f64::from_bits(rng.next()),
+                        _ => (rng.below(4001) as f64 - 2000.0) / 8.0,
+                    };
+                    let v = if bits == 32 { (x as f32).to_bits() as u64 } else { x.to_bits() };
+                    (v, Vec::new())
+                }
                 A::Buf(n) => {
                     let mut b: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
                     // sometimes small values, so data-dependent branches go both ways
@@ -441,6 +486,8 @@ impl Args {
             };
             let reg = match *s {
                 A::Int { bits, .. } if bits < 64 => (v & 0xffff_ffff) | (rng.next() << 32),
+                // the rest of an f32's register is undefined too
+                A::Float(32) => (v & 0xffff_ffff) | (rng.next() << 32),
                 _ => v,
             };
             a.vals.push(v);

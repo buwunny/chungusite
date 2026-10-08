@@ -124,6 +124,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "cpp_demangle",
+ "datafrog",
  "iced-x86",
  "memmap2",
  "object",
@@ -286,6 +287,12 @@ checksum = "8b1e3a325bc115f096c8b77bbf027a7c2592230e70be2d985be950d3d5e60ebe"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "datafrog"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0afaad2b26fa326569eb264b1363e8ae3357618c43982b3f285f0774ce76b69"
 
 [[package]]
 name = "derive_builder"

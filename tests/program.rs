@@ -56,7 +56,7 @@ fn arguments_come_from_what_callees_read() {
     assert_eq!((p.funcs[0].sig.args, p.funcs[0].sig.ret), (1, true));
     assert_eq!((p.funcs[1].sig.args, p.funcs[1].sig.ret), (2, true));
     let src = emitted(&p, Mode::Fast);
-    assert!(src[1].contains("inc(rdi as u64)"), "{}", src[1]);
+    assert!(src[1].contains("inc(rdi)"), "{}", src[1]);
     assert!(!src[1].contains("todo!"), "{}", src[1]);
     // nothing is saved to the stack any more
     assert!(!src[1].contains("frame"), "{}", src[1]);

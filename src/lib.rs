@@ -4,6 +4,7 @@ pub mod borrow;
 pub mod cfg;
 pub mod dump;
 pub mod emit;
+pub mod expr;
 pub mod frame;
 pub mod globals;
 pub mod ir;

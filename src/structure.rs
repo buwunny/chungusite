@@ -1,4 +1,4 @@
-//! Control-flow structuring: turn a reducible CFG into nested `if`/`else`, `loop`,
+//! Control-flow structuring: turn a CFG into nested `if`/`else`, `while`, `loop`,
 //! labeled blocks, `break` and `continue`, instead of a `loop { match bb { .. } }`
 //! state machine.
 //!
@@ -10,21 +10,34 @@
 //! which is emitted inline at the branch. That is correct for any reducible CFG.
 //! Rust's labeled blocks (`'b: { .. break 'b; }`) make it a direct translation.
 //!
+//! It runs on a view of the CFG with two changes:
+//!
+//! * **Short-circuit conditions.** A block that does nothing but branch (all its
+//!   values are inlined into the condition), whose only predecessor branches to it
+//!   and to one of its own targets, is folded into that predecessor's condition:
+//!   `if a { T } else if b { T } else { F }` becomes `if a || b { T } else { F }`.
+//!   Without this, `T` has two predecessors and needs a labeled block.
+//! * **Irreducible regions.** A cycle with more than one entry has no nesting.
+//!   Each such strongly connected component (found by Steensgaard's loop-nesting
+//!   decomposition, so as small as it can be) becomes one node of the view, and is
+//!   emitted as a `loop { match bb { .. } }` over just its own blocks: edges into
+//!   it set `bb` to the block they enter. The rest of the function is structured
+//!   around it.
+//!
 //! The raw result is correct but noisy, so `tidy` then removes what isn't needed:
 //! a `break`/`continue` that control would reach anyway by falling off the end,
 //! labeled blocks nothing breaks out of, and `if c { A } else { B }` where `A`
-//! always leaves (`if c { A } B`). Labels are printed only where a plain
+//! always leaves (`if c { A } B`); and turns a loop that starts with
+//! `if c { break; }` into `while !c`. Labels are printed only where a plain
 //! `break`/`continue` would not mean the same thing.
-//!
-//! Irreducible CFGs (a cycle with more than one entry) have no such nesting;
-//! `reducible` says when the caller should keep the state machine instead.
 use crate::cfg::Cfg;
+use crate::expr::{self, not};
 use crate::ir::*;
 use std::fmt::Write;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Label {
-    /// The `loop` headed by this block.
+    /// The `loop` (or `while`) headed by this block.
     Loop(u32),
     /// The labeled block that this block's code follows.
     Block(u32),
@@ -38,7 +51,14 @@ pub enum Node {
     Exit(String),
     If { c: String, then: Vec<Node>, els: Vec<Node> },
     Loop { head: u32, body: Vec<Node> },
+    /// `while c { body }`: made by `tidy` from a `loop` that starts with
+    /// `if !c { break; }`.
+    While { head: u32, c: String, body: Vec<Node> },
     Block { label: u32, body: Vec<Node> },
+    /// `match bb { k => { .. } }` over the blocks of an irreducible region; always
+    /// the whole body of its `loop`, so control falling off an arm goes round
+    /// again.
+    Dispatch { arms: Vec<(u32, Vec<Node>)> },
     /// Leave the labeled block or loop.
     Break(Label),
     /// Next iteration of the loop headed by this block.
@@ -55,7 +75,13 @@ pub trait Source {
     fn cond(&self, c: ValueId) -> String;
     /// A terminator without successors (return, tail call, ...), as a statement.
     fn exit(&mut self, b: BlockId) -> Node;
+    /// The block has no parameters and no statements: all it computes is inlined
+    /// into its terminator.
+    fn quiet(&self, b: BlockId) -> bool;
 }
+
+/// The variable the dispatch of an irreducible region matches on.
+pub const DISPATCH_VAR: &str = "bb";
 
 /// Deepest dominator tree the structurer will recurse into. Past this the caller
 /// keeps the state machine, which uses no recursion.
@@ -65,33 +91,105 @@ const MAX_DEPTH: usize = 512;
 /// (to a block no later in reverse postorder) goes to a block that dominates its
 /// source, and is a back edge of a natural loop.
 pub fn reducible(f: &Function, cfg: &Cfg) -> bool {
-    cfg.rpo.iter().all(|&b| {
-        f.blocks[b].term.successors().into_iter().flatten().all(|s| {
-            cfg.rpo_index[s.index()] > cfg.rpo_index[b.index()] || cfg.dominates(s, b)
-        })
-    })
+    cfg.rpo.iter().all(|&b| f.blocks[b].term.successors().into_iter().flatten().all(|s| back_ok(cfg, b, s)))
 }
 
-/// Structure `f`, or `None` if its CFG is irreducible or nests too deeply.
-pub fn structure(f: &Function, cfg: &Cfg, src: &mut dyn Source) -> Option<Vec<Node>> {
-    if !reducible(f, cfg) {
+fn back_ok(cfg: &Cfg, b: BlockId, s: BlockId) -> bool {
+    cfg.rpo_index[s.index()] > cfg.rpo_index[b.index()] || cfg.dominates(s, b)
+}
+
+/// A structured function body.
+pub struct Structured {
+    pub nodes: Vec<Node>,
+    /// Irreducible regions kept as a `loop { match bb }`.
+    pub regions: usize,
+}
+
+/// A branch condition built from the conditions of several blocks.
+#[derive(Clone, Debug)]
+enum Test {
+    Leaf(ValueId),
+    Not(Box<Test>),
+    And(Box<Test>, Box<Test>),
+    Or(Box<Test>, Box<Test>),
+}
+
+/// A node's terminator in the view the structurer works on.
+#[derive(Clone, Debug)]
+enum VTerm {
+    /// Its block's own terminator, which leaves the function.
+    Exit,
+    Jump { to: BlockId, args: Vec<ValueId> },
+    /// `quiet`: blocks folded into the condition, whose (empty) statements are
+    /// emitted first so their inlined values are ready.
+    Branch { c: Test, t: BlockId, e: BlockId, ta: Vec<ValueId>, ea: Vec<ValueId>, quiet: Vec<BlockId> },
+    /// An irreducible region, in reverse postorder.
+    Region(Vec<BlockId>),
+    /// Folded into another node, or part of a region.
+    Gone,
+}
+
+/// Structure `f`, or `None` if its CFG nests too deeply.
+pub fn structure(f: &Function, cfg: &Cfg, src: &mut dyn Source) -> Option<Structured> {
+    let n = f.blocks.len();
+    let regions = if reducible(f, cfg) { Vec::new() } else { irreducible_regions(f, cfg) };
+    let mut node_of: Vec<BlockId> = (0..n).map(BlockId::new).collect();
+    let mut vterm: Vec<VTerm> = (0..n).map(|i| own_term(f, BlockId::new(i))).collect();
+    // Skip empty blocks that only jump on: their predecessors go straight on.
+    let fwd: Vec<BlockId> = (0..n).map(|i| forward(f, BlockId::new(i), &*src)).collect();
+    for t in &mut vterm {
+        match t {
+            VTerm::Jump { to, .. } => *to = fwd[to.index()],
+            VTerm::Branch { t, e, .. } => (*t, *e) = (fwd[t.index()], fwd[e.index()]),
+            _ => {}
+        }
+    }
+    for (k, r) in regions.iter().enumerate() {
+        for &b in r {
+            node_of[b.index()] = BlockId::new(n + k);
+            vterm[b.index()] = VTerm::Gone;
+        }
+        vterm.push(VTerm::Region(r.clone()));
+    }
+    short_circuit(f, cfg, &node_of, &mut vterm, &*src);
+
+    // The view's edges, one per real edge (so a join stays a join).
+    let mut succ: Vec<Vec<BlockId>> = vec![Vec::new(); vterm.len()];
+    for (i, t) in vterm.iter().enumerate() {
+        succ[i] = match t {
+            VTerm::Exit | VTerm::Gone => Vec::new(),
+            VTerm::Jump { to, .. } => vec![node_of[to.index()]],
+            VTerm::Branch { t, e, .. } => vec![node_of[t.index()], node_of[e.index()]],
+            VTerm::Region(r) => {
+                let me = BlockId::new(i);
+                let out = r.iter().flat_map(|&b| f.blocks[b].term.successors().into_iter().flatten());
+                out.map(|s| node_of[s.index()]).filter(|&s| s != me).collect()
+            }
+        };
+    }
+    let entry = node_of[f.entry.index()];
+    let view = Cfg::from_succs(&succ, entry);
+    // Collapsing the irreducible regions leaves a reducible graph; if it somehow
+    // didn't, the caller keeps the whole-function state machine.
+    if !view.rpo.iter().all(|&b| succ[b.index()].iter().all(|&s| back_ok(&view, b, s))) {
         return None;
     }
-    let n = f.blocks.len();
-    let mut forward_in = vec![0u32; n];
-    let mut loop_head = vec![false; n];
-    let mut children: Vec<Vec<BlockId>> = vec![Vec::new(); n];
-    let mut depth = vec![0usize; n];
-    for &b in &cfg.rpo {
-        if let Some(d) = cfg.idom[b.index()] {
+
+    let m = vterm.len();
+    let mut forward_in = vec![0u32; m];
+    let mut loop_head = vec![false; m];
+    let mut children: Vec<Vec<BlockId>> = vec![Vec::new(); m];
+    let mut depth = vec![0usize; m];
+    for &b in &view.rpo {
+        if let Some(d) = view.idom[b.index()] {
             children[d.index()].push(b);
             depth[b.index()] = depth[d.index()] + 1;
             if depth[b.index()] > MAX_DEPTH {
                 return None;
             }
         }
-        for s in f.blocks[b].term.successors().into_iter().flatten() {
-            if cfg.rpo_index[s.index()] > cfg.rpo_index[b.index()] {
+        for &s in &succ[b.index()] {
+            if view.rpo_index[s.index()] > view.rpo_index[b.index()] {
                 forward_in[s.index()] += 1;
             } else {
                 loop_head[s.index()] = true;
@@ -102,22 +200,200 @@ pub fn structure(f: &Function, cfg: &Cfg, src: &mut dyn Source) -> Option<Vec<No
     for c in &mut children {
         c.reverse();
     }
-    let follows = vec![false; n];
-    let mut s = Structurer { f, cfg, src, forward_in, loop_head, children, follows };
-    let body = s.tree(f.entry);
-    Some(tidy(body))
+    let follows = vec![false; m];
+    let mut s = Structurer { f, cfg: &view, src, node_of, vterm, forward_in, loop_head, children, follows, n };
+    let body = s.tree(entry);
+    Some(Structured { nodes: tidy(body), regions: regions.len() })
+}
+
+/// Where control really goes when it enters `b`: past any blocks that do nothing
+/// but jump on (no parameters, no statements, no arguments).
+fn forward(f: &Function, mut b: BlockId, src: &dyn Source) -> BlockId {
+    for _ in 0..64 {
+        match f.blocks[b].term {
+            Terminator::Jump { to, args } if args.len == 0 && to != b && b != f.entry && src.quiet(b) => b = to,
+            _ => break,
+        }
+    }
+    b
+}
+
+fn own_term(f: &Function, b: BlockId) -> VTerm {
+    match f.blocks[b].term {
+        Terminator::Jump { to, args } => VTerm::Jump { to, args: args.get(&f.value_pool).to_vec() },
+        Terminator::Branch { c, t, f: e, args } => {
+            let a = args.get(&f.value_pool);
+            let nt = f.blocks[t].params.len as usize;
+            VTerm::Branch { c: Test::Leaf(c), t, e, ta: a[..nt].to_vec(), ea: a[nt..].to_vec(), quiet: Vec::new() }
+        }
+        _ => VTerm::Exit,
+    }
+}
+
+/// Fold quiet blocks into the condition of their only predecessor (see the module
+/// comment). `a || b || c` takes one round per operand.
+fn short_circuit(f: &Function, cfg: &Cfg, node_of: &[BlockId], vterm: &mut [VTerm], src: &dyn Source) {
+    let n = f.blocks.len();
+    // The node a block was folded into, for "its only predecessor is X".
+    let mut owner: Vec<BlockId> = (0..n).map(BlockId::new).collect();
+    for &x in &cfg.rpo {
+        while let VTerm::Branch { c, t, e, ta, ea, .. } = &vterm[x.index()] {
+            let (c, t, e) = (c.clone(), *t, *e);
+            let foldable = |y: BlockId, other: BlockId| {
+                y != other
+                    && y != f.entry
+                    && node_of[y.index()] == y
+                    && matches!(cfg.preds(y), [p] if owner[p.index()] == x)
+                    && src.quiet(y)
+            };
+            let merged = if foldable(e, t) {
+                // c ? S : (c2 ? t2 : e2)
+                let VTerm::Branch { c: c2, t: t2, e: e2, ta: ta2, ea: ea2, .. } = &vterm[e.index()] else { break };
+                if *t2 == t && ta2 == ta && *e2 != t {
+                    Some((e, Test::Or(c.into(), c2.clone().into()), t, *e2, ta.clone(), ea2.clone()))
+                } else if *e2 == t && ea2 == ta && *t2 != t {
+                    Some((e, Test::Or(c.into(), Test::Not(c2.clone().into()).into()), t, *t2, ta.clone(), ta2.clone()))
+                } else {
+                    None
+                }
+            } else if foldable(t, e) {
+                // c ? (c2 ? t2 : e2) : S
+                let VTerm::Branch { c: c2, t: t2, e: e2, ta: ta2, ea: ea2, .. } = &vterm[t.index()] else { break };
+                if *e2 == e && ea2 == ea && *t2 != e {
+                    Some((t, Test::And(c.into(), c2.clone().into()), *t2, e, ta2.clone(), ea.clone()))
+                } else if *t2 == e && ta2 == ea && *e2 != e {
+                    Some((t, Test::And(c.into(), Test::Not(c2.clone().into()).into()), *e2, e, ea2.clone(), ea.clone()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let Some((y, c, t, e, ta, ea)) = merged else { break };
+            let VTerm::Branch { quiet, .. } = std::mem::replace(&mut vterm[x.index()], VTerm::Gone) else { unreachable!() };
+            let mut quiet = quiet;
+            quiet.push(y);
+            vterm[x.index()] = VTerm::Branch { c, t, e, ta, ea, quiet };
+            vterm[y.index()] = VTerm::Gone;
+            owner[y.index()] = x;
+        }
+    }
+}
+
+/// The irreducible strongly connected components, smallest first by nesting:
+/// Steensgaard's decomposition. Find the SCCs; one with a single entry is a natural
+/// loop, so drop the edges back to its header and look inside it again; one with
+/// several entries is a region.
+fn irreducible_regions(f: &Function, cfg: &Cfg) -> Vec<Vec<BlockId>> {
+    let n = f.blocks.len();
+    let mut cut = vec![false; n]; // headers whose in-edges inside their loop are gone
+    let mut in_set = vec![false; n];
+    let mut out = Vec::new();
+    let mut work: Vec<Vec<BlockId>> = vec![cfg.rpo.clone()];
+    while let Some(set) = work.pop() {
+        for &b in &set {
+            in_set[b.index()] = true;
+        }
+        let sccs = sccs(&set, |b| {
+            f.blocks[b].term.successors().into_iter().flatten().filter(|s| in_set[s.index()] && !cut[s.index()]).collect()
+        });
+        for &b in &set {
+            in_set[b.index()] = false;
+        }
+        for mut c in sccs.into_iter().filter(|c| c.len() > 1) {
+            for &b in &c {
+                in_set[b.index()] = true;
+            }
+            let entries: Vec<BlockId> = c
+                .iter()
+                .copied()
+                .filter(|&b| b == f.entry || cfg.preds(b).iter().any(|p| cfg.reachable(*p) && !in_set[p.index()]))
+                .collect();
+            for &b in &c {
+                in_set[b.index()] = false;
+            }
+            if let [h] = entries[..] {
+                cut[h.index()] = true;
+                work.push(c);
+            } else {
+                c.sort_by_key(|b| cfg.rpo_index[b.index()]);
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// Tarjan's strongly connected components of the subgraph on `set`.
+fn sccs(set: &[BlockId], succ: impl Fn(BlockId) -> Vec<BlockId>) -> Vec<Vec<BlockId>> {
+    use std::collections::HashMap;
+    let pos: HashMap<BlockId, usize> = set.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+    let m = set.len();
+    let edges: Vec<Vec<usize>> = set.iter().map(|&b| succ(b).iter().map(|s| pos[s]).collect()).collect();
+    let (mut index, mut low, mut on) = (vec![usize::MAX; m], vec![0; m], vec![false; m]);
+    let (mut stack, mut out, mut next) = (Vec::new(), Vec::new(), 0);
+    for root in 0..m {
+        if index[root] != usize::MAX {
+            continue;
+        }
+        let mut call: Vec<(usize, usize)> = vec![(root, 0)];
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on[root] = true;
+        while let Some(&mut (v, ref mut k)) = call.last_mut() {
+            if let Some(&w) = edges[v].get(*k) {
+                *k += 1;
+                if index[w] == usize::MAX {
+                    index[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on[w] = true;
+                    call.push((w, 0));
+                } else if on[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            call.pop();
+            if let Some(&(u, _)) = call.last() {
+                low[u] = low[u].min(low[v]);
+            }
+            if low[v] == index[v] {
+                let mut c = Vec::new();
+                loop {
+                    let w = stack.pop().unwrap();
+                    on[w] = false;
+                    c.push(set[w]);
+                    if w == v {
+                        break;
+                    }
+                }
+                out.push(c);
+            }
+        }
+    }
+    out
 }
 
 struct Structurer<'a, 'b> {
     f: &'a Function,
+    /// The view: blocks, folded blocks (unreachable) and region nodes (`n..`).
     cfg: &'a Cfg,
     src: &'b mut dyn Source,
+    /// The view node each block belongs to: itself, or its region.
+    node_of: Vec<BlockId>,
+    vterm: Vec<VTerm>,
     forward_in: Vec<u32>,
     loop_head: Vec<bool>,
     /// Dominator-tree children, latest in reverse postorder first.
     children: Vec<Vec<BlockId>>,
     /// Loop exits emitted after their loop: edges to them are `break`s.
     follows: Vec<bool>,
+    /// Number of blocks; region `k` is node `n + k`.
+    n: usize,
 }
 
 impl Structurer<'_, '_> {
@@ -125,10 +401,10 @@ impl Structurer<'_, '_> {
         self.forward_in[b.index()] >= 2
     }
 
-    /// Blocks of the natural loop headed by `h`: those that reach a back edge to
+    /// Nodes of the natural loop headed by `h`: those that reach a back edge to
     /// `h` without passing through `h`.
     fn loop_body(&self, h: BlockId) -> Vec<bool> {
-        let mut inside = vec![false; self.f.blocks.len()];
+        let mut inside = vec![false; self.vterm.len()];
         inside[h.index()] = true;
         let hi = self.cfg.rpo_index[h.index()];
         let reachable = |p: &BlockId| self.cfg.reachable(*p);
@@ -169,47 +445,97 @@ impl Structurer<'_, '_> {
 
     /// `b`'s code, followed by its join children `joins` (latest first).
     fn within(&mut self, b: BlockId, joins: &[BlockId]) -> Vec<Node> {
-        match joins.split_first() {
-            Some((&y, rest)) => {
-                let inner = self.within(b, rest);
-                let mut out = vec![Node::Block { label: y.index() as u32, body: inner }];
-                out.extend(self.tree(y));
-                out
-            }
-            None => {
+        if let Some((&y, rest)) = joins.split_first() {
+            let inner = self.within(b, rest);
+            let mut out = vec![Node::Block { label: y.index() as u32, body: inner }];
+            out.extend(self.tree(y));
+            return out;
+        }
+        match self.vterm[b.index()].clone() {
+            VTerm::Region(blocks) => self.region(b, &blocks),
+            VTerm::Jump { to, args } => {
                 let mut out = self.src.stmts(b);
-                let f = self.f;
-                match f.blocks[b].term {
-                    Terminator::Jump { to, args } => {
-                        out.extend(self.branch(b, to, args.get(&f.value_pool)));
-                    }
-                    Terminator::Branch { c, t, f: e, args } => {
-                        let a = args.get(&f.value_pool);
-                        let nt = f.blocks[t].params.len as usize;
-                        let then = self.branch(b, t, &a[..nt]);
-                        let els = self.branch(b, e, &a[nt..]);
-                        out.push(Node::If { c: self.src.cond(c), then, els });
-                    }
-                    _ => out.push(self.src.exit(b)),
-                }
+                out.extend(self.branch(b, to, &args));
                 out
             }
+            VTerm::Branch { c, t, e, ta, ea, quiet } => {
+                let mut out = self.src.stmts(b);
+                for y in quiet {
+                    out.extend(self.src.stmts(y));
+                }
+                let then = self.branch(b, t, &ta);
+                let els = self.branch(b, e, &ea);
+                out.push(Node::If { c: self.test(&c), then, els });
+                out
+            }
+            VTerm::Exit => {
+                let mut out = self.src.stmts(b);
+                out.push(self.src.exit(b));
+                out
+            }
+            VTerm::Gone => unreachable!("folded block reached"),
         }
     }
 
-    /// Control passes from `from` to `to`.
+    fn test(&self, t: &Test) -> String {
+        match t {
+            Test::Leaf(c) => self.src.cond(*c),
+            Test::Not(x) => expr::not(&self.test(x)),
+            Test::And(a, b) => format!("{} && {}", expr::logic(self.test(a), true), expr::logic(self.test(b), true)),
+            Test::Or(a, b) => format!("{} || {}", expr::logic(self.test(a), false), expr::logic(self.test(b), false)),
+        }
+    }
+
+    /// Control passes from node `from` to block `to`.
     fn branch(&mut self, from: BlockId, to: BlockId, args: &[ValueId]) -> Vec<Node> {
         let mut out = self.src.edge(to, args);
-        if self.cfg.rpo_index[to.index()] <= self.cfg.rpo_index[from.index()] {
-            out.push(Node::Continue(to.index() as u32));
-        } else if self.is_join(to) || self.follows[to.index()] {
-            out.push(Node::Break(Label::Block(to.index() as u32)));
+        let node = self.node_of[to.index()];
+        if node.index() >= self.n {
+            out.push(Node::Line(format!("{DISPATCH_VAR} = {};", to.index())));
+        }
+        if self.cfg.rpo_index[node.index()] <= self.cfg.rpo_index[from.index()] {
+            out.push(Node::Continue(node.index() as u32));
+        } else if self.is_join(node) || self.follows[node.index()] {
+            out.push(Node::Break(Label::Block(node.index() as u32)));
         } else {
-            out.extend(self.tree(to));
+            out.extend(self.tree(node));
         }
         out
     }
+
+    /// An irreducible region `r`: a loop around a `match` with an arm per block.
+    /// Edges between its blocks set the dispatch variable and go round again.
+    fn region(&mut self, r: BlockId, blocks: &[BlockId]) -> Vec<Node> {
+        // A label of its own: `r` may also head a loop that encloses this one.
+        let me = (self.vterm.len() + r.index()) as u32;
+        let mut arms = Vec::new();
+        for &b in blocks {
+            let mut body = self.src.stmts(b);
+            match own_term(self.f, b) {
+                VTerm::Jump { to, args } => body.extend(self.go(r, me, to, &args)),
+                VTerm::Branch { c, t, e, ta, ea, .. } => {
+                    let then = self.go(r, me, t, &ta);
+                    let els = self.go(r, me, e, &ea);
+                    body.push(Node::If { c: self.test(&c), then, els });
+                }
+                _ => body.push(self.src.exit(b)),
+            }
+            arms.push((b.index() as u32, body));
+        }
+        vec![Node::Loop { head: me, body: vec![Node::Dispatch { arms }] }]
+    }
+
+    fn go(&mut self, r: BlockId, me: u32, to: BlockId, args: &[ValueId]) -> Vec<Node> {
+        if self.node_of[to.index()] != r {
+            return self.branch(r, to, args);
+        }
+        let mut out = self.src.edge(to, args);
+        out.push(Node::Line(format!("{DISPATCH_VAR} = {};", to.index())));
+        out.push(Node::Continue(me));
+        out
+    }
 }
+
 
 // ---------------------------------------------------------------------------
 // Tidying
@@ -220,7 +546,8 @@ fn uses(nodes: &[Node], l: Label) -> bool {
         Node::Break(x) => *x == l,
         Node::Continue(h) => l == Label::Loop(*h),
         Node::If { then, els, .. } => uses(then, l) || uses(els, l),
-        Node::Loop { body, .. } | Node::Block { body, .. } => uses(body, l),
+        Node::Loop { body, .. } | Node::While { body, .. } | Node::Block { body, .. } => uses(body, l),
+        Node::Dispatch { arms } => arms.iter().any(|(_, a)| uses(a, l)),
         Node::Line(_) | Node::Exit(_) => false,
     })
 }
@@ -232,7 +559,8 @@ fn diverges(nodes: &[Node]) -> bool {
         Some(Node::If { then, els, .. }) => diverges(then) && diverges(els),
         Some(Node::Block { label, body }) => diverges(body) && !uses(body, Label::Block(*label)),
         Some(Node::Loop { head, body }) => !uses_break(body, Label::Loop(*head)),
-        Some(Node::Line(_)) | None => false,
+        Some(Node::Dispatch { arms }) => arms.iter().all(|(_, a)| diverges(a)),
+        Some(Node::Line(_) | Node::While { .. }) | None => false,
     }
 }
 
@@ -241,7 +569,8 @@ fn uses_break(nodes: &[Node], l: Label) -> bool {
     nodes.iter().any(|n| match n {
         Node::Break(x) => *x == l,
         Node::If { then, els, .. } => uses_break(then, l) || uses_break(els, l),
-        Node::Loop { body, .. } | Node::Block { body, .. } => uses_break(body, l),
+        Node::Loop { body, .. } | Node::While { body, .. } | Node::Block { body, .. } => uses_break(body, l),
+        Node::Dispatch { arms } => arms.iter().any(|(_, a)| uses_break(a, l)),
         _ => false,
     })
 }
@@ -263,6 +592,8 @@ fn drop_tail(nodes: &mut Vec<Node>, jump: &Node) -> bool {
         Some(Node::If { then, els, .. }) => drop_tail(then, jump) | drop_tail(els, jump),
         // Falling off an inner block's end also falls off ours.
         Some(Node::Block { body, .. }) => drop_tail(body, jump),
+        // ... and so does falling off a dispatch arm, which goes round its loop.
+        Some(Node::Dispatch { arms }) => arms.iter_mut().fold(false, |c, (_, a)| drop_tail(a, jump) | c),
         _ => false,
     };
     if changed {
@@ -271,12 +602,10 @@ fn drop_tail(nodes: &mut Vec<Node>, jump: &Node) -> bool {
     changed
 }
 
-fn not(c: &str) -> String {
-    match c.strip_prefix('!') {
-        Some(inner) if !inner.contains(' ') => inner.to_string(),
-        _ if c.contains(' ') => format!("!({c})"),
-        _ => format!("!{c}"),
-    }
+/// Can evaluating `c` panic or fault? Then it stays even where its value doesn't
+/// matter.
+fn may_fault(c: &str) -> bool {
+    ["unsafe", "[", " / ", " % ", "wrapping_div", "wrapping_rem", "todo!"].iter().any(|k| c.contains(k))
 }
 
 fn size(nodes: &[Node]) -> usize {
@@ -284,7 +613,8 @@ fn size(nodes: &[Node]) -> usize {
         .iter()
         .map(|n| match n {
             Node::If { then, els, .. } => 1 + size(then) + size(els),
-            Node::Loop { body, .. } | Node::Block { body, .. } => 1 + size(body),
+            Node::Loop { body, .. } | Node::While { body, .. } | Node::Block { body, .. } => 1 + size(body),
+            Node::Dispatch { arms } => arms.iter().map(|(_, a)| 1 + size(a)).sum(),
             _ => 1,
         })
         .sum()
@@ -302,14 +632,27 @@ pub fn tidy(nodes: Vec<Node>) -> Vec<Node> {
             Node::Loop { head, mut body } => {
                 drop_tail(&mut body, &Node::Continue(head));
                 body = tidy(body);
-                Node::Loop { head, body }
+                // `loop { if c { break; } .. }` is `while !c { .. }`
+                match body.first() {
+                    Some(Node::If { c, then, els }) if els.is_empty() && matches!(then[..], [Node::Break(Label::Loop(h))] if h == head) => {
+                        let c = not(c);
+                        body.remove(0);
+                        Node::While { head, c, body }
+                    }
+                    _ => Node::Loop { head, body },
+                }
             }
+            Node::Dispatch { arms } => Node::Dispatch { arms: arms.into_iter().map(|(k, a)| (k, tidy(a))).collect() },
             Node::Block { label, mut body } => {
                 drop_tail(&mut body, &Node::Break(Label::Block(label)));
+                // (before the loop's own tidying too, which looks for `break`s of it)
+                if let Some(Node::Loop { head, body: lb }) = body.last_mut() {
+                    retarget(lb, Label::Block(label), Label::Loop(*head));
+                }
                 body = tidy(body);
                 // `'b: { ..; 'l: loop { .. break 'b .. } }`: leaving the loop
                 // lands at the end of the block too, so `break 'b` there is `break 'l`.
-                if let Some(Node::Loop { head, body: lb }) = body.last_mut() {
+                if let Some(Node::Loop { head, body: lb } | Node::While { head, body: lb, .. }) = body.last_mut() {
                     retarget(lb, Label::Block(label), Label::Loop(*head));
                 }
                 Node::Block { label, body }
@@ -328,7 +671,8 @@ fn retarget(nodes: &mut [Node], from: Label, to: Label) {
                 retarget(then, from, to);
                 retarget(els, from, to);
             }
-            Node::Loop { body, .. } | Node::Block { body, .. } => retarget(body, from, to),
+            Node::Loop { body, .. } | Node::While { body, .. } | Node::Block { body, .. } => retarget(body, from, to),
+            Node::Dispatch { arms } => arms.iter_mut().for_each(|(_, a)| retarget(a, from, to)),
             _ => {}
         }
     }
@@ -347,8 +691,23 @@ fn level(nodes: Vec<Node>) -> Vec<Node> {
             Node::If { c, then, els } => {
                 let (td, ed) = (diverges(&then), diverges(&els));
                 match (then.is_empty(), els.is_empty()) {
+                    // the condition may read memory (an inlined load), so keep it
+                    (true, true) if may_fault(&c) => out.push(Node::Line(format!("let _ = {c};"))),
                     (true, true) => {}
-                    (false, true) => out.push(Node::If { c, then, els }),
+                    // `if a { if b { .. } }` is `if a && b { .. }`
+                    (false, true) => {
+                        let mut then = then;
+                        match then.pop() {
+                            Some(Node::If { c: c2, then: t2, els: e2 }) if then.is_empty() && e2.is_empty() => {
+                                let c = format!("{} && {}", expr::logic(c, true), expr::logic(c2, true));
+                                out.push(Node::If { c, then: t2, els });
+                            }
+                            last => {
+                                then.extend(last);
+                                out.push(Node::If { c, then, els });
+                            }
+                        }
+                    }
                     (true, false) => todo.push(Node::If { c: not(&c), then: els, els: then }),
                     // Early exit: keep the branch that leaves (the shorter one if
                     // both do) under the `if`, and the other after it.
@@ -407,11 +766,12 @@ fn needs_label(nodes: &[Node], stack: &mut Vec<Label>, named: &mut std::collecti
                 needs_label(then, stack, named);
                 needs_label(els, stack, named);
             }
-            Node::Loop { head, body } => {
+            Node::Loop { head, body } | Node::While { head, body, .. } => {
                 stack.push(Label::Loop(*head));
                 needs_label(body, stack, named);
                 stack.pop();
             }
+            Node::Dispatch { arms } => arms.iter().for_each(|(_, a)| needs_label(a, stack, named)),
             Node::Block { label, body } => {
                 stack.push(Label::Block(*label));
                 needs_label(body, stack, named);
@@ -465,13 +825,27 @@ impl Printer {
                         let _ = writeln!(out, "{ind}}}");
                     }
                 }
-                Node::Loop { head, body } => {
+                Node::Loop { head, body } | Node::While { head, body, .. } => {
                     let l = Label::Loop(*head);
                     let name = if self.named.contains(&l) { format!("{}: ", label_name(l)) } else { String::new() };
-                    let _ = writeln!(out, "{ind}{name}loop {{");
+                    match n {
+                        Node::While { c, .. } => writeln!(out, "{ind}{name}while {c} {{"),
+                        _ => writeln!(out, "{ind}{name}loop {{"),
+                    }
+                    .unwrap();
                     self.stack.push(l);
                     self.list(body, depth + 1, out);
                     self.stack.pop();
+                    let _ = writeln!(out, "{ind}}}");
+                }
+                Node::Dispatch { arms } => {
+                    let _ = writeln!(out, "{ind}match {DISPATCH_VAR} {{");
+                    for (k, a) in arms {
+                        let _ = writeln!(out, "{ind}    {k} => {{");
+                        self.list(a, depth + 2, out);
+                        let _ = writeln!(out, "{ind}    }}");
+                    }
+                    let _ = writeln!(out, "{ind}    _ => unreachable!(),");
                     let _ = writeln!(out, "{ind}}}");
                 }
                 Node::Block { label, body } => {

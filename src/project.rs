@@ -108,7 +108,7 @@ pub fn write(dir: &Path, p: &Project) -> io::Result<Vec<String>> {
 
     let mut root = format!("//! Decompiled by chungusite from {} (--mode {}).\n", p.source, p.mode);
     root.push_str("#![allow(unknown_lints)]\n");
-    root.push_str("#![allow(unused_mut, unused_variables, unused_assignments, unreachable_code, non_snake_case, non_upper_case_globals, non_camel_case_types, unused_parens, unused_unsafe, unused_imports, unused_comparisons, unused_labels, overflowing_literals, unconditional_recursion, improper_ctypes, dead_code, static_mut_refs, clippy::all)]\n\n");
+    root.push_str("#![allow(unused_mut, unused_variables, unused_assignments, unreachable_code, non_snake_case, non_upper_case_globals, non_camel_case_types, unused_parens, unused_unsafe, unused_imports, unused_comparisons, unused_labels, overflowing_literals, unconditional_recursion, improper_ctypes, suspicious_runtime_symbol_definitions, dead_code, static_mut_refs, clippy::all)]\n\n");
     let mut modules: Vec<&str> = Vec::new();
     if !p.prelude.structs.is_empty() {
         modules.push("types");

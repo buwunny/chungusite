@@ -19,6 +19,7 @@ pub mod names;
 pub mod opt;
 pub mod program;
 pub mod refine;
+pub mod simd;
 pub mod sources;
 pub mod structure;
 pub mod types;

@@ -348,3 +348,107 @@ fn thread_locals_are_addresses_below_the_thread_pointer() {
     let out = dump(&f);
     assert!(out.contains("const 0x8000\n") && out.contains("const 0x7ff8\n"), "{out}");
 }
+
+#[test]
+fn xmm_values_cross_blocks_as_block_params() {
+    let out = ir(|a| {
+        let mut skip = a.create_label();
+        a.movdqu(xmm0, xmmword_ptr(rsi)).unwrap();
+        a.test(edx, edx).unwrap();
+        a.je(skip).unwrap();
+        a.paddd(xmm0, xmm0).unwrap();
+        a.set_label(&mut skip).unwrap();
+        a.movdqu(xmmword_ptr(rdi), xmm0).unwrap();
+        a.ret().unwrap();
+    });
+    // the join block takes both halves of xmm0: the loads, or the sums
+    assert!(out.contains("Lane(Add, 4)"), "{out}");
+    assert!(out.contains("jump bb2(v23, v24, v11, v12)"), "{out}");
+    assert!(out.contains("bb2(v21, v22, v2, v4) bb1("), "{out}");
+}
+
+fn lift_err(build: impl FnOnce(&mut CodeAssembler)) -> LiftError {
+    let mut a = CodeAssembler::new(64).unwrap();
+    build(&mut a);
+    let code = a.assemble(0x1000).unwrap();
+    let mut f = Function::with_capacity(64, 8);
+    Lifter::new().lift(&code, 0x1000, &mut f).unwrap_err()
+}
+
+#[test]
+fn xmm_arguments_and_call_results_are_refused() {
+    // an argument in xmm0
+    let err = lift_err(|a| {
+        a.movq(rax, xmm0).unwrap();
+        a.ret().unwrap();
+    });
+    assert!(matches!(err, LiftError::XmmNotSet { ip: 0x1000 }), "{err:?}");
+    // a call leaves xmm0 undefined (or holding a float result)
+    let err = lift_err(|a| {
+        a.pxor(xmm0, xmm0).unwrap();
+        a.call(0x2000).unwrap();
+        a.movq(rax, xmm0).unwrap();
+        a.ret().unwrap();
+    });
+    assert!(matches!(err, LiftError::XmmNotSet { .. }), "{err:?}");
+    // ... also when the read is in a later block
+    let err = lift_err(|a| {
+        let mut l = a.create_label();
+        a.pxor(xmm0, xmm0).unwrap();
+        a.call(0x2000).unwrap();
+        a.test(eax, eax).unwrap();
+        a.jne(l).unwrap();
+        a.nop().unwrap();
+        a.set_label(&mut l).unwrap();
+        a.movq(rax, xmm0).unwrap();
+        a.ret().unwrap();
+    });
+    assert!(matches!(err, LiftError::XmmNotSet { .. }), "{err:?}");
+}
+
+#[test]
+fn scalar_conversion_leaves_the_rest_undefined_not_an_argument() {
+    // cvtsi2sd keeps xmm0's upper half, which is garbage at entry
+    let out = ir(|a| {
+        a.cvtsi2sd(xmm0, edi).unwrap();
+        a.cvttsd2si(rax, xmm0).unwrap();
+        a.ret().unwrap();
+    });
+    assert!(out.contains("undef"), "{out}");
+}
+
+#[test]
+fn ucomisd_flags_become_float_compares() {
+    let out = ir(|a| {
+        a.movq(xmm0, rdi).unwrap();
+        a.movq(xmm1, rsi).unwrap();
+        a.ucomisd(xmm0, xmm1).unwrap();
+        a.seta(al).unwrap();
+        a.setp(cl).unwrap();
+        a.or(al, cl).unwrap();
+        a.ret().unwrap();
+    });
+    assert!(out.contains("Lane(FCmpGt, 8)") && out.contains("Lane(FCmpUnord, 8)"), "{out}");
+}
+
+#[test]
+fn rep_stos_is_a_fill() {
+    let out = ir(|a| {
+        a.xor(eax, eax).unwrap();
+        a.mov(ecx, 6).unwrap();
+        a.rep().stosq().unwrap();
+        a.mov(rax, rdi).unwrap();
+        a.ret().unwrap();
+    });
+    assert!(out.contains("MemFill") || out.contains("fill"), "{out}");
+}
+
+#[test]
+fn string_cmpsd_and_movsd_are_not_the_sse_ones() {
+    for code in [[0xA7u8, 0xC3], [0xA5, 0xC3]] {
+        // cmpsd / movsd dword [rsi], [rdi] ; ret
+        let mut f = Function::with_capacity(8, 2);
+        let err = Lifter::new().lift(&code, 0, &mut f).unwrap_err();
+        assert!(matches!(err, LiftError::Unsupported { ip: 0, .. }), "{err:?}");
+    }
+}

@@ -351,6 +351,9 @@ pub enum InstKind {
     Load { ptr: ValueId, align: u8, volatile: bool },
     Store { ptr: ValueId, val: ValueId, align: u8 },
     MemCopy { dst: ValueId, src: ValueId, len: ValueId },
+    /// `count` copies of `val` (an integer, whose width is the element size) stored
+    /// one after another from `dst`: `rep stos`.
+    MemFill { dst: ValueId, val: ValueId, count: ValueId },
 
     // ---- Tier::Safe: only created by safe-mode rewrites ----
     Copy(PlaceId),               // read a Copy value out of a place
@@ -441,8 +444,50 @@ impl Iterator for Succs<'_> {
 }
 
 /// `UMulHi`/`SMulHi`: the high 64 bits of the full 128-bit product (one-operand `MUL`/`IMUL`).
-#[derive(Copy, Clone, Debug)] pub enum BinOp { Add, Sub, Mul, UMulHi, SMulHi, UDiv, SDiv, URem, SRem, And, Or, Xor, Shl, LShr, AShr, RotL, RotR }
-#[derive(Copy, Clone, Debug)] pub enum UnOp { Neg, Not, Bswap, Popcnt, Ctz, Clz }
+#[derive(Copy, Clone, Debug)] pub enum BinOp {
+    Add, Sub, Mul, UMulHi, SMulHi, UDiv, SDiv, URem, SRem, And, Or, Xor, Shl, LShr, AShr, RotL, RotR,
+    /// The op on each `w`-byte lane of two 64-bit values: an xmm register is
+    /// two of them. Emitted as a call into the `simd` module (`simd::PRELUDE`).
+    Lane(LaneOp, u8),
+}
+#[derive(Copy, Clone, Debug)] pub enum UnOp {
+    Neg, Not, Bswap, Popcnt, Ctz, Clz,
+    /// A one-operand lane op (or conversion) on a 64-bit value; see `BinOp::Lane`.
+    Lane(LaneUn, u8),
+}
+
+/// Lane-wise ops of `BinOp::Lane`. Integer lanes wrap; `F*` ops treat the lanes
+/// as `f32` (`w` = 4) or `f64` (8) bit patterns, and compares give all ones or
+/// zero per lane, as SSE does.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum LaneOp {
+    Add, Sub, MulLo, AddSatU, SubSatU, AddSatS, SubSatS, MinU, MaxU, MinS, MaxS, AvgU,
+    CmpEq, CmpGtS,
+    /// Every lane shifted by the right operand (one count for all lanes).
+    Shl, LShr, AShr,
+    /// The low (high) half of each operand's lanes, interleaved: lhs[0], rhs[0], lhs[1], rhs[1], ...
+    UnpackLo, UnpackHi,
+    /// Sum of the absolute differences of the bytes (psadbw), as one u64.
+    SumAbsDiff,
+    FAdd, FSub, FMul, FDiv, FMin, FMax,
+    FCmpEq, FCmpLt, FCmpLe, FCmpUnord, FCmpNeq, FCmpNlt, FCmpNle, FCmpOrd,
+    /// Ordered `>`, `>=` and "less or greater", for the flags of `ucomis*`.
+    FCmpGt, FCmpGe, FCmpLtGt,
+}
+
+/// One-operand lane ops of `UnOp::Lane`: `w` is the lane (or source) width.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum LaneUn {
+    /// The top bit of each `w`-byte lane, packed into the low bits (pmovmskb, movmskpd).
+    MoveMask,
+    FSqrt,
+    /// A signed `w`-byte integer to an f32 (f64) bit pattern.
+    IntToF32, IntToF64,
+    /// An f32 (f64) to a signed `w`-byte integer, truncating (`cvtt*`) or
+    /// rounding to nearest even (`cvt*`); out of range gives the minimum, as x86 does.
+    F32ToIntTrunc, F64ToIntTrunc, F32ToInt, F64ToInt,
+    F32ToF64, F64ToF32,
+}
 #[derive(Copy, Clone, Debug)] pub enum Cond { Eq, Ne, Ult, Ule, Ugt, Uge, Slt, Sle, Sgt, Sge }
 #[derive(Copy, Clone, Debug)] pub enum CastKind { Trunc, ZExt, SExt, Bitcast, IntToFloat, FloatToInt }
 
@@ -457,7 +502,7 @@ impl InstKind {
             Const(_) | Undef | Param(_) | BlockParam(_) | Bin { .. } | Un { .. } | Cmp { .. } | Cast { .. }
             | Select { .. } | FuncRef(_) | ImportRef(_) | Call { .. } | CallOut { .. } | Exit { .. } => Tier::Pure,
             PtrOffset { .. } | AddrOfLocal(_) | AddrOfGlobal(_) | IntToPtr(_) | PtrToInt(_)
-            | Load { .. } | Store { .. } | MemCopy { .. } | Opaque { .. } => Tier::Raw,
+            | Load { .. } | Store { .. } | MemCopy { .. } | MemFill { .. } | Opaque { .. } => Tier::Raw,
             Copy(_) | Move(_) | Assign { .. } | Borrow { .. } | Aggregate { .. } => Tier::Safe,
         }
     }

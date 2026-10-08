@@ -156,6 +156,7 @@ pub fn for_each_operand(k: InstKind, f: &Function, mut cb: impl FnMut(ValueId)) 
         Load { ptr, .. } => cb(ptr),
         Store { ptr, val, .. } => { cb(ptr); cb(val) }
         MemCopy { dst, src, len } => { cb(dst); cb(src); cb(len) }
+        MemFill { dst, val, count } => { cb(dst); cb(val); cb(count) }
         Aggregate { fields, .. } => fields.get(&f.value_pool).iter().copied().for_each(&mut cb),
         Assign { val, .. } => cb(val),
         // Place operands are checked when places are introduced (safe mode).

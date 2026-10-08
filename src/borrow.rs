@@ -540,6 +540,11 @@ fn origins(f: &Function, cfg: &Cfg, roots: &[Root], starts: &HashMap<ValueId, u8
                             changed |= mem_join(&mut mem, mem_key(r, o[ptr.index()].off), o[val.index()]);
                         }
                     }
+                    InstKind::MemFill { dst, val, .. } => {
+                        if let Some(r) = o[dst.index()].single().filter(|&r| is_container(roots, r)) {
+                            changed |= mem_join(&mut mem, (r, None), o[val.index()]);
+                        }
+                    }
                     InstKind::MemCopy { dst, src, .. } => {
                         let (d, s) = (o[dst.index()].single(), o[src.index()].single());
                         if let (Some(d), Some(s)) = (d, s) {
@@ -604,6 +609,11 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callee
                 Store { ptr, val, .. } => {
                     fx.access(ptr, FactKind::Write);
                     fx.stash(roots, val, ptr);
+                }
+                MemFill { dst, val, count } => {
+                    fx.access(dst, FactKind::Write);
+                    fx.stash(roots, val, dst);
+                    fx.add(count, FactKind::Escape);
                 }
                 MemCopy { dst, src, len } => {
                     fx.access(dst, FactKind::Write);

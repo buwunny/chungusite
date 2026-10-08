@@ -5,7 +5,7 @@
 - data movement: `MOV` in every register, immediate and memory form, including 8 and 16-bit writes (merged into the old value) and `AH`-style high bytes; `MOVZX`, `MOVSX`, `MOVSXD`, `LEA`, `CDQE`/`CWDE`;
 - arithmetic: `ADD/SUB/AND/OR/XOR/CMP/TEST`, `INC/DEC/NEG/NOT`, `SHL/SHR/SAR` (immediate or `CL` count), `IMUL` in all three forms, one-operand `MUL`, and `DIV`/`IDIV` when `rdx` only extends `rax` (`xor edx, edx` or `CQO`/`CDQ` first). The 8 and 16-bit one-operand `MUL`/`IMUL`/`DIV`/`IDIV` (`ax = al * src`, `al, ah = ax / src`, `dx:ax`) compute at twice the operand's width, where nothing can overflow. Any of them can take a memory operand: the lifter loads it, and a memory destination is stored back. A 64-bit one-operand `MUL`/`IMUL` writes `rax = a * b` and `rdx = UMulHi(a, b)` (`SMulHi` for `IMUL`), the high half of the 128-bit product, which the emitter prints as `((a as u128 * b as u128) >> 64) as u64`; the 32-bit form multiplies the zero- or sign-extended halves in 64 bits;
 - flags: `Jcc`, `CMOVcc` (`Select`) and `SETcc` (`Cmp` zero-extended to a byte) all read the same lazy flags, including carry and overflow after `ADD`/`SUB`/`CMP`, after `MUL`/`IMUL`, where CF = OF = "the product doesn't fit" (`seto` after an overflow-checked multiply), and the signed conditions after `INC`/`DEC` (which are an add or subtract of 1 that leaves CF alone) and after an `ADD` of a constant. Flags set in one block and read in another become block parameters (below);
-- 16-byte copies: `MOVUPS`/`MOVAPS`/`MOVDQU`/`MOVDQA` between memory and xmm registers, `MOVUPD`/`MOVAPD`/`LDDQU`, `XORPS`/`XORPD`/`PXOR` (zeroing, or xor of known values) and the other bitwise ops (`ANDPS`, `ORPS`, `PAND`, `POR`, ...), `PCMPEQ x, x` (all ones), `MOVQ`/`MOVD`/`MOVSD` between xmm registers, general registers and memory, and `PUNPCKLQDQ`/`MOVLHPS`. An xmm register is a pair of 64-bit values (low, high), so a copy is two loads and two stores. Those values are tracked within a block only: an xmm register read before the block writes it is unsupported (SSE arithmetic and floating point aren't lifted yet);
+- SSE2 ([`src/lift/sse.rs`](../src/lift/sse.rs)): 16-byte moves (`MOVUPS`/`MOVAPS`/`MOVDQU`/`MOVDQA` and the `PD`/VEX forms), `MOVQ`/`MOVD`/`MOVSD`/`MOVSS`, half moves (`MOVHPS`, `MOVLPD`, ...), the bitwise ops, integer lane arithmetic (`PADD*`/`PSUB*` with and without saturation, `PMIN*`/`PMAX*`, `PAVG*`, `PMULLW`, `PMULUDQ`, `PSADBW`), compares (`PCMPEQ*`, `PCMPGT*`), shifts by an immediate or an xmm count and the byte shifts `PSLLDQ`/`PSRLDQ`, unpacks, `PSHUFD`/`PSHUFLW`/`PSHUFHW`/`SHUFPS`/`SHUFPD`, `PINSRW`/`PEXTRW`, `PMOVMSKB`/`MOVMSKPS`/`MOVMSKPD`, and scalar and packed floating point (`ADDSD`..`DIVPS`, `MINSD`/`MAXPS`, `SQRT*`, `CMPSD`/`CMPPS` with every predicate, `UCOMISD`/`COMISS` for `Jcc`/`SETcc`, and the `CVT*` conversions between integers, `f32` and `f64`). Below;
 - bit instructions, `adc`/`sbb`, double shifts, rotates, atomics and `rep movs` (below);
 - jump tables, as a `Terminator::Switch` (below);
 - the stack: `PUSH`, `POP` and `LEAVE` move `rsp` with a `PtrOffset` and a store or load;
@@ -125,20 +125,29 @@ bb0():
 
 After lifting, `opt::clean` removes trivial block params and dead code; see [ownership.md](ownership.md) for that pass and the safe-mode analyses built on it.
 
+## SSE
+
+An xmm register is a pair of 64-bit values (low, high), in slots of the register file after the 16 general registers, so it crosses blocks as two block parameters like any register (`BlockParam(XMM_PARAM + 2n)` and `+ 2n + 1`). A 16-byte copy is two loads and two stores, and a bitwise op is two `Bin`s.
+
+Lane arithmetic is `BinOp::Lane(op, w)` or `UnOp::Lane(op, w)` on one 64-bit half at a time, with `w`-byte lanes: `paddd` is `Lane(Add, 4)` on each half. The emitter prints them as calls into a `simd` module ([`src/simd.rs`](../src/simd.rs)) that the output file defines once when some function uses it: `simd::b32::add(x, y)` adds the two `u32` lanes of `x` and `y`, `simd::f64::cmplt` compares like `CMPLTSD` (all ones or zero), `simd::cvt::i32_from_f64_trunc` converts like `CVTTSD2SI`, giving the integer minimum for NaN and out-of-range values as the hardware does. Floats stay bit patterns in `u64`s; only the `simd` functions see `f32`/`f64`.
+
+`UCOMISD`/`COMISD` set `Flags::Float`. Each condition is one lane compare: `ja` is "greater, ordered", `jb` is "not greater-or-equal" (true when unordered, like CF), `je` is "neither less nor greater" (ZF is set when unordered), `jp` is "unordered".
+
+Which xmm values a function reads that it didn't write matters, since xmm registers carry float arguments and results, which signatures don't model yet ([calls.md](calls.md)). An xmm register read at entry, or after a call (which leaves them all undefined), is `LiftError::XmmNotSet`, also when the read is in a later block. The exception is the part of a register that a scalar conversion or square root leaves alone (`cvtsi2sd xmm0, edi` keeps xmm0's high half): compilers treat it as garbage, so when the block hasn't set it, it is `Undef`.
+
 ## Bit instructions, atomics and the rest
 
 - **`adc`/`sbb`** add or subtract the carry the previous instruction left (`cmp; sbb eax, eax` and 128-bit `add; adc` chains). The carry out of them isn't modelled.
 - **`shld`/`shrd`** are `d << n | s >> (w - n)` (the other way round for `shrd`), with a count of 0 selecting `d` unchanged. **8/16-bit shifts** by `cl` or by 8 or more shift a 32-bit copy, since x86 masks the count to 5 bits, not to the operand width.
 - **`bt`** (CF only, `Flags::Carry`), **`bts`/`btr`/`btc`** with a register (which also set, clear or flip the bit), **`bsf`/`bsr`/`tzcnt`/`lzcnt`/`popcnt`**, **`bswap`**, **`rol`/`ror`**, **`xchg`**, **`xadd`** and **`cmpxchg`**. The atomics are lifted as plain loads and stores, which is right for one thread.
-- **`rep movs`** is a `MemCopy` of `rcx` elements, with the direction flag assumed clear. **`pause`** (a spin-loop hint) is a no-op.
+- **`rep movs`** is a `MemCopy` of `rcx` elements and **`rep stos`** a `MemFill` of `rcx` copies of `al`/`ax`/`eax`/`rax`, with the direction flag assumed clear. **`pause`** (a spin-loop hint) is a no-op.
 - **The stack protector's canary** `fs:[0x28]` reads as a constant, so the check at the end of the function always passes.
 - **Thread-locals** of an executable sit just below the thread pointer, which `fs:0` holds (x86-64 TLS variant II), so code reads them as `fs:[-k]`, or loads `fs:0` and indexes down from it. `load::tls` gives the thread-local block (`.tdata`, then `.tbss`) an address range of its own above every section (`.tbss` has none: it overlaps the sections after it), and `Lifter::thread_pointer` is its end. `fs:[k]` becomes the constant address `thread_pointer + k`, and `fs:0` that address itself, so globals turn them into the static `THREAD_LOCALS` like any other data ([cli.md](cli.md#globals)). Thread-locals reached through a register (`mov rax, [rip+x]; mov eax, fs:[rax]`, the initial-exec model in shared objects), `__tls_get_addr` and `gs:` stay unsupported.
 - **Calls that don't return** (`abort`, `exit`, `__stack_chk_fail`, `__cxa_throw`, ...; `discover::noreturn`) end their block, so a caller doesn't merge their undefined `rax` into its return value. `lift_full` takes a callback that `program.rs` answers from the relocation or PLT entry at the call.
 
 ## Not handled yet
 
-- SSE beyond 16-byte copies and bitwise ops: vector compares and shuffles (`PCMPEQB` other than the all-ones idiom, `PSHUFD`, `PUNPCKLBW`, `PMOVMSKB`, ...), scalar floating point (`UCOMISD`, `CVTSI2SS`), xmm values that cross blocks or calls, and AVX.
-- `rep stos` (there is no memset instruction in the IR yet).
+- xmm arguments and return values (`LiftError::XmmNotSet`), AVX beyond the 16-byte VEX moves and bitwise ops (`ymm` registers), SSSE3 and later (`PSHUFB`, `PTEST`, ...), and the pack instructions.
 - `DIV` with a real 128-bit dividend.
 - Parity, the carry out of `adc`/`sbb`, the signed conditions after an `ADD` of two registers, and `CF|ZF` (`ja`/`jbe`) after `ADD`.
 - Thread-locals through a register, and `gs:`.

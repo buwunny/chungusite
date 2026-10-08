@@ -452,7 +452,7 @@ fn live_values(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, ret:
         for &id in blk.insts.get(&f.value_pool) {
             match f.insts[id].kind {
                 InstKind::Call { .. } => call_uses(Site::Call(id), &mut live, &mut work),
-                InstKind::Store { .. } | InstKind::MemCopy { .. } | InstKind::Opaque { .. }
+                InstKind::Store { .. } | InstKind::MemCopy { .. } | InstKind::MemFill { .. } | InstKind::Opaque { .. }
                 | InstKind::Load { volatile: true, .. } | InstKind::Assign { .. } => {
                     for_each_operand(f.insts[id].kind, f, |v| mark(v, &mut live, &mut work));
                 }

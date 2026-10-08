@@ -215,7 +215,8 @@ pub fn guess_fargs(f: &Function, site: Site) -> u8 {
 
 /// What `infer` found besides the signature: what each call site reads after
 /// the call that the callee may return (`READ_RDX`: evidence that it returns 16
-/// bytes, `READ_XMM0`: that it returns a float).
+/// bytes, `READ_XMM0`: that it returns a float, `READ_RAX`: that it returns a
+/// value at all).
 pub struct Inferred {
     pub sig: Sig,
     pub reads: Vec<u8>,
@@ -223,6 +224,25 @@ pub struct Inferred {
 
 pub const READ_RDX: u8 = 1;
 pub const READ_XMM0: u8 = 2;
+pub const READ_RAX: u8 = 4;
+/// Not a read: the function has callers in the program (so `READ_RAX` means something).
+pub const CALLED: u8 = 8;
+
+/// The call sites that never return: the last call of a block the lifter ended
+/// with `Unreachable` (a call to `abort` or a panic function, or one before a trap).
+pub fn noreturn_sites(f: &Function, sites: &[Site]) -> Vec<bool> {
+    let mut cold = vec![false; sites.len()];
+    for (_, blk) in f.blocks.iter() {
+        if !matches!(blk.term, Terminator::Unreachable) {
+            continue;
+        }
+        let last = blk.insts.get(&f.value_pool).iter().rev().find(|&&id| matches!(f.insts[id].kind, InstKind::Call { .. }));
+        if let Some(k) = last.and_then(|&id| sites.iter().position(|&x| x == Site::Call(id))) {
+            cold[k] = true;
+        }
+    }
+    cold
+}
 
 /// Where a function's control leaves it.
 enum Exit {
@@ -253,6 +273,92 @@ fn exits(f: &Function, cfg: &Cfg, sites: &[Site]) -> Vec<Exit> {
         }
     }
     out
+}
+
+/// The registers (indexed by number, xmm halves from `XMM_PARAM`) that some
+/// exit reached from where a call that never returns would have fallen through
+/// (`Function::noreturn_falls`) leaves as they were before that point: defined
+/// outside the code that follows. Before such calls ended their blocks, that
+/// path reached the exit with the register clobbered by the call, so it wasn't
+/// preserved, and rax there wasn't a result unless the code after recomputed it.
+fn stale_regs(f: &Function, cfg: &Cfg, sites: &[Site], callee: &dyn Fn(usize) -> Sig) -> Vec<bool> {
+    let mut stale = vec![false; 256];
+    if f.noreturn_falls.is_empty() {
+        return stale;
+    }
+    let mut def = vec![None; f.insts.len()];
+    for (b, blk) in f.blocks.iter() {
+        for &v in blk.params.get(&f.value_pool).iter().chain(blk.insts.get(&f.value_pool)) {
+            def[v.index()] = Some(b);
+        }
+    }
+    let regs: Vec<u8> = EXIT_REGS.iter().map(|r| r.number() as u8).chain((0..32).map(|x| XMM_PARAM + x)).chain([RAX]).collect();
+    for &(_, from) in &f.noreturn_falls {
+        let mut region = vec![false; f.blocks.len()];
+        let mut work = vec![from];
+        while let Some(b) = work.pop() {
+            if !std::mem::replace(&mut region[b.index()], true) {
+                work.extend(f.blocks[b].term.successors(&f.value_pool));
+            }
+        }
+        let outside = |v: ValueId| def[v.index()].is_none_or(|b| !region[b.index()]);
+        // Block parameters that would have merged the clobbered value: those
+        // of `from`, and those fed one on an edge inside the region.
+        let mut merged = vec![false; f.insts.len()];
+        for &p in f.blocks[from].params.get(&f.value_pool) {
+            merged[p.index()] = true;
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (b, blk) in f.blocks.iter() {
+                if !region[b.index()] || b == from {
+                    continue;
+                }
+                for (k, &p) in blk.params.get(&f.value_pool).iter().enumerate() {
+                    if merged[p.index()] {
+                        continue;
+                    }
+                    let mut m = false;
+                    for &q in cfg.preds(b).iter().filter(|q| region[q.index()]) {
+                        incoming(f, q, b, k, |a| m |= merged[a.index()] || outside(a));
+                    }
+                    if m {
+                        merged[p.index()] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        let outside = |v: ValueId| outside(v) || merged[v.index()];
+        for (b, blk) in f.blocks.iter() {
+            if !region[b.index()] {
+                continue;
+            }
+            let e = match blk.term {
+                Terminator::Return(Some(rax)) => {
+                    let regs = blk.insts.get(&f.value_pool).iter().rev().find_map(|&id| match f.insts[id].kind {
+                        InstKind::Exit { regs } => Some(regs),
+                        _ => None,
+                    });
+                    Exit::Return { rax, regs }
+                }
+                Terminator::TailCall { .. } => match sites.iter().position(|&s| s == Site::Tail(b)) {
+                    Some(k) => Exit::Tail(k),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            for &r in &regs {
+                // after a tail call rax is the callee's result, recomputed
+                let tail_rax = r == RAX && matches!(e, Exit::Tail(_));
+                if !tail_rax && exit_value(f, sites, callee, &e, r).is_some_and(outside) {
+                    stale[r as usize] = true;
+                }
+            }
+        }
+    }
+    stale
 }
 
 /// Where a value comes from, as far as register summaries care.
@@ -351,10 +457,24 @@ fn exit_value(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, e: &E
 /// The signature of `f` (lifted with `track_exits`, cleaned, not yet `apply`d),
 /// given the signature of the callee at each call site (`callee(i)` for
 /// `sites[i]`), the function's own signature from the previous round, and what
-/// its callers read after calling it (`READ_RDX | READ_XMM0`). `stack_args` is
-/// left 0; see `stack_args`.
-pub fn infer(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, prev: Sig, wanted: u8) -> Inferred {
+/// its callers read after calling it (`READ_RDX | READ_XMM0 | READ_RAX`, and
+/// `CALLED` if it has callers). `set_args` is the most argument registers any
+/// caller sets up (6 without callers). `stack_args` is left 0; see `stack_args`.
+///
+/// A path that ends in a call that never returns is evidence of neither a
+/// result nor an argument, so around such calls the callers decide. If rax at
+/// a return reached from where the call would have fallen through is still
+/// what it was before that point (`stale_regs`; unoptimized code leaves
+/// whatever it last computed there), it is a result only if a caller reads it,
+/// and such registers aren't preserved, as when the call fell through. A
+/// register that is live only because a call that never returns takes it
+/// (`assert_failed`'s unused `Option<Arguments>` payload) is an argument only
+/// up to what the callers set.
+pub fn infer(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, prev: Sig, wanted: u8, set_args: u8) -> Inferred {
+    let cold = noreturn_sites(f, sites);
+    let has_cold = cold.contains(&true);
     let cfg = Cfg::new(f);
+    let stale = stale_regs(f, &cfg, sites, callee);
     let ex = exits(f, &cfg, sites);
     let src = sources(f, &cfg, sites);
 
@@ -368,7 +488,7 @@ pub fn infer(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, prev: 
             Exit::Tail(k) if !callee(*k).keeps(reg) => false,
             e => exit_value(f, sites, callee, e, reg).is_some_and(|v| traces_to_entry(f, &src, sites, callee, reg, v)),
         });
-        if ok && !ex.is_empty() {
+        if ok && !ex.is_empty() && !stale[reg as usize] {
             preserves |= 1 << reg;
         }
     }
@@ -383,7 +503,7 @@ pub fn infer(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, prev: 
             Exit::Return { regs: Some(l), .. } if l.len as usize == EXIT_XMM0 => (0..sites.len()).all(|t| callee(t).keeps(reg)),
             e => exit_value(f, sites, callee, e, reg).is_some_and(|v| traces_to_entry(f, &src, sites, callee, reg, v)),
         });
-        if ok && !ex.is_empty() {
+        if ok && !ex.is_empty() && !stale[reg as usize] {
             xpreserves |= 1 << k;
         }
     }
@@ -402,7 +522,9 @@ pub fn infer(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, prev: 
         }
         e => exit_value(f, sites, callee, e, reg).is_some_and(|v| !undef[v.index()]),
     };
-    let rax = !ex.is_empty() && ex.iter().all(|e| defined_at(&undef, RAX, e));
+    let rax = !ex.is_empty()
+        && ex.iter().all(|e| defined_at(&undef, RAX, e))
+        && (!stale[RAX as usize] || wanted & CALLED == 0 || wanted & READ_RAX != 0);
     let fret = !ex.is_empty() && ex.iter().all(|e| defined_at(&undef, XMM0, e)) && (wanted & READ_XMM0 != 0 || {
         // No caller says. Each exit votes: a float, an integer, or nothing (xmm0
         // is a constant, like the 0.0 of an empty sum).
@@ -439,20 +561,29 @@ pub fn infer(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, prev: 
 
     // ---- arguments: which entry registers are live ----
     let mut reads = vec![0u8; sites.len()];
-    let live = live_values(f, sites, callee, ret && !fret, prev.ret2, fret, &mut reads);
-    let (mut args, mut fargs) = (0, 0);
-    for &p in f.blocks[f.entry].params.get(&f.value_pool) {
-        if let InstKind::BlockParam(r) = f.insts[p].kind {
-            if !live[p.index()] {
-                continue;
-            }
-            if let Some(k) = SYSV_ARGS.iter().position(|&a| a == r) {
-                args = args.max(k as u8 + 1);
-            }
-            if let Some(j) = float_arg(r) {
-                fargs = fargs.max(j + 1);
+    let live = live_values(f, sites, callee, ret && !fret, prev.ret2, fret, &[], &mut reads);
+    let entry_args = |live: &[bool]| {
+        let (mut args, mut fargs) = (0, 0);
+        for &p in f.blocks[f.entry].params.get(&f.value_pool) {
+            if let InstKind::BlockParam(r) = f.insts[p].kind {
+                if !live[p.index()] {
+                    continue;
+                }
+                if let Some(k) = SYSV_ARGS.iter().position(|&a| a == r) {
+                    args = args.max(k as u8 + 1);
+                }
+                if let Some(j) = float_arg(r) {
+                    fargs = fargs.max(j + 1);
+                }
             }
         }
+        (args, fargs)
+    };
+    let (mut args, fargs) = entry_args(&live);
+    if has_cold && args > set_args {
+        // without what only the calls that don't return read
+        let warm = live_values(f, sites, callee, ret && !fret, prev.ret2, fret, &cold, &mut vec![0u8; sites.len()]);
+        args = entry_args(&warm).0.max(set_args);
     }
 
     // ---- rdx: returned too? ----
@@ -628,8 +759,10 @@ pub(crate) fn incoming(f: &Function, p: BlockId, b: BlockId, k: usize, mut cb: i
 /// takes; a register after a call that the callee preserves uses its value before
 /// the call. The return value counts only if the function returns rax (`ret`;
 /// rdx at returns too, if it `ret2`s; xmm0 at returns instead if it `fret`s).
-/// Marks in `reads` the call sites whose rdx or xmm0 is read.
-fn live_values(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, ret: bool, ret2: bool, fret: bool, reads: &mut [u8]) -> Vec<bool> {
+/// Marks in `reads` the call sites whose rax, rdx or xmm0 is read. The arguments
+/// of the sites `skip` marks don't count.
+#[allow(clippy::too_many_arguments)]
+fn live_values(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, ret: bool, ret2: bool, fret: bool, skip: &[bool], reads: &mut [u8]) -> Vec<bool> {
     let n = f.insts.len();
     let mut param_of: Vec<Option<(BlockId, usize)>> = vec![None; n];
     for (b, blk) in f.blocks.iter() {
@@ -649,7 +782,11 @@ fn live_values(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, ret:
         let (c, args) = s.parts(f);
         mark(c, live, work);
         let args = args.get(&f.value_pool);
-        let c = sites.iter().position(|&x| x == s).map(callee).unwrap_or_default();
+        let k = sites.iter().position(|&x| x == s);
+        if k.is_some_and(|k| skip.get(k) == Some(&true)) {
+            return;
+        }
+        let c = k.map(callee).unwrap_or_default();
         for &a in &args[..(c.args as usize).min(args.len()).min(6)] {
             mark(a, live, work);
         }
@@ -689,6 +826,7 @@ fn live_values(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, ret:
             // returns nothing but keeps rax, the result is rax from before.
             InstKind::Call { .. } => {
                 if let Some(k) = site_of(v) {
+                    reads[k] |= READ_RAX;
                     let c = callee(k);
                     if !c.rax() && c.keeps(RAX) {
                         ops.extend(sites[k].before(f, RAX));

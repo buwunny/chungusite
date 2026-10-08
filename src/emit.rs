@@ -1185,7 +1185,8 @@ impl Emitter<'_> {
                 } else {
                     let _ = writeln!(out, "    struct Frame(Vec<u8>);\n    let mut frame = Frame(vec![0; {}]);", n * 16);
                 }
-                let _ = writeln!(out, "    let frame_base: u64 = frame.0.as_ptr() as u64;");
+                // (mutable, for the objects of the frame that stay raw)
+                let _ = writeln!(out, "    let frame_base: u64 = frame.0.as_mut_ptr() as u64;");
             } else if n * 16 <= 4096 {
                 let _ = writeln!(out, "    let mut frame = [0u128; {n}];");
             } else {
@@ -1697,7 +1698,7 @@ impl Emitter<'_> {
                         };
                         Place { read, write: mutbl.then_some(write), base: format!("{n}_base"), elem }
                     }
-                    Root::Frame => Place { read: "frame.0".into(), write: Some("frame.0".into()), base: "frame_base".into(), elem: None },
+                    Root::Frame(_) => Place { read: "frame.0".into(), write: Some("frame.0".into()), base: "frame_base".into(), elem: None },
                     Root::Global(c) => {
                         let g = global_slice(c)?;
                         Place { read: format!("{g}.b"), write: None, base: format!("(core::ptr::addr_of!({g}) as u64)"), elem: None }
@@ -2041,8 +2042,7 @@ impl Emitter<'_> {
     /// The frame is a safe root: an array of bytes that accesses index.
     fn frame_safe(&self) -> bool {
         self.borrow
-            .and_then(|a| a.roots.iter().position(|&r| r == Root::Frame).map(|r| self.places.get(r).is_some_and(|p| p.is_some())))
-            .unwrap_or(false)
+            .is_some_and(|a| a.roots.iter().enumerate().any(|(r, x)| matches!(x, Root::Frame(_)) && self.places.get(r).is_some_and(|p| p.is_some())))
     }
 
     /// A call to `memcpy` or `memset` whose pointers all have safe roots: what it
@@ -2099,13 +2099,15 @@ impl Emitter<'_> {
         let mut out = typed;
         let mut lets = String::new();
         let Some(a) = self.borrow else { return (lets, out) };
-        // (root, argument) for every borrowed argument that points into a root
+        // (root, argument) for every borrowed argument that points into a root;
+        // the objects of the frame are one array, so they are one group
         let mut groups: Vec<(u8, Vec<usize>)> = Vec::new();
+        let same = |r: u8, s: u8| r == s || [r, s].iter().all(|&x| matches!(a.roots.get(x as usize), Some(Root::Frame(_))));
         for (k, &v) in args.iter().enumerate() {
             let Some(&Pass::Borrow { nullable, .. }) = pass.get(k) else { continue };
             match self.borrow.and_then(|a| a.safe_root(v)) {
                 Some(r) if self.places.get(r as usize).is_some_and(|p| p.is_some()) => {
-                    match groups.iter_mut().find(|g| g.0 == r) {
+                    match groups.iter_mut().find(|g| same(g.0, r)) {
                         Some(g) => g.1.push(k),
                         None => groups.push((r, vec![k])),
                     }
@@ -2114,6 +2116,17 @@ impl Emitter<'_> {
                 _ => {
                     self.stats.todo += 1;
                     out[k] = "todo!(\"a slice the borrow analysis couldn't prove\")".into();
+                }
+            }
+        }
+        // The other arguments may read the roots lent here (`f(&mut s[..],
+        // s[8])`), so they are evaluated first.
+        if !groups.is_empty() {
+            let lent: Vec<usize> = groups.iter().flat_map(|g| g.1.iter().copied()).collect();
+            for k in 0..out.len() {
+                if !lent.contains(&k) && !out[k].chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    let _ = write!(lets, "let __a{k} = {}; ", out[k]);
+                    out[k] = format!("__a{k}");
                 }
             }
         }
@@ -2134,10 +2147,18 @@ impl Emitter<'_> {
                     exprs.push((k, e));
                 }
             } else {
-                // distinct known offsets, in order
-                let at = |k: usize| match a.origin[args[k].index()].off {
-                    Off::Known(x) => x,
-                    Off::Unknown => i64::MAX,
+                // distinct known offsets in one object, or different objects of
+                // the frame, in order
+                let at = |k: usize| {
+                    let o = a.origin[args[k].index()];
+                    let piece = match o.single().and_then(|r| a.roots.get(r as usize)) {
+                        Some(&Root::Frame(lo)) => lo as i64,
+                        _ => 0,
+                    };
+                    (piece, match o.off {
+                        Off::Known(x) => x,
+                        Off::Unknown => i64::MAX,
+                    })
                 };
                 ks.sort_by_key(|&k| at(k));
                 let w = place.write.clone().unwrap_or_default();

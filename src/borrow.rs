@@ -46,20 +46,25 @@ pub struct Origin {
     pub roots: u64,
     /// Meaningful only when `roots` is non-zero.
     pub off: Off,
+    /// The lowest offset it may have: pointer arithmetic moves up within an
+    /// object (`frame.rs` assumes the same), so an indexed pointer stays at or
+    /// above where it was last known. `i64::MIN` if it moved down by an unknown
+    /// amount. Equal to the offset when that is known.
+    pub lo: i64,
 }
 
 /// The root index shared by every root past the 63rd. It is never safe.
 pub const OTHER: u8 = 63;
 
 impl Origin {
-    pub const NONE: Origin = Origin { roots: 0, off: Off::Known(0) };
+    pub const NONE: Origin = Origin { roots: 0, off: Off::Known(0), lo: 0 };
 
     pub fn is_none(self) -> bool {
         self.roots == 0
     }
 
     fn root(r: u8) -> Origin {
-        Origin { roots: 1 << r, off: Off::Known(0) }
+        Origin { roots: 1 << r, off: Off::Known(0), lo: 0 }
     }
 
     /// The root, if there is exactly one.
@@ -75,7 +80,7 @@ impl Origin {
             return self;
         }
         let off = if self.roots == o.roots && self.off == o.off { self.off } else { Off::Unknown };
-        Origin { roots: self.roots | o.roots, off }
+        Origin { roots: self.roots | o.roots, off, lo: self.lo.min(o.lo) }
     }
 
     // `shift` and `unknown` keep NONE canonical (offset Known(0)); otherwise an
@@ -84,11 +89,16 @@ impl Origin {
         if self.is_none() {
             return self;
         }
-        let off = match self.off {
-            Off::Known(x) => x.checked_add(d).map_or(Off::Unknown, Off::Known),
-            Off::Unknown => Off::Unknown,
+        let (off, lo) = match self.off {
+            Off::Known(x) => match x.checked_add(d) {
+                Some(y) => (Off::Known(y), y),
+                None => (Off::Unknown, i64::MIN),
+            },
+            // (moving down from an unknown offset: no bound, which also keeps a
+            // pointer decremented in a loop from lowering it forever)
+            Off::Unknown => (Off::Unknown, if d >= 0 { self.lo } else { i64::MIN }),
         };
-        Origin { off, ..self }
+        Origin { off, lo, ..self }
     }
 
     fn unknown(self) -> Origin {
@@ -108,8 +118,11 @@ impl Origin {
 pub enum Root {
     /// Entry parameter `k`.
     Param(u8),
-    /// The function's stack frame (`Function::locals[0]`, from `frame::promote`).
-    Frame,
+    /// An object in the function's stack frame (`Function::locals[0]`, from
+    /// `frame::promote`), by the offset in the frame where it starts. Offsets of
+    /// pointers into it are still from the start of the frame. The frame is
+    /// split into as many objects as the pointers into it allow (`frame_pieces`).
+    Frame(u32),
     /// A constant address: a global in the binary's data.
     Global(u64),
     /// The result of the allocating call that defines this value.
@@ -124,7 +137,13 @@ pub enum Pass {
     Ignore,
     /// Takes it as a slice (`&[u8]` / `&mut [u8]`, `Option<..>` if nullable): the
     /// caller reborrows the root the argument points into.
-    Borrow { mutbl: bool, nullable: bool },
+    Borrow {
+        mutbl: bool,
+        nullable: bool,
+        /// It accesses at most this many bytes from the pointer, also through
+        /// callees; `None` if it indexes or doesn't know.
+        len: Option<u32>,
+    },
     /// Frees it (`free`, `operator delete`): a move of an owned allocation.
     Free,
     /// Reads (or writes) through it during the call only, like `memcpy`. Safe
@@ -145,6 +164,10 @@ pub struct Callee {
     pub alloc: Option<(u8, Option<u8>)>,
     /// The result points into these arguments (bit = position).
     pub ret_from: u64,
+    /// The call goes to the callee's raw twin: arguments it borrows are passed
+    /// as addresses (they escape), but it still accesses only `len` bytes of
+    /// them during the call.
+    pub raw: bool,
 }
 
 /// What the analysis needs from the rest of the program.
@@ -193,6 +216,8 @@ pub enum FactKind {
 pub struct Fact {
     pub root: u8,
     pub off: Off,
+    /// The lowest offset the pointer may have (`Origin::lo`).
+    pub lo: i64,
     pub kind: FactKind,
     /// The instruction, or `None` for a terminator.
     pub at: Option<ValueId>,
@@ -230,6 +255,10 @@ pub struct ParamBorrow {
     pub fields: Vec<(i64, bool)>,
     /// Accessed at a non-constant offset: evidence for a slice or array.
     pub indexed: bool,
+    /// How many bytes from the pointer are accessed, here and in the callees it
+    /// is lent to; `None` if that isn't known (an indexed access, a callee that
+    /// indexes).
+    pub extent: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -277,10 +306,18 @@ pub fn analyze(f: &Function) -> Analysis {
 pub fn analyze_with(f: &Function, ctx: &Ctx) -> Analysis {
     let cfg = Cfg::new(f);
     let callees = callees(f, &cfg, ctx);
-    let (roots, starts) = find_roots(f, &cfg, &callees);
-    let origin = origins(f, &cfg, &roots, &starts, &callees);
+    let (mut roots, starts) = find_roots(f, &cfg, &callees);
+    let mut origin = origins(f, &cfg, &roots, &starts, &callees);
     let points = Points::new(f);
-    let (facts, unprovable, bad_calls) = facts(f, &cfg, &origin, &roots, &callees, &points);
+    let (mut facts, mut unprovable, mut bad_calls) = facts(f, &cfg, &origin, &roots, &callees, &points);
+    // One object of the frame that escapes shouldn't take the rest with it.
+    if let (Some(fr), Some((_, l))) = (roots.iter().position(|&r| r == Root::Frame(0)), f.locals.iter().next()) {
+        let pieces = frame_pieces(f, &facts, fr as u8, &callees, l.size as i64);
+        if pieces.len() > 1 {
+            split_frame(&mut roots, &mut origin, fr as u8, &pieces);
+            (facts, unprovable, bad_calls) = self::facts(f, &cfg, &origin, &roots, &callees, &points);
+        }
+    }
     let mut a = Analysis {
         origin,
         facts,
@@ -377,7 +414,7 @@ fn find_roots(f: &Function, cfg: &Cfg, callees: &Callees) -> (Vec<Root>, HashMap
     for &b in &cfg.rpo {
         for &id in f.blocks[b].insts.get(&f.value_pool) {
             let r = match f.insts[id].kind {
-                InstKind::AddrOfLocal(_) => Root::Frame,
+                InstKind::AddrOfLocal(_) => Root::Frame(0),
                 InstKind::IntToPtr(v) => match konst(f, v) {
                     Some(c) => Root::Global(c as u64),
                     None => continue,
@@ -398,8 +435,108 @@ fn find_roots(f: &Function, cfg: &Cfg, callees: &Callees) -> (Vec<Root>, HashMap
     (roots, starts)
 }
 
+/// The roots that are objects of the frame.
+fn frame_mask(roots: &[Root]) -> u64 {
+    roots.iter().enumerate().filter(|(_, r)| matches!(r, Root::Frame(_))).fold(0, |m, (i, _)| m | 1 << i)
+}
+
+/// Bytes a load or store of this type accesses.
+fn access_len(ty: TyId) -> Option<i64> {
+    match ty {
+        TyId::B1 | TyId::BOOL => Some(1),
+        TyId::B2 => Some(2),
+        TyId::B4 => Some(4),
+        TyId::B8 | TyId::PTR | TyId::F64 => Some(8),
+        TyId::PAIR => Some(16),
+        _ => None,
+    }
+}
+
+/// How far from its pointer a fact reaches: the bytes an access touches, or what
+/// a callee that borrows it says it accesses. `None`: anywhere above it.
+fn fact_len(f: &Function, x: &Fact, callee: impl Fn(Site) -> Option<Callee>) -> Option<i64> {
+    let Off::Known(_) = x.off else { return None };
+    match (x.kind, x.at.map(|v| f.insts[v].kind)) {
+        (FactKind::Read | FactKind::Write, Some(InstKind::Load { .. })) if x.site.is_none() => access_len(f.insts[x.at?].ty),
+        (FactKind::Read | FactKind::Write, Some(InstKind::Store { val, .. })) if x.site.is_none() => access_len(f.insts[val].ty),
+        (FactKind::Read | FactKind::Write, Some(InstKind::MemFill { val, count, .. })) => {
+            Some(konst(f, count)?.checked_mul(access_len(f.insts[val].ty)?)?).filter(|&n| n >= 0)
+        }
+        (FactKind::Read | FactKind::Write, Some(InstKind::MemCopy { len, .. })) => konst(f, len).filter(|&n| n >= 0),
+        // `memcpy(dst, src, n)`, `memset(dst, c, n)`
+        (FactKind::Read | FactKind::Write, Some(InstKind::Call { args, .. })) if x.site.is_some() => {
+            konst(f, *args.get(&f.value_pool).get(2)?).filter(|&n| n >= 0)
+        }
+        // lent, to a slice-taking callee or its raw twin
+        (FactKind::Borrow { .. } | FactKind::Escape, _) => {
+            let (site, k) = x.site?;
+            match callee(site)?.args.get(k as usize)? {
+                Pass::Borrow { len, .. } => len.map(i64::from),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The frame's objects, as byte ranges `[lo, hi)` of the frame, from what is done
+/// with pointers into it: an access covers the bytes it touches, a borrow what the
+/// callee accesses, and anything else (an index, an escape, a callee that indexes)
+/// everything from the pointer's lowest offset up, as `frame.rs` assumes. Ranges
+/// that overlap are one object. One range: the frame is one object.
+fn frame_pieces(f: &Function, facts: &[Fact], fr: u8, callees: &Callees, end: i64) -> Vec<(i64, i64)> {
+    let mut ranges: Vec<(i64, i64)> = Vec::new();
+    // (a pointer stored in the frame or an allocation is followed: its uses after
+    // it is loaded back are facts of their own)
+    for x in facts.iter().filter(|x| x.root == fr && !matches!(x.kind, FactKind::NullCheck | FactKind::Stash(_))) {
+        let lo = match x.off {
+            Off::Known(o) => o,
+            Off::Unknown => x.lo,
+        };
+        // before the frame: all of it
+        if lo < 0 {
+            return vec![(0, end)];
+        }
+        let len = fact_len(f, x, |s| callees.get(s).cloned());
+        let hi = len.map_or(end, |n| lo.saturating_add(n.max(1)).min(end));
+        ranges.push((lo.min(end), hi.max(lo.min(end))));
+    }
+    ranges.sort_unstable();
+    let mut pieces: Vec<(i64, i64)> = Vec::new();
+    for (lo, hi) in ranges {
+        match pieces.last_mut() {
+            Some(p) if lo < p.1 || lo == p.0 => p.1 = p.1.max(hi),
+            _ => pieces.push((lo, hi)),
+        }
+    }
+    pieces
+}
+
+/// Makes each piece of the frame its own root (`Root::Frame(lo)`), and points
+/// every value into the frame at the piece holding its lowest offset.
+fn split_frame(roots: &mut Vec<Root>, origin: &mut [Origin], fr: u8, pieces: &[(i64, i64)]) {
+    let mut index = vec![fr];
+    roots[fr as usize] = Root::Frame(pieces[0].0 as u32);
+    for &(lo, _) in &pieces[1..] {
+        if roots.len() < OTHER as usize {
+            roots.push(Root::Frame(lo as u32));
+            index.push((roots.len() - 1) as u8);
+        } else {
+            index.push(OTHER);
+        }
+    }
+    for o in origin.iter_mut().filter(|o| o.roots & (1 << fr) != 0) {
+        let at = match o.off {
+            Off::Known(x) => x,
+            Off::Unknown => o.lo,
+        };
+        let k = pieces.iter().rposition(|p| p.0 <= at).unwrap_or(0);
+        o.roots = (o.roots & !(1 << fr)) | 1 << index[k];
+    }
+}
+
 fn is_container(roots: &[Root], r: u8) -> bool {
-    matches!(roots.get(r as usize), Some(Root::Frame | Root::Alloc(_)))
+    matches!(roots.get(r as usize), Some(Root::Frame(_) | Root::Alloc(_)))
 }
 
 /// Points-to: what is stored at `(container root, offset)`; `None` is an unknown
@@ -628,7 +765,8 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callee
                             Some(d) => FactKind::CopyTo(d),
                             None => FactKind::Spill,
                         };
-                        fx.out.push(Fact { root: s, off: Off::Unknown, kind, at: fx.at, point: fx.point, site: None });
+                        let lo = o[src.index()].lo;
+                        fx.out.push(Fact { root: s, off: Off::Unknown, lo, kind, at: fx.at, point: fx.point, site: None });
                     }
                 }
                 Call { callee, args } => {
@@ -639,7 +777,12 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callee
                 // result lost track of a rooted operand, that operand escapes.
                 k @ (PtrOffset { .. } | Bin { op: BinOp::Add | BinOp::Sub, .. } | Select { .. }
                 | Cast { kind: CastKind::Bitcast, .. } | IntToPtr(_) | PtrToInt(_)) => {
-                    let kept = o[id.index()].roots;
+                    let mut kept = o[id.index()].roots;
+                    // (moving between objects of the frame at known offsets is
+                    // addressing, as in the machine code)
+                    if kept & frame_mask(roots) != 0 {
+                        kept |= frame_mask(roots);
+                    }
                     if !is_pointer_difference(k, o) {
                         crate::verify::for_each_operand(k, f, |v| {
                             if o[v.index()].roots & !kept != 0 && !is_index(roots, o, id, v) {
@@ -684,7 +827,7 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callee
     // Unliftable code may do anything with any root.
     if opaque {
         for root in 0..roots.len() as u8 {
-            out.push(Fact { root, off: Off::Unknown, kind: FactKind::Escape, at: None, point: 0, site: None });
+            out.push(Fact { root, off: Off::Unknown, lo: i64::MIN, kind: FactKind::Escape, at: None, point: 0, site: None });
         }
     }
     (out, unprovable, bad_calls)
@@ -707,7 +850,7 @@ impl FactSink<'_> {
     fn add_site(&mut self, v: ValueId, kind: FactKind, site: Option<(Site, u8)>) {
         let og = self.o[v.index()];
         for root in og.each_root() {
-            self.out.push(Fact { root, off: og.off, kind, at: self.at, point: self.point, site });
+            self.out.push(Fact { root, off: og.off, lo: og.lo, kind, at: self.at, point: self.point, site });
         }
     }
 
@@ -733,6 +876,12 @@ impl FactSink<'_> {
             let pass = c.and_then(|c| c.args.get(k)).copied().unwrap_or(Pass::Escape);
             let og = self.o[a.index()];
             let k = k.min(255) as u8;
+            if c.is_some_and(|c| c.raw) {
+                if matches!(pass, Pass::Borrow { .. }) {
+                    self.add_site(a, FactKind::Escape, Some((site, k)));
+                }
+                continue;
+            }
             match pass {
                 Pass::Ignore => {}
                 Pass::Escape => self.add(a, FactKind::Escape),
@@ -874,7 +1023,7 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
                             if !(x.read || x.write || x.borrowed) { "not dereferenced" } else { "" },
                         ])
                     }
-                    Root::Frame => first(&[
+                    Root::Frame(_) => first(&[
                         if frame_ok { "" } else { "too large for an array" },
                         common,
                         neg,
@@ -964,7 +1113,15 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
             let x = u.get(r).copied().unwrap_or_default();
             let mut fields: Vec<(i64, bool)> = Vec::new();
             let mut indexed = false;
+            let mut extent = Some(0i64);
             for y in a.facts.iter().filter(|y| y.root as usize == r) {
+                if !matches!(y.kind, FactKind::NullCheck | FactKind::Return) {
+                    let end = match y.off {
+                        Off::Known(o) if o >= 0 => fact_len(f, y, |s| (ctx.callee)(s)).map(|n| o + n),
+                        _ => None,
+                    };
+                    extent = extent.zip(end).map(|(e, n)| e.max(n));
+                }
                 if matches!(y.kind, FactKind::Read | FactKind::Write) {
                     match y.off {
                         Off::Known(o) => fields.push((o, y.kind == FactKind::Write)),
@@ -992,7 +1149,8 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
             } else {
                 Class::Shared
             };
-            ParamBorrow { value, reg: reg(k), class, returned: x.returned, nullable: x.nullable, fields, indexed }
+            let extent = extent.and_then(|e| u32::try_from(e).ok());
+            ParamBorrow { value, reg: reg(k), class, returned: x.returned, nullable: x.nullable, fields, indexed, extent }
         })
         .collect();
 }

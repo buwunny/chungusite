@@ -287,6 +287,39 @@ fn the_same_local_lent_twice_calls_the_raw_twin() {
     assert!(src[1].contains("add_raw(") && !src[1].contains("&mut"), "{}", src[1]);
 }
 
+#[test]
+fn an_escaping_local_leaves_the_rest_of_the_frame_safe() {
+    // a[2] and b[2], each filled by `set2`; b's address is stored through the
+    // argument, so b is raw, and a is still a slice of the frame
+    let (p, _) = program(&[
+        ("set2", &|a| {
+            a.mov(qword_ptr(rdi), 1).unwrap();
+            a.mov(qword_ptr(rdi + 8), 2).unwrap();
+            a.ret().unwrap();
+        }),
+        ("caller", &|a| {
+            a.push(rbx).unwrap();
+            a.sub(rsp, 32).unwrap();
+            a.mov(rbx, rdi).unwrap();
+            a.mov(rdi, rsp).unwrap();
+            a.call(addr(0)).unwrap();
+            a.lea(rdi, qword_ptr(rsp + 16)).unwrap();
+            a.call(addr(0)).unwrap();
+            a.lea(rax, qword_ptr(rsp + 16)).unwrap();
+            a.mov(qword_ptr(rbx), rax).unwrap();
+            a.mov(rax, qword_ptr(rsp)).unwrap();
+            a.add(rax, qword_ptr(rsp + 8)).unwrap();
+            a.add(rsp, 32).unwrap();
+            a.pop(rbx).unwrap();
+            a.ret().unwrap();
+        }),
+    ]);
+    let src = emitted(&p, Mode::Safe);
+    assert!(src[1].contains("set2(&mut frame.0["), "{}", src[1]);
+    assert!(src[1].contains("set2_raw("), "{}", src[1]);
+    assert!(src[1].contains("u64::from_le_bytes(frame.0["), "{}", src[1]);
+}
+
 /// Stand-ins for `malloc`, `free` and `memcpy`: safe mode goes by their names,
 /// and the program by the arguments they read.
 fn stub_malloc(a: &mut CodeAssembler) {

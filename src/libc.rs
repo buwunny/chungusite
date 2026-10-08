@@ -122,7 +122,7 @@ pub fn lookup(name: &str) -> Option<Sig> {
 pub fn summary(name: &str) -> Option<crate::borrow::Callee> {
     use crate::borrow::{Callee, Pass};
     let name = name.split('@').next().unwrap_or(name);
-    let alloc = |size: (u8, Option<u8>), args: usize| Some(Callee { args: vec![Pass::Ignore; args], alloc: Some(size), ret_from: 0 });
+    let alloc = |size: (u8, Option<u8>), args: usize| Some(Callee { args: vec![Pass::Ignore; args], alloc: Some(size), ret_from: 0, raw: false });
     match name {
         "malloc" | "_Znwm" | "_Znam" => alloc((0, None), 1),
         "calloc" => alloc((0, Some(1)), 2),
@@ -130,14 +130,15 @@ pub fn summary(name: &str) -> Option<crate::borrow::Callee> {
         "free" | "_ZdlPv" | "_ZdaPv" | "_ZdlPvm" | "_ZdaPvm" | "__rust_dealloc" => {
             let mut args = vec![Pass::Ignore; 3];
             args[0] = Pass::Free;
-            Some(Callee { args, alloc: None, ret_from: 0 })
+            Some(Callee { args, alloc: None, ret_from: 0, raw: false })
         }
         "memcpy" | "memmove" => Some(Callee {
             args: vec![Pass::Access { write: true }, Pass::Access { write: false }, Pass::Ignore],
             alloc: None,
             ret_from: 1,
+            raw: false,
         }),
-        "memset" => Some(Callee { args: vec![Pass::Access { write: true }, Pass::Ignore, Pass::Ignore], alloc: None, ret_from: 1 }),
+        "memset" => Some(Callee { args: vec![Pass::Access { write: true }, Pass::Ignore, Pass::Ignore], alloc: None, ret_from: 1, raw: false }),
         _ => None,
     }
 }

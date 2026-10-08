@@ -508,7 +508,8 @@ fn borrows(func: &Function, a: &Analysis, out: &mut String) {
         }
         let name = match root {
             Root::Param(_) => continue,
-            Root::Frame => "frame".to_string(),
+            Root::Frame(0) => "frame".to_string(),
+            Root::Frame(lo) => format!("frame from {lo}"),
             Root::Global(c) => format!("global {c:#x}"),
             Root::Alloc(v) => format!("allocation v{}", v.index()),
         };

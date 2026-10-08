@@ -196,3 +196,48 @@ fn parallel_output_is_deterministic() {
     assert!(one.len() > 100_000);
     assert_eq!(one, run("4"));
 }
+
+const STDERR_C: &str = r#"
+#include <stdio.h>
+int report(int x) {
+    fprintf(stderr, "x=%d\n", x);
+    return fileno(stderr) * 100 + x;
+}
+int main(int argc, char **argv) { return report(argc); }
+"#;
+
+const STDERR_MAIN: &str = r#"
+fn main() {
+    assert_eq!(unsafe { dec::report(5 as _) } as i32, 205);
+}
+"#;
+
+/// The C library's own data that a program reads through a copy relocation
+/// (`stderr` in a PIE) is the library's, not a copy of the bytes in the file.
+#[test]
+fn copy_relocated_library_data() {
+    let dir = scratch("copyreloc");
+    let c = dir.join("orig.c");
+    std::fs::write(&c, STDERR_C).unwrap();
+    let exe = dir.join("orig");
+    let Ok(out) = Command::new("cc").args(["-O2", "-o"]).arg(&exe).arg(&c).output() else {
+        assert!(std::env::var_os("CI").is_none(), "no C compiler");
+        return;
+    };
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let bin = env!("CARGO_BIN_EXE_chungusite");
+    for mode in ["fast", "safe"] {
+        let out = Command::new(bin).arg(&exe).args(["--mode", mode, "-f", "report"]).output().unwrap();
+        let src = String::from_utf8(out.stdout).unwrap();
+        assert!(out.status.success(), "{}\n{src}", String::from_utf8_lossy(&out.stderr));
+        assert!(src.contains("#[link_name = \"stderr\"]"), "{mode}:\n{src}");
+        let d = dir.join(mode);
+        std::fs::create_dir_all(&d).unwrap();
+        rustc(&d, "dec.rs", &src, &["--crate-type", "rlib", "--crate-name", "dec"]);
+        let rlib = d.join("libdec.rlib");
+        rustc(&d, "main.rs", STDERR_MAIN, &["--extern", &format!("dec={}", rlib.display()), "-o", d.join("run").to_str().unwrap()]);
+        let run = Command::new(d.join("run")).output().unwrap();
+        assert!(run.status.success(), "{mode}: {}\n{src}", String::from_utf8_lossy(&run.stderr));
+        assert_eq!(String::from_utf8_lossy(&run.stderr), "x=5\n", "{mode}");
+    }
+}

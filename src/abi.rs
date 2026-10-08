@@ -166,7 +166,7 @@ pub fn sites(f: &Function) -> Vec<Site> {
 }
 
 /// How many argument registers a call to unknown code passes: up to the last one
-/// set in the call's own block (prefix-closed). Valid on lifter output, where a
+/// the function set up (`set_for`; prefix-closed). Valid on lifter output, where a
 /// call's arguments are `CALL_ARGS` long.
 pub fn guess_args(f: &Function, site: Site) -> u8 {
     let (_, args) = site.parts(f);
@@ -179,19 +179,65 @@ pub fn guess_args(f: &Function, site: Site) -> u8 {
         Site::Tail(b) => Some(b),
     };
     let Some(block) = block else { return 0 };
-    let here = f.blocks[block].insts.get(&f.value_pool);
     let mut n = 0;
     for (k, &a) in args[..6].iter().enumerate() {
-        let set_here = here.contains(&a) && !matches!(f.insts[a].kind, InstKind::Undef | InstKind::CallOut { .. });
-        if set_here {
+        if set_for(f, block, a, Some(CALL_REGS[k].number() as u8)) {
             n = k + 1;
         }
     }
     n as u8
 }
 
+/// Did the function set `a` up for a call in `block`, in register `reg`:
+/// computed there, computed before (in a block that dominates it), or moved
+/// there from another register, on every path, rather than left in `reg` by
+/// the caller or a callee. `free(opaque, p)` through a pointer often loads
+/// `p` before a null check and `opaque` after it; `usage(name)` passes `name`
+/// on to `fprintf` in r8.
+fn set_for(f: &Function, block: BlockId, a: ValueId, reg: Option<u8>) -> bool {
+    match f.insts[a].kind {
+        InstKind::BlockParam(_) if reg.is_some() => set_before(f, a, reg, &mut Vec::new()),
+        InstKind::Param(_) | InstKind::BlockParam(_) => f.blocks[block].insts.get(&f.value_pool).contains(&a),
+        _ => set_before(f, a, reg, &mut Vec::new()),
+    }
+}
+
+/// `set_for` of a value computed before the call's block. A block parameter
+/// (paths joining, each with the arguments it set up, as in
+/// `fprintf(stderr, fmt, name, why)` after two error checks) counts if every
+/// path into it set its register up; a loop's way back adds nothing.
+fn set_before(f: &Function, a: ValueId, reg: Option<u8>, seen: &mut Vec<ValueId>) -> bool {
+    match f.insts[a].kind {
+        InstKind::Undef | InstKind::CallOut { .. } | InstKind::Param(_) => false,
+        InstKind::BlockParam(r) if reg.is_some_and(|reg| reg != r) => true,
+        InstKind::BlockParam(_) => {
+            if seen.contains(&a) {
+                return true;
+            }
+            if seen.len() >= 16 {
+                return false;
+            }
+            seen.push(a);
+            let Some((b, k)) = f.blocks.iter().find_map(|(b, blk)| {
+                blk.params.get(&f.value_pool).iter().position(|&p| p == a).map(|k| (b, k))
+            }) else { return false };
+            let (mut paths, mut all) = (0, true);
+            for (p, blk) in f.blocks.iter() {
+                if blk.term.successors(&f.value_pool).any(|s| s == b) {
+                    incoming(f, p, b, k, |v| {
+                        paths += 1;
+                        all = all && set_before(f, v, reg, seen);
+                    });
+                }
+            }
+            paths > 0 && all
+        }
+        _ => true,
+    }
+}
+
 /// How many float arguments a call to unknown code passes: up to the last xmm
-/// register set in the call's own block, like `guess_args`.
+/// register the function set up, like `guess_args`.
 pub fn guess_fargs(f: &Function, site: Site) -> u8 {
     let (_, args) = site.parts(f);
     let args = args.get(&f.value_pool);
@@ -203,10 +249,9 @@ pub fn guess_fargs(f: &Function, site: Site) -> u8 {
         Site::Tail(b) => Some(b),
     };
     let Some(block) = block else { return 0 };
-    let here = f.blocks[block].insts.get(&f.value_pool);
     let mut n = 0;
     for (j, &a) in args[CALL_XMM..].iter().step_by(2).take(FLOAT_ARGS).enumerate() {
-        if here.contains(&a) && !matches!(f.insts[a].kind, InstKind::Undef | InstKind::CallOut { .. }) {
+        if set_for(f, block, a, None) {
             n = j + 1;
         }
     }

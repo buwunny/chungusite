@@ -6,6 +6,20 @@
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::TensorRef;
 
+/// Loads libonnxruntime from `ORT_DYLIB_PATH` (or the system's library path), so
+/// that a missing library is an error here rather than a panic in the first call
+/// into `ort`. Loading it again is a no-op.
+pub fn load_runtime() -> Result<(), String> {
+    use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
+    let path = match std::env::var("ORT_DYLIB_PATH") {
+        Ok(s) if !s.is_empty() => s,
+        _ => format!("{DLL_PREFIX}onnxruntime{DLL_SUFFIX}"),
+    };
+    let env = ort::init_from(&path).map_err(|e| format!("can't load ONNX Runtime from {path} (set ORT_DYLIB_PATH): {e}"))?;
+    env.commit();
+    Ok(())
+}
+
 pub struct Refiner {
     session: Session,
     ids: Vec<i64>,

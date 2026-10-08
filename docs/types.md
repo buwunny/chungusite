@@ -70,7 +70,7 @@ The stderr summary adds a line: `types: A of B arguments typed, N structs inferr
 
 ## The model hook
 
-`types::TypeModel` is where a learned type model plugs in ([ml-runtime.md](ml-runtime.md)). Nothing in this crate implements it yet.
+`types::TypeModel` is where a learned type model plugs in. `refine::model::TypeClassifier` implements it for an ONNX classifier, and `--refine <dir>` uses it ([ml-runtime.md](ml-runtime.md#--refine)).
 
 ```rust
 pub trait TypeModel: Sync {
@@ -78,7 +78,7 @@ pub trait TypeModel: Sync {
 }
 ```
 
-It is asked about each argument and the return value (`Var::Arg`, `Var::Ret`) of a function without usable debug info, and answers with a C type label as DWARF spells it (`int`, `unsigned char`, `char *`, `size_t`) and a score. `parse_label` turns the label into a width, signedness, bool or pointer, and `accept` checks it against the facts: a proposal may say more than the code shows (an `int` for an argument only used as a byte), never less (a byte for a value used at 32 bits) or something else (an integer for a dereferenced value, unsigned for a value compared as signed). A rejected proposal changes nothing, and `TypeStats` counts both. Pass a model with `program::Options { model: Some(&m), .. }` and `Program::build_with`.
+It is asked about each argument and the return value (`Var::Arg`, `Var::Ret`) of a function without usable debug info, and answers with a C type label as DWARF spells it (`int`, `unsigned char`, `char *`, `size_t`) and a score. `parse_label` turns the label into a width, signedness, bool or pointer, and `accept` checks it against the facts: a proposal may say more than the code shows (an `int` for an argument only used as a byte), never less (a byte for a value used at 32 bits) or something else (an integer for a dereferenced value, unsigned for a value compared as signed). A rejected proposal changes nothing, and `TypeStats` counts both (the stderr summary prints them as `type model: N proposals used, M turned down by the facts`). The questions don't depend on each other, so `recover` asks them for every function in parallel before the sequential part that builds the types. Pass a model with `program::BuildOptions { model: Some(&m), .. }` and `Program::build_with`.
 
 ## Tests
 

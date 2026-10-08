@@ -53,6 +53,8 @@ pub trait Source {
     fn edge(&mut self, to: BlockId, args: &[ValueId]) -> Vec<Node>;
     /// The condition of a `Branch`, as an expression.
     fn cond(&self, c: ValueId) -> String;
+    /// "`v` is one of `cases`", for a `Switch`, as an expression.
+    fn case(&self, v: ValueId, cases: &[u64]) -> String;
     /// A terminator without successors (return, tail call, ...), as a statement.
     fn exit(&mut self, b: BlockId) -> Node;
 }
@@ -66,7 +68,7 @@ const MAX_DEPTH: usize = 512;
 /// source, and is a back edge of a natural loop.
 pub fn reducible(f: &Function, cfg: &Cfg) -> bool {
     cfg.rpo.iter().all(|&b| {
-        f.blocks[b].term.successors().into_iter().flatten().all(|s| {
+        f.blocks[b].term.successors(&f.value_pool).all(|s| {
             cfg.rpo_index[s.index()] > cfg.rpo_index[b.index()] || cfg.dominates(s, b)
         })
     })
@@ -90,7 +92,7 @@ pub fn structure(f: &Function, cfg: &Cfg, src: &mut dyn Source) -> Option<Vec<No
                 return None;
             }
         }
-        for s in f.blocks[b].term.successors().into_iter().flatten() {
+        for s in f.blocks[b].term.successors(&f.value_pool) {
             if cfg.rpo_index[s.index()] > cfg.rpo_index[b.index()] {
                 forward_in[s.index()] += 1;
             } else {
@@ -189,6 +191,22 @@ impl Structurer<'_, '_> {
                         let then = self.branch(b, t, &a[..nt]);
                         let els = self.branch(b, e, &a[nt..]);
                         out.push(Node::If { c: self.src.cond(c), then, els });
+                    }
+                    // `if v == 0 { .. } else if matches!(v, 1 | 3) { .. } else { default }`
+                    Terminator::Switch { v, table, default } => {
+                        let cases = table.get(&f.value_pool);
+                        let mut arms = Vec::new();
+                        for t in f.blocks[b].term.successors(&f.value_pool).skip(1) {
+                            let ks: Vec<u64> = (0..cases.len() as u64)
+                                .filter(|&k| BlockId::from_value(cases[k as usize]) == t)
+                                .collect();
+                            arms.push((self.src.case(v, &ks), self.branch(b, t, &[])));
+                        }
+                        let mut chain = self.branch(b, default, &[]);
+                        for (c, then) in arms.into_iter().rev() {
+                            chain = vec![Node::If { c, then, els: chain }];
+                        }
+                        out.extend(chain);
                     }
                     _ => out.push(self.src.exit(b)),
                 }

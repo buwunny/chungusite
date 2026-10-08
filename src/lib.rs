@@ -6,6 +6,7 @@ pub mod check;
 pub mod discover;
 pub mod dump;
 pub mod emit;
+pub mod expr;
 pub mod frame;
 pub mod globals;
 pub mod ir;

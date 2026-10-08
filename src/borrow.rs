@@ -996,7 +996,7 @@ fn in_cycle(f: &Function, cfg: &Cfg, v: ValueId) -> bool {
         return true;
     };
     let mut seen = vec![false; f.blocks.len()];
-    let mut work: Vec<BlockId> = f.blocks[home].term.successors().into_iter().flatten().collect();
+    let mut work: Vec<BlockId> = f.blocks[home].term.successors(&f.value_pool).collect();
     while let Some(b) = work.pop() {
         if b == home {
             return true;
@@ -1004,7 +1004,7 @@ fn in_cycle(f: &Function, cfg: &Cfg, v: ValueId) -> bool {
         if std::mem::replace(&mut seen[b.index()], true) {
             continue;
         }
-        work.extend(f.blocks[b].term.successors().into_iter().flatten());
+        work.extend(f.blocks[b].term.successors(&f.value_pool));
     }
     false
 }
@@ -1030,7 +1030,7 @@ fn check_loans(f: &Function, cfg: &Cfg, points: &Points, a: &Analysis, safe: &[b
         for i in 0..len {
             facts.cfg_edge.push((points.at(b, i), points.at(b, i + 1)));
         }
-        for s in f.blocks[b].term.successors().into_iter().flatten() {
+        for s in f.blocks[b].term.successors(&f.value_pool) {
             facts.cfg_edge.push((points.term(f, b), points.at(s, 0)));
         }
     }

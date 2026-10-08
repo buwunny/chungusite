@@ -457,3 +457,37 @@ uint64_t local_copy(const uint8_t *src, uint8_t c, uint64_t n, uint64_t m) {
     for (int i = 0; i < 48; i++) s = s * 31 + t[i];
     return s;
 }
+
+/* ---- wide multiplies and 16-byte copies ---- */
+
+// @diff mulhi_u64: u64(u64, u64)
+uint64_t mulhi_u64(uint64_t a, uint64_t b) { return (uint64_t)(((unsigned __int128)a * b) >> 64); }
+
+// @diff mulhi_i64: i64(i64, i64)
+int64_t mulhi_i64(int64_t a, int64_t b) { return (int64_t)(((__int128)a * b) >> 64); }
+
+// @diff mul_overflows: bool(u64, u64)
+_Bool mul_overflows(uint64_t a, uint64_t b) { uint64_t r; return __builtin_mul_overflow(a, b, &r); }
+
+// @diff smul_overflows: bool(i64, i64)
+_Bool smul_overflows(int64_t a, int64_t b) { int64_t r; return __builtin_mul_overflow(a, b, &r); }
+
+// @diff mul32_wide: u64(u32, u32)
+uint64_t mul32_wide(uint32_t a, uint32_t b) { return (uint64_t)a * b; }
+
+// @diff copy16: void(buf:16, buf:16)
+void copy16(uint8_t *d, const uint8_t *s) { memcpy(d, s, 16); }
+
+// @diff zero32: void(buf:32)
+void zero32(uint8_t *d) { memset(d, 0, 32); }
+
+struct pair { uint64_t a, b; };
+
+// @diff swap_pairs: void(buf:32)
+void swap_pairs(uint8_t *p) {
+    struct pair x, y;
+    memcpy(&x, p, 16);
+    memcpy(&y, p + 16, 16);
+    memcpy(p, &y, 16);
+    memcpy(p + 16, &x, 16);
+}

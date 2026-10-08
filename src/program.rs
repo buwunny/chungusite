@@ -18,6 +18,7 @@ use crate::emit::{emit_function_in, CallInfo, EmitStats, Env, Mode};
 use crate::ir::*;
 use crate::lift::Lifter;
 use crate::opt::clean;
+use crate::types::{FnTypes, TypeModel, TypeStats};
 use crate::verify::verify;
 use object::{Object, ObjectKind, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationTarget, SectionKind};
 use rayon::prelude::*;
@@ -61,6 +62,8 @@ pub struct Func {
     /// The IR straight out of the lifter, if `build` was asked to keep it.
     pub raw_ir: Option<String>,
     pub sig: Sig,
+    /// Recovered types (`types.rs`); `None` if it didn't lift.
+    pub types: Option<FnTypes>,
     sites: Vec<Site>,
     targets: Vec<Target>,
     guesses: Vec<u8>,
@@ -78,6 +81,24 @@ pub struct Program {
     pub funcs: Vec<Func>,
     pub externs: Vec<Extern>,
     extern_of: HashMap<String, usize>,
+    /// The types `Func::types` refer to, structs included.
+    pub tys: TyTable,
+    pub type_stats: TypeStats,
+}
+
+/// How `Program::build_with` recovers types.
+#[derive(Copy, Clone)]
+pub struct Options<'a> {
+    /// Use DWARF debug info when the file has it.
+    pub dwarf: bool,
+    /// Proposes argument and return types; the facts accept or reject them.
+    pub model: Option<&'a dyn TypeModel>,
+}
+
+impl Default for Options<'_> {
+    fn default() -> Self {
+        Options { dwarf: true, model: None }
+    }
 }
 
 /// Names for call targets, from the object file.
@@ -179,6 +200,11 @@ impl Program {
     /// Lift, resolve, infer signatures and rewrite every function. `file` is the
     /// whole binary, for relocations and import names (`None` for raw bytes).
     pub fn build(inputs: Vec<Input>, file: Option<&[u8]>, keep_raw_ir: bool) -> Program {
+        Self::build_with(inputs, file, keep_raw_ir, Options::default())
+    }
+
+    /// `build`, choosing where types come from.
+    pub fn build_with(inputs: Vec<Input>, file: Option<&[u8]>, keep_raw_ir: bool, opts: Options) -> Program {
         let syms = file.map(Symbols::parse).unwrap_or_default();
         let by_addr: HashMap<u64, usize> = inputs.iter().enumerate().map(|(i, x)| (x.addr, i)).rev().collect();
         let mut by_name: HashMap<String, usize> = HashMap::new();
@@ -186,32 +212,42 @@ impl Program {
             by_name.entry(x.name.clone()).or_insert(i);
         }
 
-        // 1. Lift and clean.
-        let lifted: Vec<(Result<Function, String>, Option<String>)> = inputs
-            .par_iter()
-            .map_init(
-                || {
-                    let mut l = Lifter::new();
-                    l.track_exits = true;
-                    l
-                },
-                |lifter, x| {
-                let mut f = Function::with_capacity(256, 16);
-                let mut raw = None;
-                let r = lifter
-                    .lift(x.bytes, x.addr, &mut f)
-                    .map_err(|e| describe(&e))
-                    .and_then(|()| verify(&f).map_err(|e| format!("lifted IR failed verification: {e:?}")))
-                    .and_then(|()| {
-                        if keep_raw_ir && x.selected {
-                            raw = Some(crate::dump::dump(&f));
-                        }
-                        clean(&mut f);
-                        verify(&f).map_err(|e| format!("cleaned IR failed verification: {e:?}"))
-                    });
-                (r.map(|()| f), raw)
-            })
-            .collect();
+        // 1. Lift and clean, and meanwhile read the debug info (one thread).
+        let mut tys = TyTable::new();
+        let addrs: std::collections::HashSet<u64> = inputs.iter().map(|x| x.addr).collect();
+        let read_debug = || match (opts.dwarf, file) {
+            (true, Some(d)) => crate::dwarf::read(d, &mut tys, &|a| addrs.contains(&a)),
+            _ => None,
+        };
+        let lift = || -> Vec<(Result<Function, String>, Option<String>)> {
+            inputs
+                .par_iter()
+                .map_init(
+                    || {
+                        let mut l = Lifter::new();
+                        l.track_exits = true;
+                        l
+                    },
+                    |lifter, x| {
+                        let mut f = Function::with_capacity(256, 16);
+                        let mut raw = None;
+                        let r = lifter
+                            .lift(x.bytes, x.addr, &mut f)
+                            .map_err(|e| describe(&e))
+                            .and_then(|()| verify(&f).map_err(|e| format!("lifted IR failed verification: {e:?}")))
+                            .and_then(|()| {
+                                if keep_raw_ir && x.selected {
+                                    raw = Some(crate::dump::dump(&f));
+                                }
+                                clean(&mut f);
+                                verify(&f).map_err(|e| format!("cleaned IR failed verification: {e:?}"))
+                            });
+                        (r.map(|()| f), raw)
+                    },
+                )
+                .collect()
+        };
+        let (lifted, debug) = rayon::join(lift, read_debug);
 
         // 2. Call sites and their targets.
         let resolve = |f: &Function, site: Site| -> Target {
@@ -257,7 +293,19 @@ impl Program {
                     }
                     Err(_) => Default::default(),
                 };
-                Func { name: x.name, ident: x.ident, addr: x.addr, selected: x.selected, ir, raw_ir, sig: Sig::default(), sites, targets, guesses }
+                Func {
+                    name: x.name,
+                    ident: x.ident,
+                    addr: x.addr,
+                    selected: x.selected,
+                    ir,
+                    raw_ir,
+                    sig: Sig::default(),
+                    types: None,
+                    sites,
+                    targets,
+                    guesses,
+                }
             })
             .collect();
 
@@ -335,7 +383,18 @@ impl Program {
             }
         }
 
-        // 5. Extern declarations for what emitted code calls but doesn't define.
+        // 5. Types: from debug info, a model, and how values are used.
+        let type_inputs: Vec<Option<crate::types::Input>> = funcs
+            .iter()
+            .map(|f| f.ir.as_ref().ok().map(|ir| crate::types::Input { f: ir, sig: f.sig, addr: f.addr, name: &f.name }))
+            .collect();
+        let (fn_types, type_stats) = crate::types::recover(&type_inputs, debug.as_ref(), opts.model, &mut tys);
+        drop(type_inputs);
+        for (f, t) in funcs.iter_mut().zip(fn_types) {
+            f.types = t;
+        }
+
+        // 6. Extern declarations for what emitted code calls but doesn't define.
         let mut externs: Vec<Extern> = Vec::new();
         let mut extern_of: HashMap<String, usize> = HashMap::new();
         let mut idents: HashMap<String, usize> = HashMap::new();
@@ -365,7 +424,7 @@ impl Program {
                 externs.push(Extern { name, ident, sig });
             }
         }
-        Program { funcs, externs, extern_of }
+        Program { funcs, externs, extern_of, tys, type_stats }
     }
 
     /// The callee of each call site in function `i`, for the emitter.
@@ -374,13 +433,28 @@ impl Program {
         let k = f.sites.iter().position(|&s| s == site)?;
         let ext = |name: &str| {
             let e = &self.externs[*self.extern_of.get(name)?];
-            Some(CallInfo { path: Some(format!("ffi::{}", e.ident)), ret: e.sig.ret, ret2: e.sig.ret2, foreign: true })
+            Some(CallInfo {
+                path: Some(format!("ffi::{}", e.ident)),
+                ret: e.sig.ret,
+                ret2: e.sig.ret2,
+                foreign: true,
+                args: Vec::new(),
+                ret_ty: None,
+            })
         };
         match &f.targets[k] {
             Target::Func(j) => {
                 let g = &self.funcs[*j];
                 if g.selected && g.ir.is_ok() {
-                    Some(CallInfo { path: Some(g.ident.clone()), ret: g.sig.ret, ret2: g.sig.ret2, foreign: false })
+                    let t = g.types.as_ref();
+                    Some(CallInfo {
+                        path: Some(g.ident.clone()),
+                        ret: g.sig.ret,
+                        ret2: g.sig.ret2,
+                        foreign: false,
+                        args: t.map(|t| t.args.iter().map(|a| a.ty).collect()).unwrap_or_default(),
+                        ret_ty: t.and_then(|t| t.ret),
+                    })
                 } else {
                     ext(&g.name)
                 }
@@ -411,7 +485,8 @@ impl Program {
             .map(|(i, f)| {
                 let ir = f.ir.as_ref().ok().filter(|_| f.selected)?;
                 let call = |s: Site| self.call_info(i, s);
-                let env = Env { sig: Some(f.sig), call: &call, demote: called[i], structure: true, global_of };
+                let types = f.types.as_ref().map(|t| (t, &self.tys));
+                let env = Env { sig: Some(f.sig), call: &call, demote: called[i], structure: true, global_of, types };
                 let mut src = String::new();
                 let stats = emit_function_in(ir, &f.ident, mode, &env, &mut src);
                 Some((src, stats))
@@ -442,12 +517,28 @@ impl Program {
         out
     }
 
-    /// `mod ffi`, declaring every extern the emitted code calls; empty if none.
+    /// The recovered structs the emitted functions use, and `mod ffi`, declaring
+    /// every extern the emitted code calls; empty if neither.
     pub fn prelude(&self) -> String {
-        if self.externs.is_empty() {
-            return String::new();
+        let mut roots = Vec::new();
+        for f in self.funcs.iter().filter(|f| f.selected && f.ir.is_ok()) {
+            let Some(t) = &f.types else { continue };
+            roots.extend(t.args.iter().filter_map(|a| a.ty));
+            roots.extend(t.ret);
+            roots.extend(t.pointee.iter().flatten());
         }
-        let mut s = String::from("\n/// Functions the decompiled code calls but doesn't define.\npub mod ffi {\n");
+        roots.sort_unstable_by_key(|t| t.index());
+        roots.dedup();
+        let structs = crate::types::render_structs(&self.tys, roots);
+        let mut s = String::new();
+        if !structs.is_empty() {
+            s.push('\n');
+            s.push_str(&structs);
+        }
+        if self.externs.is_empty() {
+            return s;
+        }
+        s.push_str("\n/// Functions the decompiled code calls but doesn't define.\npub mod ffi {\n");
         if self.externs.iter().any(|e| e.sig.ret2) {
             s.push_str("    /// A 16-byte result, returned in rax:rdx.\n    #[repr(C)]\n    pub struct Pair(pub u64, pub u64);\n\n");
         }

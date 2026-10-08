@@ -110,17 +110,142 @@ impl TyId {
 }
 
 /// Per-binary type interner, pre-seeded with the `TyId` constants above.
-pub struct TyTable { pub tys: Arena<TyId, Ty> }
+/// Instructions keep the lifter's storage types (`B1`..`B8`, `BOOL`, ...); the
+/// richer types `types.rs` recovers (signed integers, pointers, structs) are
+/// interned here and live in side tables next to the IR (`types::FnTypes`).
+pub struct TyTable {
+    pub tys: Arena<TyId, Ty>,
+    pub structs: Arena<StructId, StructDef>,
+    lookup: std::collections::HashMap<Ty, TyId>,
+    names: std::collections::HashSet<String>,
+}
+
+/// A recovered struct: from debug info, or inferred from the offsets a pointer
+/// is accessed at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructDef {
+    /// Rust identifier, unique in the table.
+    pub name: String,
+    /// Sorted by offset, non-overlapping. Gaps are padding.
+    pub fields: Vec<Field>,
+    pub size: u32,
+    /// `#[repr(C, packed)]`: the layout doesn't follow C alignment rules, or (for
+    /// inferred structs) the real alignment isn't known.
+    pub packed: bool,
+    /// From DWARF rather than inferred.
+    pub debug: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Field {
+    pub name: String,
+    pub off: u32,
+    pub ty: TyId,
+}
 
 impl TyTable {
     pub fn new() -> Self {
-        let mut tys = Arena::with_capacity(256);
-        for t in [
+        let mut t = TyTable { tys: Arena::with_capacity(256), structs: Arena::with_capacity(0), lookup: Default::default(), names: Default::default() };
+        // Struct names that would shadow the prelude, or the types the emitted
+        // file declares itself (`Bytes`/`Words` for statics).
+        for n in [
+            "Option", "Result", "Vec", "String", "Box", "Some", "None", "Ok", "Err", "Copy", "Clone", "Send", "Sync", "Sized",
+            "Unpin", "Drop", "Fn", "FnMut", "FnOnce", "Iterator", "IntoIterator", "DoubleEndedIterator", "ExactSizeIterator",
+            "Extend", "ToString", "ToOwned", "Default", "Eq", "PartialEq", "Ord", "PartialOrd", "AsRef", "AsMut", "Into", "From",
+            "TryFrom", "TryInto", "FromIterator", "Self", "Bytes", "Words",
+        ] {
+            t.names.insert(n.to_string());
+        }
+        for ty in [
             Ty::Unknown { bytes: 1 }, Ty::Unknown { bytes: 2 }, Ty::Unknown { bytes: 4 }, Ty::Unknown { bytes: 8 },
             Ty::Bool, Ty::RawPtr { pointee: TyId::B1, mutbl: Mutbl::Mut }, Ty::Array { elem: TyId::B1, len: 0 },
             Ty::Array { elem: TyId::B8, len: 2 },
-        ] { tys.push(t); }
-        TyTable { tys }
+        ] {
+            let id = t.tys.push(ty);
+            t.lookup.entry(ty).or_insert(id);
+        }
+        t
+    }
+
+    /// The id of `ty`, adding it if it's new.
+    pub fn intern(&mut self, ty: Ty) -> TyId {
+        if let Some(&id) = self.lookup.get(&ty) {
+            return id;
+        }
+        let id = self.tys.push(ty);
+        self.lookup.insert(ty, id);
+        id
+    }
+
+    /// The id of `ty` if it has been interned.
+    pub fn get(&self, ty: &Ty) -> Option<TyId> {
+        self.lookup.get(ty).copied()
+    }
+
+    pub fn int(&mut self, bytes: usize, signed: bool) -> TyId {
+        self.intern(Ty::Int { bits: (bytes * 8) as u8, signed })
+    }
+
+    pub fn ptr(&mut self, pointee: TyId, mutbl: Mutbl) -> TyId {
+        self.intern(Ty::RawPtr { pointee, mutbl })
+    }
+
+    /// A struct name not used yet, from a C or Rust type name: `list_node` is
+    /// `ListNode`, and anything that isn't an identifier character becomes `_`.
+    pub fn fresh_struct_name(&mut self, base: &str) -> String {
+        let mut s = crate::names::sanitize(base);
+        if s.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_') {
+            s = s.split('_').filter(|w| !w.is_empty()).map(|w| w[..1].to_ascii_uppercase() + &w[1..]).collect();
+            if s.is_empty() || s.starts_with(|c: char| c.is_ascii_digit()) {
+                s.insert(0, 'S');
+            }
+        }
+        let mut n = s.clone();
+        let mut k = 1;
+        while !self.names.insert(n.clone()) {
+            k += 1;
+            n = format!("{s}_{k}");
+        }
+        n
+    }
+
+    /// Adds a struct and its `Ty::Struct`.
+    pub fn add_struct(&mut self, def: StructDef) -> (StructId, TyId) {
+        let sid = self.structs.push(def);
+        (sid, self.intern(Ty::Struct(sid)))
+    }
+
+    /// Size in bytes (pointers are 8, `Fn` is a code address).
+    pub fn size_of(&self, ty: TyId) -> u32 {
+        match self.tys[ty] {
+            Ty::Int { bits, .. } => bits as u32 / 8,
+            Ty::Bool => 1,
+            Ty::F32 => 4,
+            Ty::F64 => 8,
+            Ty::Unknown { bytes } => bytes as u32,
+            Ty::RawPtr { .. } | Ty::Ref { .. } | Ty::Fn(_) => 8,
+            Ty::Slice { .. } => 16,
+            Ty::Array { elem, len } => self.size_of(elem).saturating_mul(len),
+            Ty::Struct(s) => self.structs[s].size,
+        }
+    }
+
+    /// C alignment (1 for packed structs).
+    pub fn align_of(&self, ty: TyId) -> u32 {
+        self.align_at(ty, 0)
+    }
+
+    fn align_at(&self, ty: TyId, depth: u32) -> u32 {
+        if depth > 64 {
+            return 1; // a struct that contains itself: bad debug info
+        }
+        match self.tys[ty] {
+            Ty::Array { elem, .. } => self.align_at(elem, depth + 1),
+            Ty::Struct(s) if self.structs[s].packed => 1,
+            Ty::Struct(s) => self.structs[s].fields.iter().map(|f| self.align_at(f.ty, depth + 1)).max().unwrap_or(1),
+            Ty::Slice { .. } => 8,
+            _ => self.size_of(ty).clamp(1, 8),
+        }
     }
 }
 

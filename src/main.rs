@@ -63,6 +63,10 @@ struct Cli {
     #[arg(long)]
     skip_failed: bool,
 
+    /// Ignore DWARF debug info: infer every type from the code.
+    #[arg(long)]
+    no_dwarf: bool,
+
     /// Worker threads (default: one per CPU, or RAYON_NUM_THREADS).
     #[arg(short, long)]
     jobs: Option<usize>,
@@ -178,13 +182,14 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         }
     }
     let file = bin.map(|_| &data[..]);
-    let program = Program::build(inputs, file, cli.emit == Emit::RawIr);
+    let opts = chungusite::program::Options { dwarf: !cli.no_dwarf, model: None };
+    let program = Program::build_with(inputs, file, cli.emit == Emit::RawIr, opts);
     let emitted = if rust { program.emit_all(mode, &global_of) } else { Vec::new() };
 
     let mut out = String::new();
     if rust {
         let _ = writeln!(out, "// Decompiled by chungusite from {source} (--mode {mode_name}).");
-        out.push_str("#![allow(unused_mut, unused_variables, unused_assignments, unreachable_code, non_snake_case, non_upper_case_globals, unused_parens, unused_unsafe, clippy::all)]\n");
+        out.push_str("#![allow(unused_mut, unused_variables, unused_assignments, unreachable_code, non_snake_case, non_upper_case_globals, non_camel_case_types, unused_parens, unused_unsafe, clippy::all)]\n");
         out.push_str(&program.prelude());
     }
     let mut failures: BTreeMap<String, usize> = BTreeMap::new();
@@ -227,7 +232,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 let (body, s) = emitted[i].as_ref().expect("emitted");
                 let _ = write!(out, "\n// {header}");
                 if s.checked + s.raw > 0 {
-                    let _ = write!(out, "; {} of {} memory accesses bounds-checked", s.checked, s.checked + s.raw);
+                    let _ = write!(out, "; {} of {} memory accesses safe", s.checked, s.checked + s.raw);
                 }
                 out.push('\n');
                 out.push_str(body);
@@ -268,7 +273,15 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
 
     eprintln!("chungusite: lifted {ok} of {} functions ({mode_name} mode)", funcs.len());
     if total.checked + total.raw > 0 {
-        eprintln!("  memory accesses: {} bounds-checked, {} raw", total.checked, total.raw);
+        eprintln!("  memory accesses: {} safe (slice bounds-checked or a struct field), {} raw", total.checked, total.raw);
+    }
+    let ts = program.type_stats;
+    if ts.args > 0 || ts.debug_fns > 0 {
+        let from = if ts.debug_fns > 0 { format!(", {} prototypes from debug info", ts.debug_fns) } else { String::new() };
+        eprintln!(
+            "  types: {} of {} arguments typed, {} structs inferred from field accesses{from}",
+            ts.typed_args, ts.args, ts.inferred_structs
+        );
     }
     if !statics.is_empty() {
         let bytes: u64 = statics.iter().map(|i| i.len).sum();

@@ -4,6 +4,12 @@
 //! Pointers are `u64` addresses, so the output always type-checks no matter how a
 //! register is used, and each memory access becomes an explicit read or write.
 //!
+//! With recovered types (`Env::types`, from `types.rs`) integers get their
+//! signedness (`i32` ...), the signature gets real argument and return types
+//! (`n: i32`, `p: *mut Node`, `-> bool`), and a load or store at a known offset
+//! from a pointer to a struct becomes a field access (`(*p).count`). Arguments
+//! are converted to the `u64` registers the body works on in a short prologue.
+//!
 //! * **fast**: every load and store is a raw, unaligned access inside `unsafe { }`,
 //!   and the function is an `unsafe fn` taking every argument as `u64`.
 //! * **safe**: arguments that `borrow::analyze` classifies as `&T` / `&mut T`
@@ -30,6 +36,7 @@ use crate::expr::{self, lit};
 use crate::structure::{print, structure, Node, Source, DISPATCH_VAR};
 use crate::ir::*;
 use crate::sources::bucket;
+use crate::types::{base_of, leaf, render, width, FnTypes};
 use crate::verify::for_each_operand;
 use std::fmt::Write;
 
@@ -41,7 +48,8 @@ pub enum Mode {
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmitStats {
-    /// Loads and stores emitted as bounds-checked slice accesses.
+    /// Loads and stores emitted safely: bounds-checked slice accesses, or fields
+    /// of a `&S` / `&mut S` argument.
     pub checked: usize,
     /// Loads, stores and copies emitted as raw pointer accesses inside `unsafe`,
     /// plus FFI and indirect calls. Zero means the body has no raw pointer.
@@ -71,6 +79,9 @@ const REG: [&str; 16] = [
 enum ArgKind {
     Int,
     Slice { mutbl: bool, nullable: bool },
+    /// `&S` / `&mut S` for a recovered struct `S`: every access through it is a
+    /// field access.
+    Struct { mutbl: bool, nullable: bool, ty: TyId },
 }
 
 /// What a call site calls, as `program.rs` resolved it.
@@ -97,6 +108,11 @@ pub struct CallInfo {
     /// A call to a function's raw twin (fast-mode code): counted as raw, like
     /// an FFI call.
     pub raw: bool,
+    /// Recovered argument types, in signature order (`None`: `u64`). Empty if
+    /// the callee takes every argument as `u64`.
+    pub arg_tys: Vec<Option<TyId>>,
+    /// Recovered return type (`None`: `u64`).
+    pub ret_ty: Option<TyId>,
 }
 
 /// The whole-program context a function is emitted in (`program.rs`).
@@ -120,6 +136,12 @@ pub struct Env<'a> {
     /// Safe mode: the borrow analysis, if the caller ran it with call summaries
     /// (`program.rs`); otherwise it runs here, knowing nothing about calls.
     pub analysis: Option<&'a Analysis>,
+    /// Recovered types (`types.rs`), and the table they refer to. `None` prints
+    /// every integer unsigned and every argument as `u64`.
+    pub types: Option<(&'a FnTypes, &'a TyTable)>,
+    /// Safe mode: struct arguments can be `&S` / `&mut S`. Only for functions
+    /// that decompiled code doesn't call, since callers lend byte slices.
+    pub struct_args: bool,
 }
 
 /// Where safe-mode code indexes a root's bytes.
@@ -161,6 +183,16 @@ struct Emitter<'a> {
     /// Where each value points (`sources.rs`), to count raw accesses by source.
     src: Vec<u8>,
     stats: EmitStats,
+    table: &'a TyTable,
+    types: Option<&'a FnTypes>,
+    /// Rust type of each value.
+    vt: Vec<TyId>,
+    /// The name each entry parameter has in the signature, when it isn't the
+    /// register name (a slice, a reference, a pointer, a name from debug info).
+    bind: Vec<Option<String>>,
+    /// What each block parameter always equals (`types::aliases`).
+    alias: Vec<ValueId>,
+    u64_ty: TyId,
 }
 
 /// Emit `f`, straight from the lifter (no signature), as a Rust function named
@@ -203,7 +235,7 @@ pub fn emit_function_with(
 ) -> EmitStats {
     let _ = name_of;
     let call = |_: Site| None;
-    let env = Env { sig: None, call: &call, demote: false, structure, global_of, global_slice: &|_| None, analysis: None };
+    let env = Env { sig: None, call: &call, demote: false, structure, global_of, global_slice: &|_| None, analysis: None, types: None, struct_args: false };
     emit_function_in(f, name, mode, &env, out)
 }
 
@@ -227,11 +259,39 @@ pub fn emit_function_in(f: &Function, name: &str, mode: Mode, env: &Env, out: &m
             Some(&owned)
         }
     };
-    let args = entry_params
+    let mut own = TyTable::new();
+    let (types, table) = match env.types {
+        Some((t, table)) => (Some(t), table),
+        None => {
+            for b in [1, 2, 4, 8] {
+                own.int(b, false);
+            }
+            (None, &own)
+        }
+    };
+    let int = |w: u8| table.get(&Ty::Int { bits: w * 8, signed: false }).expect("integer types are interned");
+    let vt: Vec<TyId> = match types {
+        Some(t) => t.vals.clone(),
+        None => f.insts.iter().map(|(_, i)| width(i.ty).map_or(i.ty, int)).collect(),
+    };
+    let alias = crate::types::aliases(f);
+
+    let args: Vec<ArgKind> = entry_params
         .iter()
         .enumerate()
-        .map(|(k, _)| match borrow {
-            Some(a) if !env.demote => arg_kind(&a.params[k]),
+        .map(|(k, &p)| match borrow {
+            Some(a) if !env.demote => {
+                let kind = arg_kind(&a.params[k]);
+                let pointee = types.and_then(|t| t.pointee[p.index()]).filter(|_| env.struct_args);
+                match (kind, pointee) {
+                    (ArgKind::Slice { mutbl, nullable }, Some(s))
+                        if matches!(table.tys[s], Ty::Struct(_)) && struct_arg(f, &cfg, a, env.call, &alias, table, k, p, s) =>
+                    {
+                        ArgKind::Struct { mutbl, nullable, ty: s }
+                    }
+                    _ => kind,
+                }
+            }
             _ => ArgKind::Int,
         })
         .collect();
@@ -256,7 +316,14 @@ pub fn emit_function_in(f: &Function, name: &str, mode: Mode, env: &Env, out: &m
         global_of: env.global_of,
         src: crate::sources::sources(f),
         stats: EmitStats::default(),
+        table,
+        types,
+        vt,
+        bind: vec![None; entry_params.len()],
+        alias,
+        u64_ty: int(8),
     };
+    e.bind_names();
 
     e.places = e.places(env.global_slice);
     let mut body = String::new();
@@ -265,6 +332,66 @@ pub fn emit_function_in(f: &Function, name: &str, mode: Mode, env: &Env, out: &m
     out.push_str(&body);
     out.push_str("}\n");
     e.stats
+}
+
+/// Can safe-mode argument `k` (entry parameter `p`) be a `&S` for struct `s`?
+/// Only if its root is safe, every access through it is a field access of `s`
+/// at its own address, and no call borrows it as a slice.
+#[allow(clippy::too_many_arguments)]
+fn struct_arg(
+    f: &Function,
+    cfg: &Cfg,
+    a: &Analysis,
+    call: &dyn Fn(Site) -> Option<CallInfo>,
+    alias: &[ValueId],
+    table: &TyTable,
+    k: usize,
+    p: ValueId,
+    s: TyId,
+) -> bool {
+    let Some(r) = a.roots.iter().position(|&x| x == Root::Param(k as u8)) else { return false };
+    if !a.safe[r] {
+        return false;
+    }
+    let through = |v: ValueId| a.origin[v.index()].roots & (1 << r) != 0;
+    let mut any = false;
+    for &b in &cfg.rpo {
+        for &id in f.blocks[b].insts.get(&f.value_pool) {
+            let (ptr, bytes) = match f.insts[id].kind {
+                InstKind::Load { ptr, .. } => (ptr, width(f.insts[id].ty)),
+                InstKind::Store { ptr, val, .. } => (ptr, width(f.insts[val].ty)),
+                InstKind::MemCopy { dst, src, .. } if through(dst) || through(src) => return false,
+                InstKind::Call { args, .. } => {
+                    let pass = call(Site::Call(id)).map(|c| c.args).unwrap_or_default();
+                    let lent = args.get(&f.value_pool).iter().zip(&pass).any(|(&v, x)| matches!(x, Pass::Borrow { .. }) && through(v));
+                    if lent {
+                        return false;
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            if !through(ptr) {
+                continue;
+            }
+            let (base, d) = base_of(f, alias, ptr);
+            let ok = base == p && bytes.is_some_and(|w| leaf(table, s, d, w as u32).is_some());
+            if !ok {
+                return false;
+            }
+            any = true;
+        }
+    }
+    // a tail call can lend it too
+    for &b in &cfg.rpo {
+        if let Terminator::TailCall { args, .. } = f.blocks[b].term {
+            let pass = call(Site::Tail(b)).map(|c| c.args).unwrap_or_default();
+            if args.get(&f.value_pool).iter().zip(&pass).any(|(&v, x)| matches!(x, Pass::Borrow { .. }) && through(v)) {
+                return false;
+            }
+        }
+    }
+    any
 }
 
 fn arg_kind(p: &ParamBorrow) -> ArgKind {
@@ -478,18 +605,6 @@ fn case_pattern(cases: &[u64]) -> String {
     parts.join(" | ")
 }
 
-fn rty(ty: TyId) -> &'static str {
-    match ty {
-        TyId::B1 => "u8",
-        TyId::B2 => "u16",
-        TyId::B4 => "u32",
-        TyId::BOOL => "bool",
-        TyId::UNIT => "()",
-        TyId::PAIR => "(u64, u64)",
-        _ => "u64", // B8, PTR, and anything richer the IR grows later
-    }
-}
-
 fn bytes(ty: TyId) -> usize {
     match ty {
         TyId::B1 => 1,
@@ -517,7 +632,7 @@ impl Emitter<'_> {
             (Some(_), InstKind::BlockParam(r)) if r >= STACK_ARG_BASE => format!("arg{}", 6 + (r - STACK_ARG_BASE) as usize),
             (Some(_), InstKind::BlockParam(r)) => REG[r as usize & 15].to_string(),
             _ if self.is_lit(v) && ty == TyId::BOOL => (self.konst(v) != Some(0)).to_string(),
-            _ if self.is_lit(v) => format!("{}_{}", lit(self.konst(v).unwrap_or(0)), rty(ty)),
+            _ if self.is_lit(v) => self.lit_as(self.konst(v).unwrap_or(0), self.vt[v.index()]),
             _ => match &self.exprs[v.index()] {
                 Some(e) => e.clone(),
                 None => {
@@ -547,26 +662,185 @@ impl Emitter<'_> {
         }
     }
 
-    /// `v` where its type is already fixed by the other operand: a constant needs
-    /// no suffix there.
-    fn operand(&self, v: ValueId) -> String {
-        match self.konst(v) {
-            Some(c) if self.ty(v) != TyId::BOOL => lit(c),
-            _ => expr::rhs(self.name(v)),
+    /// The width and signedness of integer type `t`.
+    fn int_of(&self, t: TyId) -> Option<(u8, bool)> {
+        match self.table.tys[t] {
+            Ty::Int { bits, signed } => Some((bits, signed)),
+            Ty::Unknown { bytes: b @ (1 | 2 | 4 | 8) } => Some(((b * 8) as u8, false)),
+            _ => None,
         }
+    }
+
+    /// Bits `c` as a literal of integer type `t`, without a suffix: negative
+    /// if `t` is signed and the sign bit is set.
+    fn lit_bits(&self, c: u64, t: TyId) -> String {
+        match self.int_of(t) {
+            Some((bits, true)) => {
+                let bits = bits.clamp(8, 64) as u32;
+                let x = ((c << (64 - bits)) as i64) >> (64 - bits);
+                if x < 0 { format!("-{}", lit(x.unsigned_abs())) } else { lit(x as u64) }
+            }
+            Some((bits, false)) if bits < 64 => lit(c & ((1u64 << bits) - 1)),
+            _ => lit(c),
+        }
+    }
+
+    /// Bits `c` as a literal of type `t`, with its suffix: `5_u32`, `-1_i64`.
+    fn lit_as(&self, c: u64, t: TyId) -> String {
+        format!("{}_{}", self.lit_bits(c, t), self.rs(t))
+    }
+
+    /// Constant `v` as the same bits in integer type `t`, without a suffix
+    /// (`None` if `v` isn't an integer constant): for a place where the other
+    /// operand fixes the type.
+    fn const_in(&self, v: ValueId, t: TyId) -> Option<String> {
+        let c = self.konst(v)?;
+        if self.ty(v) == TyId::BOOL || self.int_of(t).is_none() {
+            return None;
+        }
+        // the bits `conv` would give: widened by `v`'s own signedness
+        let c = match self.int_of(self.vt[v.index()]) {
+            Some((bits, true)) if bits < 64 => (((c << (64 - bits as u32)) as i64) >> (64 - bits as u32)) as u64,
+            _ => c,
+        };
+        Some(self.lit_bits(c, t))
+    }
+
+    /// `v` as type `t`, where the other operand fixes the type: a constant needs
+    /// no suffix there.
+    fn operand_as(&self, v: ValueId, t: TyId) -> String {
+        match self.const_in(v, t) {
+            Some(c) => c,
+            None => expr::rhs(self.val(v, t)),
+        }
+    }
+
+    /// `v` where its type is already fixed by the other operand (`lhs`).
+    fn operand(&self, v: ValueId, lhs: ValueId) -> String {
+        self.operand_as(v, self.vt[lhs.index()])
+    }
+
+    /// `v` converted to type `t` (just `v` if it already is one).
+    fn val(&self, v: ValueId, t: TyId) -> String {
+        self.conv(&self.name(v), self.vt[v.index()], t)
+    }
+
+    /// `v` as a return value or call argument of type `t`. The ABI only defines
+    /// the low byte of a `bool` (`al`), so a wider register is truncated first.
+    fn abi_val(&self, v: ValueId, t: TyId) -> String {
+        if self.table.tys[t] == Ty::Bool && self.ty(v) != TyId::BOOL && bytes(self.ty(v)) > 1 {
+            return self.conv(&format!("{} as u8", expr::cast(self.name(v))), TyId::B1, t);
+        }
+        self.val(v, t)
     }
 
     /// `v as u64`, or just `v` if it already is one.
     fn as_u64(&self, v: ValueId) -> String {
-        if rty(self.ty(v)) == "u64" {
-            self.name(v)
-        } else {
-            format!("{} as u64", expr::cast(self.name(v)))
-        }
+        self.val(v, self.u64_ty)
     }
 
     fn ty(&self, v: ValueId) -> TyId {
         self.f.insts[v].ty
+    }
+
+    /// The Rust spelling of a type (`PAIR` is a tuple, `UNIT` is `()`).
+    fn rs(&self, t: TyId) -> String {
+        match t {
+            TyId::PAIR => "(u64, u64)".into(),
+            TyId::UNIT => "()".into(),
+            TyId::BOOL => "bool".into(),
+            _ => render(self.table, t),
+        }
+    }
+
+    /// Rust type of value `v`.
+    fn rt(&self, v: ValueId) -> String {
+        self.rs(self.vt[v.index()])
+    }
+
+    fn is_signed(&self, v: ValueId) -> bool {
+        matches!(self.table.tys[self.vt[v.index()]], Ty::Int { signed: true, .. })
+    }
+
+    /// `v` as the unsigned integer of its width (just `v` if it is one).
+    fn as_u(&self, v: ValueId) -> String {
+        if self.is_signed(v) { format!("{} as u{}", expr::cast(self.name(v)), bytes(self.ty(v)) * 8) } else { self.name(v) }
+    }
+
+    /// Expression `e` of type `from` as type `to`, with the bits the machine
+    /// code would have: integers widen by their own signedness, so a signed
+    /// value is made unsigned before it is zero-extended.
+    fn conv(&self, e: &str, from: TyId, to: TyId) -> String {
+        if from == to {
+            return e.to_string();
+        }
+        let t = self.table;
+        let to_s = self.rs(to);
+        let c = || expr::cast(e.to_string());
+        match (t.tys[from], t.tys[to]) {
+            (Ty::Bool, _) if self.int_of(to).is_some() => format!("{} as {to_s}", c()),
+            (_, Ty::Bool) => format!("{} != 0", expr::lhs(e.to_string(), "!=")),
+            (Ty::RawPtr { .. }, _) => format!("{} as {to_s}", c()),
+            (_, Ty::RawPtr { .. }) => match self.int_of(from) {
+                Some((bits, true)) if bits < 64 => format!("{} as u{bits} as {to_s}", c()),
+                _ => format!("{} as {to_s}", c()),
+            },
+            (Ty::F32 | Ty::F64, _) => format!("{}.to_bits() as {to_s}", expr::recv(e.to_string())),
+            (_, Ty::F32) => format!("f32::from_bits({} as u32)", c()),
+            (_, Ty::F64) => format!("f64::from_bits({} as u64)", c()),
+            _ => match (self.int_of(from), self.int_of(to)) {
+                (Some((fb, true)), Some((tb, _))) if tb > fb => format!("{} as u{fb} as {to_s}", c()),
+                (Some(_), Some(_)) => format!("{} as {to_s}", c()),
+                // a tuple, `()`: nothing to convert
+                _ => e.to_string(),
+            },
+        }
+    }
+
+    /// An argument of type `t` as the register value the body reads. Callers
+    /// extend 8- and 16-bit arguments to 32 bits by their signedness (gcc and
+    /// clang both do, and clang's code relies on it), so do the same.
+    fn arg_to_reg(&self, b: &str, t: TyId, to: TyId) -> String {
+        match self.table.tys[t] {
+            Ty::Int { bits: 8 | 16, signed } => {
+                let w = self.table.get(&Ty::Int { bits: 32, signed }).expect("integer types are interned");
+                self.conv(&format!("{b} as {}32", if signed { 'i' } else { 'u' }), w, to)
+            }
+            Ty::Bool => self.conv(&format!("{b} as u32"), self.table.get(&Ty::Int { bits: 32, signed: false }).unwrap(), to),
+            _ => self.conv(b, t, to),
+        }
+    }
+
+    /// A zero of type `t`.
+    fn zero(&self, t: TyId) -> String {
+        match self.table.tys[t] {
+            Ty::Bool => "false".into(),
+            Ty::RawPtr { mutbl: Mutbl::Mut, .. } => "core::ptr::null_mut()".into(),
+            Ty::RawPtr { .. } => "core::ptr::null()".into(),
+            _ => format!("0_{}", self.rs(t)),
+        }
+    }
+
+    /// Signature names for the entry parameters that aren't their register.
+    fn bind_names(&mut self) {
+        let params: Vec<ValueId> = self.f.blocks[self.f.entry].params.get(&self.f.value_pool).to_vec();
+        let typed: Vec<(u8, Option<TyId>, Option<String>)> =
+            self.types.map(|t| t.args.iter().map(|a| (a.reg, a.ty, a.name.clone())).collect()).unwrap_or_default();
+        for (k, &p) in params.iter().enumerate() {
+            let reg = match self.f.insts[p].kind {
+                InstKind::BlockParam(r) => r,
+                _ => continue,
+            };
+            let n = self.name(p);
+            let (ty, dname) = typed.iter().find(|a| a.0 == reg).map(|a| (a.1, a.2.clone())).unwrap_or((None, None));
+            self.bind[k] = match self.args[k] {
+                ArgKind::Slice { .. } | ArgKind::Struct { .. } => Some(dname.unwrap_or(format!("{n}_ref"))),
+                ArgKind::Int => match ty.map(|t| self.table.tys[t]) {
+                    Some(Ty::RawPtr { .. }) => Some(dname.unwrap_or(format!("{n}_p"))),
+                    _ => dname,
+                },
+            };
+        }
     }
 
     /// Entry parameters, ordered for the signature: SysV argument registers first,
@@ -584,24 +858,31 @@ impl Emitter<'_> {
     }
 
     /// Entry parameter indices in signature order, with `None` for an argument the
-    /// function takes but never uses.
-    fn arg_order(&self) -> Vec<(Option<usize>, String)> {
+    /// function takes but never uses (and the name to give it), and the
+    /// argument's recovered type.
+    fn arg_order(&self) -> Vec<(Option<usize>, String, Option<TyId>)> {
         let params = self.f.blocks[self.f.entry].params.get(&self.f.value_pool);
         let Some(sig) = self.sig else {
-            return self.sig_order().into_iter().map(|k| (Some(k), String::new())).collect();
+            return self.sig_order().into_iter().map(|k| (Some(k), String::new(), None)).collect();
         };
         let find = |reg: u8| params.iter().position(|&p| matches!(self.f.insts[p].kind, InstKind::BlockParam(r) if r == reg));
+        let typed = |reg: u8| self.types.and_then(|t| t.args.iter().find(|a| a.reg == reg));
+        let unused = |reg: u8, fallback: String| match typed(reg).and_then(|a| a.name.as_ref()) {
+            Some(n) => format!("_{n}"),
+            None => fallback,
+        };
         let mut order = Vec::new();
-        for (k, &reg) in SYSV_ARGS[..sig.args as usize].iter().enumerate() {
-            order.push((find(reg), format!("_{}", REG[SYSV_ARGS[k] as usize])));
+        for &reg in &SYSV_ARGS[..sig.args as usize] {
+            order.push((find(reg), unused(reg, format!("_{}", REG[reg as usize])), typed(reg).and_then(|a| a.ty)));
         }
         for j in 0..sig.stack_args {
-            order.push((find(STACK_ARG_BASE + j), format!("_arg{}", 6 + j as usize)));
+            let reg = STACK_ARG_BASE + j;
+            order.push((find(reg), unused(reg, format!("_arg{}", 6 + j as usize)), typed(reg).and_then(|a| a.ty)));
         }
         // anything else on entry (there shouldn't be anything after `abi::apply`)
         for k in 0..params.len() {
-            if !order.iter().any(|&(x, _)| x == Some(k)) {
-                order.push((Some(k), String::new()));
+            if !order.iter().any(|&(x, _, _)| x == Some(k)) {
+                order.push((Some(k), String::new(), None));
             }
         }
         order
@@ -612,32 +893,64 @@ impl Emitter<'_> {
         let unsafety = if self.stats.raw > 0 { "unsafe " } else { "" };
         let mut sig = Vec::new();
         let mut prologue = String::new();
-        for (k, unused) in self.arg_order() {
+        for (k, unused, ty) in self.arg_order() {
             let Some(k) = k else {
-                sig.push(format!("{unused}: u64"));
+                sig.push(format!("{unused}: {}", ty.map_or("u64".to_string(), |t| self.rs(t))));
                 continue;
             };
-            let n = self.name(params[k]);
+            let p = params[k];
+            let n = self.name(p);
+            let pt = self.rt(p);
+            let bind = self.bind[k].clone();
             match self.args[k] {
-                ArgKind::Int => sig.push(format!("mut {n}: u64")),
+                ArgKind::Int => match (ty, bind) {
+                    (None, None) => sig.push(format!("mut {n}: {pt}")),
+                    (Some(t), b) => {
+                        let b = b.unwrap_or_else(|| n.clone());
+                        sig.push(format!("{b}: {}", self.rs(t)));
+                        let _ = writeln!(prologue, "    let mut {n}: {pt} = {};", self.arg_to_reg(&b, t, self.vt[p.index()]));
+                    }
+                    (None, Some(b)) => {
+                        sig.push(format!("{b}: {pt}"));
+                        let _ = writeln!(prologue, "    let mut {n}: {pt} = {b};");
+                    }
+                },
                 ArgKind::Slice { mutbl, nullable } => {
+                    let b = bind.unwrap_or_else(|| format!("{n}_ref"));
                     let r = if mutbl { "&mut [u8]" } else { "&[u8]" };
                     let (m, t) = if nullable { (if mutbl { "mut " } else { "" }, format!("Option<{r}>")) } else { ("", r.to_string()) };
-                    sig.push(format!("{m}{n}_ref: {t}"));
+                    sig.push(format!("{m}{b}: {t}"));
                     let addr = if nullable {
-                        format!("{n}_ref.as_deref().map_or(0, |s| s.as_ptr() as u64)")
+                        format!("{b}.as_deref().map_or(0, |s| s.as_ptr() as u64)")
                     } else {
-                        format!("{n}_ref.as_ptr() as u64")
+                        format!("{b}.as_ptr() as u64")
                     };
                     let _ = writeln!(prologue, "    let {n}_base: u64 = {addr};");
-                    let _ = writeln!(prologue, "    let mut {n}: u64 = {n}_base;");
+                    let _ = writeln!(prologue, "    let mut {n}: {pt} = {};", self.conv(&format!("{n}_base"), self.u64_ty, self.vt[p.index()]));
+                }
+                ArgKind::Struct { mutbl, nullable, ty: st } => {
+                    let b = bind.unwrap_or_else(|| format!("{n}_ref"));
+                    let sn = self.rs(st);
+                    let r = if mutbl { format!("&mut {sn}") } else { format!("&{sn}") };
+                    let (m, t) = if nullable { (if mutbl { "mut " } else { "" }, format!("Option<{r}>")) } else { ("", r) };
+                    sig.push(format!("{m}{b}: {t}"));
+                    let addr = if nullable {
+                        format!("{b}.as_deref().map_or(0, |s| s as *const {sn} as u64)")
+                    } else {
+                        format!("&*{b} as *const {sn} as u64")
+                    };
+                    let _ = writeln!(prologue, "    let {n}_base: u64 = {addr};");
+                    let _ = writeln!(prologue, "    let mut {n}: {pt} = {};", self.conv(&format!("{n}_base"), self.u64_ty, self.vt[p.index()]));
                 }
             }
         }
         let ret = match self.sig {
-            Some(s) if s.ret2 => " -> (u64, u64)",
-            Some(s) if !s.ret => "",
-            _ => " -> u64",
+            Some(s) if s.ret2 => " -> (u64, u64)".to_string(),
+            Some(s) if !s.ret => String::new(),
+            _ => match self.types.and_then(|t| t.ret) {
+                Some(t) => format!(" -> {}", self.rs(t)),
+                None => " -> u64".to_string(),
+            },
         };
         let _ = writeln!(out, "pub {unsafety}fn {name}({}){ret} {{", sig.join(", "));
         out.push_str(&prologue);
@@ -682,7 +995,7 @@ impl Emitter<'_> {
                         TyId::PAIR => "(0, 0)",
                         _ => "0",
                     };
-                    let _ = writeln!(out, "    let mut {}: {} = {zero};", self.name(v), rty(self.ty(v)));
+                    let _ = writeln!(out, "    let mut {}: {} = {zero};", self.name(v), self.rt(v));
                 }
             }
         }
@@ -736,15 +1049,16 @@ impl Emitter<'_> {
             let n = self.name(id);
             match self.inst(id) {
                 Stmt::Value(e) if self.hoisted[id.index()] => out.push(format!("{n} = {e}; // {at:#x}")),
-                Stmt::Value(e) => out.push(format!("let {n}: {} = {e}; // {at:#x}", rty(self.ty(id)))),
+                Stmt::Value(e) => out.push(format!("let {n}: {} = {e}; // {at:#x}", self.rt(id))),
                 Stmt::Effect(e) => out.push(format!("{e}; // {at:#x}")),
                 Stmt::Pair(e) => {
                     // rax:rdx; the rdx half is a `CallOut` reading `vN_pair.1`
                     out.push(format!("let {n}_pair: (u64, u64) = {e}; // {at:#x}"));
+                    let first = self.conv(&format!("{n}_pair.0"), self.u64_ty, self.vt[id.index()]);
                     if self.hoisted[id.index()] {
-                        out.push(format!("{n} = {n}_pair.0;"));
+                        out.push(format!("{n} = {first};"));
                     } else {
-                        out.push(format!("let {n}: u64 = {n}_pair.0;"));
+                        out.push(format!("let {n}: {} = {first};", self.rt(id)));
                     }
                 }
             }
@@ -752,21 +1066,29 @@ impl Emitter<'_> {
         out
     }
 
+    /// The function's return type (`u64` unless types say otherwise).
+    fn ret_ty(&self) -> TyId {
+        self.types.and_then(|t| t.ret).unwrap_or(self.u64_ty)
+    }
+
     /// A terminator that leaves the function (or can't be expressed yet).
     fn exit_line(&mut self, b: BlockId) -> String {
         let t = self.f.blocks[b].term;
         match t {
             Terminator::Return(Some(v)) if self.ty(v) == TyId::PAIR => format!("return {};", self.name(v)),
-            Terminator::Return(Some(v)) => format!("return {};", self.as_u64(v)),
+            Terminator::Return(Some(v)) => format!("return {};", self.abi_val(v, self.ret_ty())),
             Terminator::Return(None) if self.sig.is_some_and(|s| !s.ret) => "return;".to_string(),
-            Terminator::Return(None) => "return 0;".to_string(),
+            Terminator::Return(None) if self.types.is_none() => "return 0;".to_string(),
+            Terminator::Return(None) => format!("return {};", self.zero(self.ret_ty())),
             Terminator::TailCall { callee, args } => {
-                let (call, ret, ret2) = self.call_expr(Site::Tail(b), callee, args);
+                let (call, ret, ret2, rty) = self.call_expr(Site::Tail(b), callee, args);
                 let me2 = self.sig.is_some_and(|s| s.ret2);
                 match (self.sig.is_none_or(|s| s.ret), ret) {
-                    (true, true) if ret2 && !me2 => format!("return {call}.0;"),
-                    (true, true) => format!("return {call};"),
-                    (true, false) => format!("{call}; return 0;"),
+                    (true, true) if ret2 && !me2 => format!("return {};", self.conv(&format!("{call}.0"), self.u64_ty, self.ret_ty())),
+                    (true, true) if ret2 => format!("return {call};"),
+                    (true, true) => format!("return {};", self.conv(&call, rty, self.ret_ty())),
+                    (true, false) if self.types.is_none() => format!("{call}; return 0;"),
+                    (true, false) => format!("{call}; return {};", self.zero(self.ret_ty())),
                     (false, _) => format!("{call}; return;"),
                 }
             }
@@ -797,7 +1119,7 @@ impl Emitter<'_> {
             }
             Terminator::Switch { v, table, default } => {
                 let cases = table.get(&f.value_pool);
-                let _ = writeln!(out, "{ind}bb = match {} {{", self.name(v));
+                let _ = writeln!(out, "{ind}bb = match {} {{", self.as_u(v));
                 for t in f.blocks[b].term.successors(&f.value_pool).skip(1) {
                     let ks: Vec<u64> =
                         (0..cases.len() as u64).filter(|&k| BlockId::from_value(cases[k as usize]) == t).collect();
@@ -819,18 +1141,12 @@ impl Emitter<'_> {
             .iter()
             .zip(args)
             .map(|(&p, &a)| {
-                let (pt, at) = (rty(self.ty(p)), rty(self.ty(a)));
+                let (pt, at) = (self.vt[p.index()], self.vt[a.index()]);
                 // the lifter can pass a wider register than the parameter holds
-                let int = |t: &str| t.starts_with('u');
                 let v = match self.konst(a) {
                     _ if pt == at => self.name(a),
-                    Some(c) if int(pt) && at != "bool" => {
-                        let bits = bytes(self.ty(p)) * 8;
-                        format!("{}_{pt}", lit(if bits >= 64 { c } else { c & ((1 << bits) - 1) }))
-                    }
-                    _ if pt == "bool" && int(at) => format!("{} != 0", expr::lhs(self.name(a), "!=")),
-                    _ if int(pt) && (int(at) || at == "bool") => format!("{} as {pt}", expr::cast(self.name(a))),
-                    _ => self.name(a),
+                    Some(c) if self.int_of(pt).is_some() && at != TyId::BOOL => self.lit_as(c, pt),
+                    _ => self.val(a, pt),
                 };
                 (self.name(p), v)
             })
@@ -858,46 +1174,43 @@ impl Emitter<'_> {
         use InstKind::*;
         let f = self.f;
         let ty = self.ty(id);
-        let t = rty(ty);
+        let vt = self.vt[id.index()];
+        let t = self.rt(id);
         let n = |v: ValueId| self.name(v);
         let e = match f.insts[id].kind {
-            Const(c) => {
-                let v = f.consts[c.index()];
-                match ty {
-                    TyId::BOOL => (v != 0).to_string(),
-                    _ => {
-                        let mask = if bytes(ty) >= 8 { u64::MAX as u128 } else { (1u128 << (bytes(ty) * 8)) - 1 };
-                        format!("{:#x}_{t}", v & mask)
-                    }
-                }
-            }
+            Const(c) => match ty {
+                TyId::BOOL => (f.consts[c.index()] != 0).to_string(),
+                _ => self.lit_as(self.konst(id).unwrap_or(0), vt),
+            },
             Undef if ty == TyId::BOOL => "false".to_string(),
             CallOut { call, reg: crate::abi::RDX } if matches!(f.insts[call].kind, Call { .. }) && self.ret2(call) => {
-                format!("{}_pair.1", n(call))
+                self.conv(&format!("{}_pair.1", n(call)), self.u64_ty, vt)
             }
             Undef | CallOut { .. } => format!("0_{t}"),
             Aggregate { ty: TyId::PAIR, fields } => {
                 let v = fields.get(&f.value_pool);
                 format!("({}, {})", self.as_u64(v[0]), self.as_u64(v[1]))
             }
-            AddrOfLocal(_) if self.frame_safe() => "frame_base".to_string(),
-            AddrOfLocal(_) => "frame.as_mut_ptr() as u64".to_string(),
+            AddrOfLocal(_) if self.frame_safe() => self.conv("frame_base", self.u64_ty, vt),
+            AddrOfLocal(_) => self.conv("frame.as_mut_ptr() as u64", self.u64_ty, vt),
             Call { args, .. } if self.boxed_alloc(id).is_some() => {
                 // `malloc` of an allocation that is used, then freed or dropped, like a Box
                 let h = self.boxed_alloc(id).unwrap();
                 let (a, b) = (self.call)(Site::Call(id)).and_then(|c| c.alloc).unwrap_or((0, None));
                 let args = args.get(&f.value_pool);
-                let mut len = format!("({} as usize)", n(args[a as usize]));
+                let size = |v: ValueId| format!("{} as usize", expr::cast(self.as_u(v)));
+                let mut len = format!("({})", size(args[a as usize]));
                 if let Some(b) = b {
-                    len = format!("{len}.wrapping_mul({} as usize)", n(args[b as usize]));
+                    len = format!("{len}.wrapping_mul({})", size(args[b as usize]));
                 }
-                format!("{{ {h} = vec![0u8; {len}].into_boxed_slice(); {h}_base = {h}.as_ptr() as u64; {h}_base }}")
+                let e = format!("{{ {h} = vec![0u8; {len}].into_boxed_slice(); {h}_base = {h}.as_ptr() as u64; {h}_base }}");
+                self.conv(&e, self.u64_ty, vt)
             }
             Call { args, .. } if self.builtin(id).is_some() => {
                 let (b, ps) = self.builtin(id).unwrap();
                 let a = args.get(&f.value_pool);
-                let off = |k: usize| format!("{}.wrapping_sub({}) as usize", n(a[k]), ps[k].base);
-                let len = format!("{} as usize", n(a[2]));
+                let off = |k: usize| format!("{}.wrapping_sub({}) as usize", expr::recv(self.as_u64(a[k])), ps[k].base);
+                let len = format!("{} as usize", expr::cast(self.as_u(a[2])));
                 let dst = ps[0].write.clone().unwrap();
                 let e = match b {
                     crate::libc::Builtin::Fill => format!("{dst}[{}..][..{len}].fill({} as u8)", off(0), n(a[1])),
@@ -911,67 +1224,73 @@ impl Emitter<'_> {
                 if !self.used[id.index()] {
                     return Stmt::Effect(format!("{{ {e}; }}"));
                 }
-                format!("{{ {e}; {} }}", n(a[0]))
+                format!("{{ {e}; {} }}", self.val(a[0], vt))
             }
             Call { args, .. } if self.boxed_free(id).is_some() => {
                 let _ = args;
                 return Stmt::Effect(format!("{} = Box::default()", self.boxed_free(id).unwrap()));
             }
             Call { callee, args } => {
-                let (call, ret, ret2) = self.call_expr(Site::Call(id), callee, args);
+                let (call, ret, ret2, rty) = self.call_expr(Site::Call(id), callee, args);
                 if ret2 {
                     return Stmt::Pair(call);
                 }
                 if !ret || !self.used[id.index()] {
                     return Stmt::Effect(call);
                 }
-                call
+                self.conv(&call, rty, vt)
             }
             Param(i) => format!("todo!(\"param {i}\")"),
             BlockParam(_) => n(id),
-            Bin { op, lhs, rhs } => self.bin(op, lhs, rhs),
+            Bin { op, lhs, rhs } => self.bin(id, op, lhs, rhs),
             Un { op, v } => {
                 let r = expr::recv(n(v));
+                // in the result's own type
+                let same = expr::recv(self.val(v, vt));
                 match op {
-                    UnOp::Neg => format!("{r}.wrapping_neg()"),
-                    UnOp::Not => format!("!{}", expr::unary(n(v))),
-                    UnOp::Bswap => format!("{r}.swap_bytes()"),
+                    UnOp::Neg => format!("{same}.wrapping_neg()"),
+                    UnOp::Not => format!("!{}", expr::unary(self.val(v, vt))),
+                    UnOp::Bswap => format!("{same}.swap_bytes()"),
                     UnOp::Popcnt => format!("{r}.count_ones() as {t}"),
                     UnOp::Ctz => format!("{r}.trailing_zeros() as {t}"),
                     UnOp::Clz => format!("{r}.leading_zeros() as {t}"),
                 }
             }
             Cmp { cc, lhs, rhs } => self.cmp(cc, lhs, rhs),
-            Cast { kind, v } => self.cast(kind, v, ty),
-            Select { c, t: a, f: b } => format!("if {} {{ {} }} else {{ {} }}", n(c), n(a), n(b)),
+            Cast { kind, v } => self.cast(kind, v, id),
+            Select { c, t: a, f: b } => format!("if {} {{ {} }} else {{ {} }}", n(c), self.val(a, vt), self.val(b, vt)),
             PtrOffset { base, index, scale, disp } => {
-                let mut s = expr::recv(n(base));
+                let mut s = expr::recv(self.as_u64(base));
                 if let Some(i) = index {
                     s = if scale == 1 {
-                        format!("{s}.wrapping_add({})", n(i))
+                        format!("{s}.wrapping_add({})", self.as_u64(i))
                     } else {
-                        format!("{s}.wrapping_add({}.wrapping_mul({scale}))", expr::recv(n(i)))
+                        format!("{s}.wrapping_add({}.wrapping_mul({scale}))", expr::recv(self.as_u64(i)))
                     };
                 }
-                match disp {
+                let s = match disp {
                     0 => s,
                     d if d < 0 => format!("{s}.wrapping_sub({})", lit((d as i64).unsigned_abs())),
                     d => format!("{s}.wrapping_add({})", lit(d as u64)),
-                }
+                };
+                self.conv(&s, self.u64_ty, vt)
             }
             IntToPtr(v) => match f.insts[v].kind {
-                Const(c) => (self.global_of)(f.consts[c.index()] as u64).unwrap_or_else(|| n(v)),
-                _ => n(v),
+                Const(c) => match (self.global_of)(f.consts[c.index()] as u64) {
+                    Some(g) => self.conv(&g, self.u64_ty, vt),
+                    None => self.val(v, vt),
+                },
+                _ => self.val(v, vt),
             },
-            PtrToInt(v) => n(v),
-            Load { ptr, .. } => self.load(ptr, ty),
+            PtrToInt(v) => self.val(v, vt),
+            Load { ptr, .. } => self.load(id, ptr),
             Store { ptr, val, .. } => return Stmt::Effect(self.store(ptr, val)),
             MemCopy { dst, src, len } => {
                 let s = format!(
                     "unsafe {{ core::ptr::copy({} as *const u8, {} as *mut u8, {} as usize) }}",
-                    expr::cast(n(src)),
-                    expr::cast(n(dst)),
-                    expr::cast(n(len))
+                    expr::cast(self.as_u(src)),
+                    expr::cast(self.as_u(dst)),
+                    expr::cast(self.as_u(len))
                 );
                 self.stats.raw += 1;
                 self.stats.raw_by[bucket(self.src[dst.index()] | self.src[src.index()])] += 1;
@@ -994,18 +1313,27 @@ impl Emitter<'_> {
         (self.call)(Site::Call(call)).is_some_and(|c| c.ret2)
     }
 
-    /// A call to the callee at `site`, and whether it returns a value (`ret`), and
-    /// two (`ret2`, as a `(u64, u64)`).
-    fn call_expr(&mut self, site: Site, callee: ValueId, args: ListRef) -> (String, bool, bool) {
+    /// The arguments of a call as the callee takes them: converted to its
+    /// recovered argument types, or `u64`.
+    fn typed_args(&self, args: &[ValueId], info: Option<&CallInfo>) -> Vec<String> {
+        let want = |k: usize| info.and_then(|c| c.arg_tys.get(k).copied().flatten()).unwrap_or(self.u64_ty);
+        args.iter().enumerate().map(|(k, &v)| self.abi_val(v, want(k))).collect()
+    }
+
+    /// A call to the callee at `site`, whether it returns a value (`ret`) and two
+    /// (`ret2`, as a `(u64, u64)`), and the Rust type of the value it returns.
+    fn call_expr(&mut self, site: Site, callee: ValueId, args: ListRef) -> (String, bool, bool, TyId) {
         let args = args.get(&self.f.value_pool);
         // Straight from the lifter, a call lists all six argument registers and more.
         let args = if self.sig.is_none() { &args[..args.len().min(6)] } else { args };
-        let a: Vec<String> = args.iter().map(|&v| self.as_u64(v)).collect();
-        let a = a.join(", ");
-        match (self.call)(site) {
+        let info = (self.call)(site);
+        let typed = self.typed_args(args, info.as_ref());
+        let a = typed.join(", ");
+        let rty = info.as_ref().and_then(|c| c.ret_ty).unwrap_or(self.u64_ty);
+        match info {
             Some(CallInfo { path: Some(p), ret, ret2, foreign: false, args: pass, .. }) if pass.iter().any(|x| matches!(x, Pass::Borrow { .. })) => {
-                let (lets, a) = self.call_args(args, &pass);
-                (format!("unsafe {{ {lets}{p}({}) }}", a.join(", ")), ret, ret2)
+                let (lets, a) = self.call_args(args, &pass, typed);
+                (format!("unsafe {{ {lets}{p}({}) }}", a.join(", ")), ret, ret2, rty)
             }
             Some(CallInfo { path: Some(p), ret, ret2, foreign, raw, .. }) => {
                 if foreign || raw {
@@ -1013,42 +1341,63 @@ impl Emitter<'_> {
                 }
                 if ret2 && foreign {
                     // an extern returns `ffi::Pair`, which is FFI-safe; a tuple isn't
-                    return (format!("unsafe {{ let p = {p}({a}); (p.0, p.1) }}"), ret, ret2);
+                    return (format!("unsafe {{ let pair_ = {p}({a}); (pair_.0, pair_.1) }}"), ret, ret2, rty);
                 }
-                (format!("unsafe {{ {p}({a}) }}"), ret, ret2)
+                (format!("unsafe {{ {p}({a}) }}"), ret, ret2, rty)
             }
             _ => {
                 self.stats.raw += 1;
                 let tys = vec!["u64"; args.len()].join(", ");
-                let callee = self.name(callee);
-                (format!("unsafe {{ core::mem::transmute::<u64, unsafe extern \"C\" fn({tys}) -> u64>({callee})({a}) }}"), true, false)
+                let callee = self.as_u64(callee);
+                (
+                    format!("unsafe {{ core::mem::transmute::<u64, unsafe extern \"C\" fn({tys}) -> u64>({callee})({a}) }}"),
+                    true,
+                    false,
+                    self.u64_ty,
+                )
             }
         }
     }
 
-    fn bin(&self, op: BinOp, lhs: ValueId, rhs: ValueId) -> String {
+    fn bin(&self, id: ValueId, op: BinOp, lhs: ValueId, rhs: ValueId) -> String {
         let ty = self.ty(lhs);
-        let t = rty(ty);
-        let infix = |o: &str| format!("{} {o} {}", expr::lhs(self.name(lhs), o), self.operand(rhs));
         if ty == TyId::BOOL {
-            return infix(match op {
+            let o = match op {
                 BinOp::And => "&",
                 BinOp::Or => "|",
                 _ => "^",
-            });
+            };
+            return format!("{} {o} {}", expr::lhs(self.name(lhs), o), self.operand(rhs, lhs));
         }
-        let a = expr::recv(self.name(lhs));
+        let vt = self.vt[id.index()];
+        let t = self.rt(id);
+        let res_signed = self.is_signed(id);
+        // the operands in the result's own type
+        let a = expr::recv(self.val(lhs, vt));
         // the right operand: its type is fixed by the method, so a literal needs no suffix
-        let b = match self.konst(rhs) {
-            Some(c) => lit(c),
-            None => self.name(rhs),
+        let b = self.const_in(rhs, vt).unwrap_or_else(|| self.val(rhs, vt));
+        let infix = |o: &str| format!("{} {o} {}", expr::lhs(self.val(lhs, vt), o), self.operand_as(rhs, vt));
+        // computed unsigned, then as the result's type
+        let unsigned = |e: String| if res_signed { format!("{} as {t}", expr::cast(e)) } else { e };
+        let uinfix = |o: &str| {
+            let r = match self.konst(rhs) {
+                Some(c) => lit(c),
+                None => expr::rhs(self.as_u(rhs)),
+            };
+            unsigned(format!("{} {o} {r}", expr::lhs(self.as_u(lhs), o)))
         };
+        // computed signed, then as the result's type
+        let sa = if self.is_signed(lhs) { expr::recv(self.name(lhs)) } else { format!("({})", self.signed(lhs)) };
+        let signed = |e: String| if res_signed { e } else { format!("{e} as {t}") };
         // a shift or rotate amount, as the u32 the method takes
         let amount = match self.konst(rhs) {
             Some(c) => lit(c & 0xff),
             None => format!("{} as u32", expr::cast(self.name(rhs))),
         };
-        let neg = self.konst(rhs).map(|c| c.wrapping_neg() & if bytes(ty) >= 8 { u64::MAX } else { (1 << (bytes(ty) * 8)) - 1 });
+        let neg = self
+            .konst(rhs)
+            .filter(|_| !res_signed)
+            .map(|c| c.wrapping_neg() & if bytes(ty) >= 8 { u64::MAX } else { (1 << (bytes(ty) * 8)) - 1 });
         match op {
             // `x - 8` reads better than `x + 0xfffffffffffffff8`
             BinOp::Add if neg.is_some_and(|m| m < 0x10000) => format!("{a}.wrapping_sub({})", lit(neg.unwrap())),
@@ -1056,20 +1405,22 @@ impl Emitter<'_> {
             BinOp::Add => format!("{a}.wrapping_add({b})"),
             BinOp::Sub => format!("{a}.wrapping_sub({b})"),
             BinOp::Mul => format!("{a}.wrapping_mul({b})"),
-            BinOp::UMulHi => {
-                format!("(({} as u128 * {} as u128) >> 64) as {t}", expr::cast(self.name(lhs)), expr::cast(self.name(rhs)))
-            }
+            BinOp::UMulHi => format!(
+                "(({} as u128 * {} as u128) >> 64) as {t}",
+                expr::cast(self.as_u(lhs)),
+                expr::cast(self.as_u(rhs))
+            ),
             BinOp::SMulHi => format!("(({} as i128 * {} as i128) >> 64) as {t}", self.signed(lhs), self.signed(rhs)),
-            BinOp::UDiv => infix("/"),
-            BinOp::URem => infix("%"),
-            BinOp::SDiv => format!("({}).wrapping_div({}) as {t}", self.signed(lhs), self.signed(rhs)),
-            BinOp::SRem => format!("({}).wrapping_rem({}) as {t}", self.signed(lhs), self.signed(rhs)),
+            BinOp::UDiv => uinfix("/"),
+            BinOp::URem => uinfix("%"),
+            BinOp::SDiv => signed(format!("{sa}.wrapping_div({})", self.signed(rhs))),
+            BinOp::SRem => signed(format!("{sa}.wrapping_rem({})", self.signed(rhs))),
             BinOp::And => infix("&"),
             BinOp::Or => infix("|"),
             BinOp::Xor => infix("^"),
             BinOp::Shl => format!("{a}.wrapping_shl({amount})"),
-            BinOp::LShr => format!("{a}.wrapping_shr({amount})"),
-            BinOp::AShr => format!("({}).wrapping_shr({amount}) as {t}", self.signed(lhs)),
+            BinOp::LShr => unsigned(format!("{}.wrapping_shr({amount})", expr::recv(self.as_u(lhs)))),
+            BinOp::AShr => signed(format!("{sa}.wrapping_shr({amount})")),
             BinOp::RotL => format!("{a}.rotate_left({amount})"),
             BinOp::RotR => format!("{a}.rotate_right({amount})"),
         }
@@ -1090,14 +1441,15 @@ impl Emitter<'_> {
                     Root::Param(k) => {
                         let ArgKind::Slice { mutbl, nullable } = self.args[k as usize] else { return None };
                         let n = self.name(params[k as usize]);
+                        let b = self.bind[k as usize].clone().unwrap_or_else(|| format!("{n}_ref"));
                         let read = match (nullable, mutbl) {
-                            (false, _) => format!("{n}_ref"),
-                            (true, false) => format!("{n}_ref.unwrap()"),
-                            (true, true) => format!("{n}_ref.as_deref().unwrap()"),
+                            (false, _) => b.clone(),
+                            (true, false) => format!("{b}.unwrap()"),
+                            (true, true) => format!("{b}.as_deref().unwrap()"),
                         };
                         let write = match nullable {
-                            false => format!("{n}_ref"),
-                            true => format!("{n}_ref.as_deref_mut().unwrap()"),
+                            false => b.clone(),
+                            true => format!("{b}.as_deref_mut().unwrap()"),
                         };
                         Place { read, write: mutbl.then_some(write), base: format!("{n}_base") }
                     }
@@ -1118,21 +1470,30 @@ impl Emitter<'_> {
     fn cmp(&self, cc: Cond, lhs: ValueId, rhs: ValueId) -> String {
         let ty = self.ty(lhs);
         let (op, sign) = match cc {
-            Cond::Eq => ("==", false),
-            Cond::Ne => ("!=", false),
-            Cond::Ult => ("<", false),
-            Cond::Ule => ("<=", false),
-            Cond::Ugt => (">", false),
-            Cond::Uge => (">=", false),
-            Cond::Slt => ("<", true),
-            Cond::Sle => ("<=", true),
-            Cond::Sgt => (">", true),
-            Cond::Sge => (">=", true),
+            Cond::Eq => ("==", None),
+            Cond::Ne => ("!=", None),
+            Cond::Ult => ("<", Some(false)),
+            Cond::Ule => ("<=", Some(false)),
+            Cond::Ugt => (">", Some(false)),
+            Cond::Uge => (">=", Some(false)),
+            Cond::Slt => ("<", Some(true)),
+            Cond::Sle => ("<=", Some(true)),
+            Cond::Sgt => (">", Some(true)),
+            Cond::Sge => (">=", Some(true)),
         };
-        if !sign || ty == TyId::BOOL {
-            return format!("{} {op} {}", expr::lhs(self.name(lhs), op), self.operand(rhs));
+        match sign {
+            _ if ty == TyId::BOOL => return format!("{} {op} {}", expr::lhs(self.name(lhs), op), self.operand(rhs, lhs)),
+            None => return format!("{} {op} {}", expr::lhs(self.name(lhs), op), self.operand(rhs, lhs)),
+            Some(false) => {
+                let b = match self.konst(rhs) {
+                    Some(c) => lit(c),
+                    None => expr::rhs(self.as_u(rhs)),
+                };
+                return format!("{} {op} {b}", expr::lhs(self.as_u(lhs), op));
+            }
+            Some(true) => {}
         }
-        let a = format!("({})", self.signed(lhs));
+        let a = if self.is_signed(lhs) { expr::lhs(self.name(lhs), op) } else { format!("({})", self.signed(lhs)) };
         let b = match self.konst(rhs) {
             // the constant as the signed number it is compared as
             Some(c) => {
@@ -1140,6 +1501,7 @@ impl Emitter<'_> {
                 let v = ((c << (64 - bits)) as i64) >> (64 - bits);
                 if (-9..10).contains(&v) { v.to_string() } else if v < 0 { format!("-{:#x}", v.unsigned_abs()) } else { format!("{v:#x}") }
             }
+            None if self.is_signed(rhs) => expr::rhs(self.name(rhs)),
             None => format!("({})", self.signed(rhs)),
         };
         format!("{a} {op} {b}")
@@ -1147,8 +1509,10 @@ impl Emitter<'_> {
 
     /// A cast, skipping an inner cast that the outer one makes redundant:
     /// `x as u32 as u64 as u8` is `x as u8`.
-    fn cast(&self, kind: CastKind, mut v: ValueId, ty: TyId) -> String {
-        let t = rty(ty);
+    fn cast(&self, kind: CastKind, mut v: ValueId, id: ValueId) -> String {
+        let ty = self.ty(id);
+        let vt = self.vt[id.index()];
+        let t = self.rt(id);
         if let CastKind::Trunc | CastKind::ZExt = kind {
             let trunc = matches!(kind, CastKind::Trunc);
             while self.inline[v.index()] {
@@ -1160,7 +1524,9 @@ impl Emitter<'_> {
                     CastKind::SExt => trunc && bytes(ty) <= bytes(self.ty(w)),
                     _ => false,
                 };
-                if !redundant {
+                // `w as T` would sign-extend a signed `w`
+                let widens_signed = self.is_signed(w) && bytes(ty) > bytes(self.ty(w));
+                if !redundant || widens_signed {
                     break;
                 }
                 v = w;
@@ -1172,21 +1538,26 @@ impl Emitter<'_> {
                 let bits = bytes(self.ty(v)) as u32 * 8;
                 let c = if matches!(kind, CastKind::SExt) { (((c << (64 - bits)) as i64) >> (64 - bits)) as u64 } else { c };
                 let mask = if bytes(ty) >= 8 { u64::MAX } else { (1u64 << (bytes(ty) * 8)) - 1 };
-                return format!("{}_{t}", lit(c & mask));
+                return self.lit_as(c & mask, vt);
             }
         }
-        if rty(self.ty(v)) == t {
+        if self.vt[v.index()] == vt {
             return self.name(v);
         }
         match kind {
             CastKind::SExt => format!("{} as {t}", self.signed(v)),
+            CastKind::ZExt => format!("{} as {t}", expr::cast(self.as_u(v))),
             _ => format!("{} as {t}", expr::cast(self.name(v))),
         }
     }
 
     /// `v` reinterpreted as the signed integer of its width: `v as i32`, where
-    /// casts inside `v` that don't change its low bits are dropped.
+    /// casts inside `v` that don't change its low bits are dropped. Just `v`
+    /// (ready for an `as`) if it is signed already.
     fn signed(&self, mut v: ValueId) -> String {
+        if self.is_signed(v) {
+            return expr::cast(self.name(v));
+        }
         let width = bytes(self.ty(v));
         let s = signed(self.ty(v));
         while self.inline[v.index()] {
@@ -1215,10 +1586,69 @@ impl Emitter<'_> {
         }
     }
 
-    fn load(&mut self, ptr: ValueId, ty: TyId) -> String {
-        let (t, len, p) = (rty(ty), bytes(ty), self.name(ptr));
+    /// A field access for a load or store of `bytes` through `ptr`: the place
+    /// (`p.count`, `(*p).count`), whether it is a raw dereference, and the
+    /// field's type.
+    fn field(&self, ptr: ValueId, bytes: usize, write: bool) -> Option<(String, bool, TyId)> {
+        let types = self.types?;
+        let (r, d) = base_of(self.f, &self.alias, ptr);
+        let s = types.pointee[r.index()].or_else(|| types.pointee[ptr.index()].filter(|_| d == 0))?;
+        if !matches!(self.table.tys[s], Ty::Struct(_)) {
+            return None;
+        }
+        let (path, lt) = leaf(self.table, s, d, bytes as u32)?;
+        let sn = self.rs(s);
+        if let Some(k) = self.entry_param[r.index()] {
+            let b = self.bind[k].clone();
+            match (self.args[k], b) {
+                (ArgKind::Struct { mutbl, nullable, ty }, Some(b)) if ty == s && (mutbl || !write) => {
+                    let base = match (nullable, mutbl, write) {
+                        (false, _, _) => b,
+                        (true, false, _) => format!("{b}.unwrap()"),
+                        (true, true, false) => format!("{b}.as_deref().unwrap()"),
+                        (true, true, true) => format!("{b}.as_deref_mut().unwrap()"),
+                    };
+                    return Some((format!("{base}{path}"), false, lt));
+                }
+                (ArgKind::Int, Some(b)) => {
+                    let arg = types.args.iter().find(|a| Some(a.reg) == self.reg_of(r)).and_then(|a| a.ty);
+                    if let Some(Ty::RawPtr { pointee, mutbl }) = arg.map(|t| self.table.tys[t]) {
+                        if pointee == s && (mutbl == Mutbl::Mut || !write) {
+                            return Some((format!("(*{b}){path}"), true, lt));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let m = if write { "mut" } else { "const" };
+        Some((format!("(*({} as *{m} {sn})){path}", expr::cast(self.as_u64(r))), true, lt))
+    }
+
+    fn reg_of(&self, v: ValueId) -> Option<u8> {
+        match self.f.insts[v].kind {
+            InstKind::BlockParam(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    fn load(&mut self, id: ValueId, ptr: ValueId) -> String {
+        let ty = self.ty(id);
+        let (t, len) = (self.rt(id), bytes(ty));
+        let slice = self.slice_root(ptr, false);
+        if let Some((place, raw, lt)) = self.field(ptr, len, false).filter(|(_, raw, _)| !raw || slice.is_none()) {
+            let e = self.conv(&place, lt, self.vt[id.index()]);
+            if raw {
+                self.stats.raw += 1;
+                self.stats.raw_by[bucket(self.src[ptr.index()])] += 1;
+                return format!("unsafe {{ {e} }}");
+            }
+            self.stats.checked += 1;
+            return e;
+        }
+        let p = self.as_u64(ptr);
         let (pr, pc) = (expr::recv(p.clone()), expr::cast(p));
-        if let Some((s, base)) = self.slice_root(ptr, false) {
+        if let Some((s, base)) = slice {
             self.stats.checked += 1;
             return format!("{t}::from_le_bytes({s}[{pr}.wrapping_sub({base}) as usize..][..{len}].try_into().unwrap())");
         }
@@ -1229,9 +1659,25 @@ impl Emitter<'_> {
 
     fn store(&mut self, ptr: ValueId, val: ValueId) -> String {
         let vt = self.ty(val);
-        let (t, len, p, v) = (rty(vt), bytes(vt), self.name(ptr), self.name(val));
+        let (t, len, v) = (self.rt(val), bytes(vt), self.name(val));
+        let slice = self.slice_root(ptr, true);
+        if let Some((place, raw, lt)) = self.field(ptr, len, true).filter(|(_, raw, _)| !raw || slice.is_none()) {
+            let e = match self.table.tys[lt] {
+                // the pointee may not be printed (`render_structs`); let Rust infer it
+                Ty::RawPtr { .. } => format!("{} as _", expr::cast(self.as_u64(val))),
+                _ => self.val(val, lt),
+            };
+            if raw {
+                self.stats.raw += 1;
+                self.stats.raw_by[bucket(self.src[ptr.index()])] += 1;
+                return format!("unsafe {{ {place} = {e} }}");
+            }
+            self.stats.checked += 1;
+            return format!("{place} = {e}");
+        }
+        let p = self.as_u64(ptr);
         let (pr, pc, vr) = (expr::recv(p.clone()), expr::cast(p), expr::recv(v.clone()));
-        if let Some((s, base)) = self.slice_root(ptr, true) {
+        if let Some((s, base)) = slice {
             self.stats.checked += 1;
             return format!("{s}[{pr}.wrapping_sub({base}) as usize..][..{len}].copy_from_slice(&{vr}.to_le_bytes())");
         }
@@ -1297,8 +1743,8 @@ impl Emitter<'_> {
     /// (the borrow analysis downgrades the others); they are split apart with
     /// `split_at_mut`. Returns the statements that do the splitting, and the
     /// argument expressions.
-    fn call_args(&mut self, args: &[ValueId], pass: &[Pass]) -> (String, Vec<String>) {
-        let mut out: Vec<String> = args.iter().map(|&v| format!("{} as u64", self.name(v))).collect();
+    fn call_args(&mut self, args: &[ValueId], pass: &[Pass], typed: Vec<String>) -> (String, Vec<String>) {
+        let mut out = typed;
         let mut lets = String::new();
         let Some(a) = self.borrow else { return (lets, out) };
         // (root, argument) for every borrowed argument that points into a root
@@ -1323,7 +1769,7 @@ impl Emitter<'_> {
             let place = self.places[r as usize].as_ref().unwrap();
             let mutbl = |k: usize| matches!(pass[k], Pass::Borrow { mutbl: true, .. });
             let nullable = |k: usize| matches!(pass[k], Pass::Borrow { nullable: true, .. });
-            let off = |k: usize| self.name(args[k]);
+            let off = |k: usize| expr::recv(self.as_u64(args[k]));
             let mut exprs: Vec<(usize, String)> = Vec::new();
             if ks.len() == 1 || !ks.iter().any(|&k| mutbl(k)) {
                 for &k in &ks {
@@ -1387,8 +1833,8 @@ impl Source for Emitter<'_> {
 
     fn case(&self, v: ValueId, cases: &[u64]) -> String {
         match cases {
-            [k] => format!("{} == {k}", self.name(v)),
-            _ => format!("matches!({}, {})", self.name(v), case_pattern(cases)),
+            [k] => format!("{} == {k}", self.as_u(v)),
+            _ => format!("matches!({}, {})", self.as_u(v), case_pattern(cases)),
         }
     }
 

@@ -217,7 +217,8 @@ fn the_same_local_lent_twice_calls_the_raw_twin() {
     let (p, _) = program(&[("add", &add_into), ("caller", &caller)]);
     let src = emitted(&p, Mode::Safe);
     assert!(src[0].starts_with("pub fn add(rdi_ref: &mut [u8], rsi_ref: &[u8])"), "{}", src[0]);
-    assert!(src[0].contains("pub unsafe fn add_raw(mut rdi: u64, mut rsi: u64)"), "{}", src[0]);
+    // fast mode, with the pointee types recovered from the accesses
+    assert!(src[0].contains("pub unsafe fn add_raw(rdi_p: *mut u64, rsi_p: *const u64)"), "{}", src[0]);
     assert!(src[1].contains("add_raw(") && !src[1].contains("&mut"), "{}", src[1]);
 }
 

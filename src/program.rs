@@ -439,7 +439,27 @@ impl Program {
         // 5. Types: from debug info, a model, and how values are used.
         let type_inputs: Vec<Option<crate::types::Input>> = funcs
             .iter()
-            .map(|f| f.ir.as_ref().ok().map(|ir| crate::types::Input { f: ir, sig: f.sig, addr: f.addr, name: &f.name }))
+            .map(|f| {
+                let ir = f.ir.as_ref().ok()?;
+                let calls = f
+                    .sites
+                    .iter()
+                    .zip(&f.targets)
+                    .filter_map(|(&s, t)| {
+                        let &Target::Func(j) = t else { return None };
+                        let g = &funcs[j];
+                        g.ir.as_ref().ok()?;
+                        let regs = abi::SYSV_ARGS[..(g.sig.args as usize).min(6)].iter().copied().chain((0..g.sig.stack_args).map(|k| abi::STACK_ARG_BASE + k));
+                        let args = regs.zip(s.parts(ir).1.get(&ir.value_pool).iter().copied()).collect();
+                        let ret = match s {
+                            Site::Call(id) if g.sig.rax() => Some(id),
+                            _ => None,
+                        };
+                        Some(crate::types::CallEdge { callee: j, args, ret })
+                    })
+                    .collect();
+                Some(crate::types::Input { f: ir, sig: f.sig, addr: f.addr, name: &f.name, calls })
+            })
             .collect();
         let (fn_types, type_stats) = crate::types::recover(&type_inputs, debug.as_ref(), opts.model, &mut tys);
         drop(type_inputs);

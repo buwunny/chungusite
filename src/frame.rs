@@ -279,7 +279,9 @@ struct Slot {
 }
 
 /// Promote stack slots and give the function a frame; see the module docs.
-pub fn promote(f: &mut Function) {
+/// `stack_args` is how many stack arguments the signature takes: a stack
+/// argument whose address escapes copies in only those, as callers pass no more.
+pub fn promote(f: &mut Function, stack_args: u8) {
     let entry = f.entry;
     let Some(k_sp) = f.blocks[entry]
         .params
@@ -406,7 +408,7 @@ pub fn promote(f: &mut Function) {
     // Stack arguments still read from memory are copied in from parameters.
     let mut new_params = Vec::new();
     if !o.lost && hi > 8 {
-        for word in 0..((hi - 8 + 7) / 8) {
+        for word in 0..((hi - 8 + 7) / 8).min(stack_args as i64) {
             let reg = STACK_ARG_BASE + word as u8;
             let exists = f.blocks[entry].params.get(&f.value_pool).iter().any(|&p| matches!(f.insts[p].kind, InstKind::BlockParam(r) if r == reg));
             let in_memory = slots.iter().enumerate().any(|(i, s)| !ok_slot[i] && s.off >= 8 && (s.off - 8) / 8 == word)

@@ -86,6 +86,7 @@ fn inst(f: &Function, id: ValueId, e: &mut impl Emit) {
                 BinOp::Add => " +", BinOp::Sub => " -", BinOp::Mul | BinOp::UMulHi | BinOp::SMulHi => " *", BinOp::UDiv | BinOp::SDiv => " /",
                 BinOp::URem | BinOp::SRem => " %", BinOp::And => " &", BinOp::Or => " |", BinOp::Xor => " ^",
                 BinOp::Shl | BinOp::RotL => " <<", BinOp::LShr | BinOp::AShr | BinOp::RotR => " >>",
+                BinOp::Lane(..) => " lane",
             });
             val(e, true, rhs);
         }

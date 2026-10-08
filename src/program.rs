@@ -787,8 +787,9 @@ impl Program {
         s
     }
 
-    /// The recovered structs the emitted functions use, and `mod ffi`, declaring
-    /// every extern the emitted code calls; empty if neither.
+    /// The recovered structs the emitted functions use, the `simd` module if
+    /// they use SSE lane ops, and `mod ffi`, declaring every extern the emitted
+    /// code calls; empty if none of these.
     pub fn prelude(&self) -> String {
         let mut roots = Vec::new();
         for f in self.funcs.iter().filter(|f| f.selected && f.ir.is_ok()) {
@@ -804,6 +805,9 @@ impl Program {
         if !structs.is_empty() {
             s.push('\n');
             s.push_str(&structs);
+        }
+        if self.funcs.iter().any(|f| f.selected && f.ir.as_ref().is_ok_and(crate::simd::uses)) {
+            s.push_str(crate::simd::PRELUDE);
         }
         if self.externs.is_empty() {
             return s;
@@ -1003,5 +1007,6 @@ pub fn describe(e: &crate::lift::LiftError) -> String {
         LiftError::FlagsNotInBlock { ip } => format!("branch at {ip:#x} reads flags set in another block"),
         LiftError::BranchOutOfRange { ip, target } => format!("branch at {ip:#x} leaves the function (to {target:#x})"),
         LiftError::TargetInsideInstruction { target } => format!("branch into the middle of an instruction at {target:#x}"),
+        LiftError::XmmNotSet { ip } => format!("xmm register read at {ip:#x} holds an argument or a call's result"),
     }
 }

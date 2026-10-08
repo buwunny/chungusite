@@ -166,7 +166,7 @@ fn remove_trivial_params(f: &mut Function, repl: &mut [Option<ValueId>], preds: 
 fn is_root(k: InstKind) -> bool {
     matches!(
         k,
-        InstKind::Store { .. } | InstKind::Call { .. } | InstKind::MemCopy { .. } | InstKind::Opaque { .. } | InstKind::Exit { .. }
+        InstKind::Store { .. } | InstKind::Call { .. } | InstKind::MemCopy { .. } | InstKind::MemFill { .. } | InstKind::Opaque { .. } | InstKind::Exit { .. }
             | InstKind::Assign { .. } | InstKind::Load { volatile: true, .. }
     )
 }
@@ -310,6 +310,7 @@ pub fn map_operands(k: &mut InstKind, pool: &mut [ValueId], r: impl Fn(&mut Valu
         Load { ptr, .. } => r(ptr),
         Store { ptr, val, .. } => { r(ptr); r(val) }
         MemCopy { dst, src, len } => { r(dst); r(src); r(len) }
+        MemFill { dst, val, count } => { r(dst); r(val); r(count) }
         Aggregate { fields, .. } => map_list(pool, *fields, r),
         Assign { val, .. } => r(val),
     }

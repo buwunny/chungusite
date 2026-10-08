@@ -183,8 +183,12 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         .map(|f| Input { name: f.name.clone(), ident: String::new(), addr: f.addr, bytes: f.bytes, selected: false })
         .collect();
     let mut index = Vec::with_capacity(funcs.len());
+    let mut at: HashMap<(u64, usize), usize> = HashMap::with_capacity(inputs.len());
+    for (i, x) in inputs.iter().enumerate().rev() {
+        at.insert((x.addr, x.bytes.len()), i);
+    }
     for (fb, ident) in funcs.iter().zip(&idents) {
-        match inputs.iter().position(|x| x.addr == fb.addr && x.bytes.len() == fb.bytes.len() && !x.selected) {
+        match at.get(&(fb.addr, fb.bytes.len())).copied().filter(|&i| !inputs[i].selected) {
             Some(i) => {
                 inputs[i].ident = ident.clone();
                 inputs[i].selected = true;

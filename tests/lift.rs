@@ -35,7 +35,7 @@ bb3(v17):
 #[test]
 fn reports_unsupported_instead_of_guessing() {
     let mut a = CodeAssembler::new(64).unwrap();
-    a.bsr(rax, rcx).unwrap(); // not handled yet
+    a.cpuid().unwrap(); // no data-flow model of it at all
     a.ret().unwrap();
     let code = a.assemble(0).unwrap();
     let mut f = Function::with_capacity(8, 2);
@@ -259,4 +259,13 @@ fn jump_tables_become_switches() {
     // Without the table the jump can't be followed: unsupported, not a tail call.
     let err = Lifter::new().lift(&code, common::BASE, &mut f).unwrap_err();
     assert!(matches!(err, LiftError::Unsupported { mnemonic: iced_x86::Mnemonic::Jmp, .. }), "{err:?}");
+}
+
+#[test]
+fn indirect_jump_without_a_table_is_a_tail_call() {
+    let out = ir(|a| {
+        a.mov(rax, qword_ptr(rdi + 0x18)).unwrap();
+        a.jmp(rax).unwrap();
+    });
+    assert!(out.contains("tailcall"), "{out}");
 }

@@ -1622,7 +1622,15 @@ impl Emitter<'_> {
             }
         }
         let m = if write { "mut" } else { "const" };
-        Some((format!("(*({} as *{m} {sn})){path}", expr::cast(self.as_u64(r))), true, lt))
+        // The struct's address: `r` may be a value from another block that only an
+        // alias reaches, so go from `ptr`, which this access has in scope.
+        let p = self.as_u64(ptr);
+        let base = match d {
+            0 => p,
+            d if d < 0 => format!("{}.wrapping_add({})", expr::recv(p), lit(d.unsigned_abs())),
+            d => format!("{}.wrapping_sub({})", expr::recv(p), lit(d as u64)),
+        };
+        Some((format!("(*({} as *{m} {sn})){path}", expr::cast(base)), true, lt))
     }
 
     fn reg_of(&self, v: ValueId) -> Option<u8> {

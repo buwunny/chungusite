@@ -8,18 +8,14 @@ The ML refinement layer (`src/refine`, behind the `ml` feature; see docs/ml-runt
 
 ## 1. Lifter coverage (the blocker for real code)
 
-`CALL`, `PUSH`/`POP`, the 8/16-bit `MOV` forms, `CMOVcc`/`SETcc`, memory operands, `MOVZX`/`MOVSX`, shifts, `IMUL`, one-operand `MUL`, `INC`/`DEC`/`NEG`/`NOT`, `DIV`/`IDIV` after `CQO` or `xor edx, edx`, 16-byte SSE copies and zeroing, and jump tables (`Terminator::Switch`) are lifted now ([lift.md](lift.md)). What still fails on chungusite's own debug build (388 of 20,025 functions), by the first unsupported instruction in each function:
+`CALL`, `PUSH`/`POP`, the 8/16-bit `MOV` forms, `CMOVcc`/`SETcc`, memory operands, `MOVZX`/`MOVSX`, shifts, `IMUL`, one-operand `MUL`, `INC`/`DEC`/`NEG`/`NOT`, `DIV`/`IDIV` after `CQO` or `xor edx, edx`, 16-byte SSE copies, zeroing and bitwise ops, jump tables (`Terminator::Switch`), `ADC`/`SBB`, the bit instructions, rotates, double shifts, the atomics and `rep movs` are lifted now ([lift.md](lift.md)). On chungusite's own debug build (29,783 functions), 29,602 lift (99.4%). What still fails (181 functions), by the first unsupported instruction in each function:
 
 | Cause | Functions | What's needed |
 |---|---|---|
-| Atomics (`XADD`, `CMPXCHG`, `XCHG`) | 90 | an `Atomic` op, or `Opaque` |
-| `TZCNT`, `BSR`, `BSWAP`, `BT`, `BTS` | 86 | `UnOp::Ctz`/`Clz`/`Bswap` exist in the IR; `BT` is a shift and a test |
-| `SBB`, `ADC` | 55 | the carry from the lazy flags as a value |
-| SSE vectors and floats (`PCMPEQB`, `PUNPCKLBW`, `UCOMISD`, `PCMPGTB`, `PADDQ`, `PINSRW`, `POR`, `PMOVMSKB`, `CVTSI2SS`, AVX moves) | ~70 | xmm values across blocks, then vector ops; scalar float (`F32`/`F64` exist in `Ty`) |
-| Flags across blocks | 23 | materialize the flag values at the block exit when a successor reads them (`LiftError::FlagsNotInBlock`) |
-| `MOV` through `fs:` (TLS) and some 16-bit forms, `SHRD`/`SHLD`, `ROL`, `MOVSQ`/`MOVSB`, `PAUSE`, `CPUID`, ... | ~60 | one at a time |
-
-The differential harness (step 9) shows the same order on compiled C: of what doesn't lift there, most is rotates, `ADC`, the 8-bit `MOV` forms it doesn't take yet, and vector code (`PSHUFD`, `PADDD`).
+| Flags across blocks, and conditions the lazy flags don't model (`SETO`, `JLE`/`JG`, `CMOVO` after a shift or `ADC`) | ~65 | materialize the flag values at the block exit when a successor reads them (`LiftError::FlagsNotInBlock`), and OF/SF for more instructions |
+| SSE vectors and floats (`PMOVMSKB`, `PCMPGTB`, `PUNPCKLBW`, `UCOMISD`, `PADDQ`, `PCMPEQB`, `PINSRW`, `CVTSI2SS`, AVX moves) | ~75 | xmm values across blocks, then vector ops; scalar float (`F32`/`F64` exist in `Ty`) |
+| `MOV` through `fs:` (thread-locals) | 23 | a model of the thread pointer |
+| The rest (`PAUSE`, 8/16-bit `DIV`/`MUL`, `BTS`, `CPUID`, `XGETBV`, ...) | ~18 | one at a time |
 
 ## 2. Calls and signatures (done)
 
@@ -60,7 +56,7 @@ Done for the common case ([cli.md](cli.md#globals)): constant addresses into dat
 - Typed statics: today every static is `Bytes<N>` or `Words<N>`. Once types (step 5) also cover globals and know an access is a `u32` table or a `&str`, emit `[u32; N]` or a string.
 - Thread-locals (`fs:`-relative accesses) are still unsupported in the lifter.
 - Mach-O chained fixups and PE base relocations aren't read, so pointer slots in those formats keep their file bytes.
-- Relocatable objects (`.o`) have no addresses, so their data, jump tables included, isn't read: `switch8` in the differential corpus is a lookup table in `.rodata` and stays in `KNOWN_BAD`. Laying out the sections and applying the relocations would fix both.
+- Relocatable objects (`.o`) have no addresses, so their data, jump tables included, isn't read. The differential harness links the corpus into a program (`-nostartfiles`) to get around it; laying out an object's sections and applying its relocations would make `.o` input work directly.
 
 ## 7. Safe mode across calls (done)
 
@@ -81,4 +77,4 @@ Stages 5 to 7 in [ownership.md](ownership.md) are in: the frame, read-only globa
 
 `tests/emit.rs` already runs one decompiled function in both modes and compares results. Generalize that into differential testing: compile small C functions, decompile them, call both on random inputs, and compare. That is the test that says the decompiler is *correct*, not just that its output compiles.
 
-Started: `tests/differential.rs` compiles `tests/differential/corpus.c` (86 functions, including calls, stack arguments, address-taken locals, wide multiplies and 16-byte copies) with gcc and clang at -O1, -O2 and -Os, decompiles each function in both modes, and runs original and decompiled code side by side on random inputs, comparing return values and buffer contents. A function that doesn't lift yet is counted; one that lifts and computes something different fails the test unless `KNOWN_BAD` lists it. The pass rate it prints is a second to-do list next to `--list`: it shows which missing instructions cost the most real code. Add a function to the corpus with a `// @diff name: ret(args)` line above it.
+Started: `tests/differential.rs` compiles `tests/differential/corpus.c` (118 functions, including calls, stack arguments, address-taken locals, wide multiplies, 16-byte copies, jump tables, bit instructions and atomics) with gcc and clang at -O1, -O2 and -Os, links it into a program so its data and jump tables have addresses, decompiles each function in both modes with its data as statics, and runs original and decompiled code side by side on random inputs, comparing return values and buffer contents. A function that doesn't lift yet is counted; one that lifts and computes something different fails the test unless `KNOWN_BAD` lists it. The pass rate it prints is a second to-do list next to `--list`: it shows which missing instructions cost the most real code. Add a function to the corpus with a `// @diff name: ret(args)` line above it. It passes 1,390 of 1,416 (function, build) pairs, and no function that lifts gives a wrong result.

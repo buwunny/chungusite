@@ -20,9 +20,11 @@ pub struct CleanStats {
 pub fn clean(f: &mut Function) -> CleanStats {
     let mut stats = CleanStats::default();
     let mut repl: Vec<Option<ValueId>> = vec![None; f.insts.len()];
+    // Removing parameters never changes the edges, so the predecessors stay valid.
+    let preds = preds(f);
     loop {
-        let t = remove_trivial_params(f, &mut repl);
-        let (dp, di) = remove_dead(f, &repl);
+        let t = remove_trivial_params(f, &mut repl, &preds);
+        let (dp, di) = remove_dead(f, &repl, &preds);
         stats.trivial_params += t;
         stats.dead_params += dp;
         stats.dead_insts += di;
@@ -65,10 +67,42 @@ pub(crate) fn list_remove(pool: &mut [ValueId], l: &mut ListRef, at: usize) {
     l.len -= 1;
 }
 
-/// Remove parameter `k` of block `b` and the matching argument on every edge into it.
-pub(crate) fn remove_param(f: &mut Function, b: BlockId, k: usize, scratch: &mut Vec<usize>) {
-    for pi in 0..f.blocks.len() {
-        let p = BlockId::new(pi);
+/// Each block's predecessors, each listed once: `preds[start[b]..start[b + 1]]`.
+struct Preds {
+    start: Vec<u32>,
+    preds: Vec<BlockId>,
+}
+
+impl std::ops::Index<usize> for Preds {
+    type Output = [BlockId];
+    fn index(&self, b: usize) -> &[BlockId] {
+        &self.preds[self.start[b] as usize..self.start[b + 1] as usize]
+    }
+}
+
+fn preds(f: &Function) -> Preds {
+    let mut edges: Vec<(u32, BlockId)> = Vec::new();
+    for (b, blk) in f.blocks.iter() {
+        for s in blk.term.successors(&f.value_pool) {
+            edges.push((s.index() as u32, b));
+        }
+    }
+    edges.sort_unstable_by_key(|&(s, b)| (s, b.index()));
+    edges.dedup_by_key(|e| (e.0, e.1.index()));
+    let mut start = vec![0u32; f.blocks.len() + 1];
+    for &(s, _) in &edges {
+        start[s as usize + 1] += 1;
+    }
+    for i in 0..f.blocks.len() {
+        start[i + 1] += start[i];
+    }
+    Preds { start, preds: edges.into_iter().map(|e| e.1).collect() }
+}
+
+/// Remove parameter `k` of block `b` and the matching argument on every edge into
+/// it; `preds` are `b`'s predecessors.
+fn remove_param(f: &mut Function, b: BlockId, k: usize, preds: &[BlockId], scratch: &mut Vec<usize>) {
+    for &p in preds {
         scratch.clear();
         edges_into(f, p, b, scratch);
         scratch.sort_unstable_by(|a, b| b.cmp(a)); // back to front keeps offsets valid
@@ -86,7 +120,7 @@ pub(crate) fn remove_param(f: &mut Function, b: BlockId, k: usize, scratch: &mut
     f.blocks[b].params = params;
 }
 
-fn remove_trivial_params(f: &mut Function, repl: &mut [Option<ValueId>]) -> usize {
+fn remove_trivial_params(f: &mut Function, repl: &mut [Option<ValueId>], preds: &Preds) -> usize {
     let mut removed = 0;
     let mut starts = Vec::new();
     let mut scratch = Vec::new();
@@ -101,9 +135,9 @@ fn remove_trivial_params(f: &mut Function, repl: &mut [Option<ValueId>]) -> usiz
             let mut only: Option<ValueId> = None;
             let mut trivial = true;
             let mut any_edge = false;
-            for pi in 0..f.blocks.len() {
+            for &pb in &preds[bi] {
                 starts.clear();
-                edges_into(f, BlockId::new(pi), b, &mut starts);
+                edges_into(f, pb, b, &mut starts);
                 for &s in &starts {
                     any_edge = true;
                     let v = resolve(repl, f.value_pool[s + k]);
@@ -119,7 +153,7 @@ fn remove_trivial_params(f: &mut Function, repl: &mut [Option<ValueId>]) -> usiz
             match only {
                 Some(v) if trivial && any_edge => {
                     repl[p.index()] = Some(v);
-                    remove_param(f, b, k, &mut scratch);
+                    remove_param(f, b, k, &preds[bi], &mut scratch);
                     removed += 1;
                 }
                 _ => k += 1,
@@ -137,7 +171,7 @@ fn is_root(k: InstKind) -> bool {
     )
 }
 
-fn remove_dead(f: &mut Function, repl: &[Option<ValueId>]) -> (usize, usize) {
+fn remove_dead(f: &mut Function, repl: &[Option<ValueId>], preds: &Preds) -> (usize, usize) {
     let n = f.insts.len();
     // Where each block parameter lives, so a live parameter can mark its incoming args.
     let mut param_of: Vec<Option<(BlockId, usize)>> = vec![None; n];
@@ -182,9 +216,9 @@ fn remove_dead(f: &mut Function, repl: &[Option<ValueId>]) -> (usize, usize) {
         let mut ops = Vec::new();
         for_each_operand(f.insts[v].kind, f, |o| ops.push(o));
         if let Some((b, k)) = param_of[v.index()] {
-            for pi in 0..f.blocks.len() {
+            for &pb in &preds[b.index()] {
                 starts.clear();
-                edges_into(f, BlockId::new(pi), b, &mut starts);
+                edges_into(f, pb, b, &mut starts);
                 ops.extend(starts.iter().map(|&s| f.value_pool[s + k]));
             }
         }
@@ -222,7 +256,7 @@ fn remove_dead(f: &mut Function, repl: &[Option<ValueId>]) -> (usize, usize) {
         for k in (0..f.blocks[b].params.len as usize).rev() {
             let p = f.value_pool[f.blocks[b].params.start as usize + k];
             if !live[p.index()] {
-                remove_param(f, b, k, &mut scratch);
+                remove_param(f, b, k, &preds[bi], &mut scratch);
                 dead_params += 1;
             }
         }

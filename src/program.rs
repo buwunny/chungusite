@@ -205,6 +205,16 @@ impl Program {
     pub fn build_with(inputs: Vec<Input>, file: Option<&[u8]>, keep_raw_ir: bool, opts: BuildOptions) -> Program {
         let syms = file.map(Symbols::parse).unwrap_or_default();
         let sections = file.map(loaded_sections).unwrap_or_default();
+        // A call to an import that never returns (by relocation in an object
+        // file, or through the PLT) ends its block.
+        let noreturn = |ip: u64, target: Option<u64>| {
+            let name = match syms.reloc_at(ip) {
+                Some(Reloc::Sym(n)) => Some(n),
+                Some(Reloc::Addr(_)) => None,
+                None => target.and_then(|t| syms.plt.get(&t)),
+            };
+            name.is_some_and(|n| crate::discover::noreturn(n))
+        };
         let by_addr: HashMap<u64, usize> = inputs.iter().enumerate().map(|(i, x)| (x.addr, i)).rev().collect();
         let mut by_name: HashMap<String, usize> = HashMap::new();
         for (i, x) in inputs.iter().enumerate() {
@@ -230,11 +240,9 @@ impl Program {
                     |lifter, x| {
                         let mut f = Function::with_capacity(256, 16);
                         let mut raw = None;
-                        let r = if sections.is_empty() {
-                            lifter.lift(x.bytes, x.addr, &mut f)
-                        } else {
-                            lifter.lift_with_data(x.bytes, x.addr, &sections, &mut f)
-                        };
+                        let own = [(x.addr, x.bytes)];
+                        let data: &[(u64, &[u8])] = if sections.is_empty() { &own } else { &sections };
+                        let r = lifter.lift_full(x.bytes, x.addr, data, &noreturn, &mut f);
                         let r = r
                             .map_err(|e| describe(&e))
                             .and_then(|()| verify(&f).map_err(|e| format!("lifted IR failed verification: {e:?}")))
@@ -335,35 +343,69 @@ impl Program {
 
         // 3. Signatures, to a fixpoint (Jacobi rounds: every function from the
         //    previous round's callee signatures). A function returns rdx too
-        //    (`ret2`) only if some caller reads rdx after calling it.
+        //    (`ret2`) only if some caller reads rdx after calling it. A function
+        //    whose inputs (its own signature, its callees', and whether rdx is
+        //    wanted) didn't change last round gets the same result again, so only
+        //    the others are re-inferred.
         let mut sigs: Vec<Sig> = stack_args.iter().map(|&s| Sig { stack_args: s, ..Sig::default() }).collect();
         let mut rdx_wanted = vec![false; funcs.len()];
+        let mut callers: Vec<Vec<usize>> = vec![Vec::new(); funcs.len()];
+        for (i, f) in funcs.iter().enumerate() {
+            for t in &f.targets {
+                if let Target::Func(j) = t {
+                    if callers[*j].last() != Some(&i) {
+                        callers[*j].push(i);
+                    }
+                }
+            }
+        }
+        let mut results: Vec<(Sig, Vec<bool>)> = sigs.iter().map(|&s| (s, Vec::new())).collect();
+        let mut dirty = vec![true; funcs.len()];
         for _round in 0..MAX_ROUNDS {
-            let next: Vec<(Sig, Vec<bool>)> = funcs
+            let next: Vec<Option<(Sig, Vec<bool>)>> = funcs
                 .par_iter()
                 .enumerate()
                 .map(|(i, f)| match &f.ir {
-                    Ok(ir) => {
+                    Ok(ir) if dirty[i] => {
                         let callee = |k: usize| site_sig(&f.targets[k], f.guesses[k], &sigs, &guessed);
                         let r = abi::infer(ir, &f.sites, &callee, sigs[i], rdx_wanted[i]);
-                        (Sig { stack_args: stack_args[i], ..r.sig }, r.rdx_read)
+                        Some((Sig { stack_args: stack_args[i], ..r.sig }, r.rdx_read))
                     }
-                    Err(_) => (sigs[i], Vec::new()),
+                    _ => None,
                 })
                 .collect();
+            for (i, r) in next.into_iter().enumerate() {
+                if let Some(r) = r {
+                    results[i] = r;
+                }
+            }
             let mut wanted = vec![false; funcs.len()];
-            for (f, (_, read)) in funcs.iter().zip(&next) {
+            for (f, (_, read)) in funcs.iter().zip(&results) {
                 for (t, &r) in f.targets.iter().zip(read) {
                     if let (Target::Func(j), true) = (t, r) {
                         wanted[*j] = true;
                     }
                 }
             }
-            let next: Vec<Sig> = next.into_iter().map(|(s, _)| s).collect();
-            if next == sigs && wanted == rdx_wanted {
+            dirty.iter_mut().for_each(|d| *d = false);
+            let mut changed = false;
+            for i in 0..funcs.len() {
+                if results[i].0 != sigs[i] {
+                    changed = true;
+                    dirty[i] = true;
+                    for &c in &callers[i] {
+                        dirty[c] = true;
+                    }
+                }
+                if wanted[i] != rdx_wanted[i] {
+                    changed = true;
+                    dirty[i] = true;
+                }
+            }
+            if !changed {
                 break;
             }
-            sigs = next;
+            sigs = results.iter().map(|r| r.0).collect();
             rdx_wanted = wanted;
         }
 

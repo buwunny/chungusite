@@ -48,9 +48,17 @@ fn stripped_binaries_have_the_same_functions() {
     let main_c = dir.join("main.c");
     std::fs::write(&main_c, "int main(void) { return 0; }\n").unwrap();
     // With unwind tables (the default) every boundary comes from `.eh_frame`;
-    // without them, from calls and prologues.
-    let variants: [(&str, &[&str]); 3] =
-        [("eh", &["-O2"]), ("noeh", &["-O0", "-fno-asynchronous-unwind-tables"]), ("nopie", &["-O1", "-fno-pie", "-no-pie"])];
+    // without them, from calls and the code left between functions.
+    // gcc -O2 without unwind tables ends some functions in a call to
+    // `__stack_chk_fail` and uses jump tables; clang -Os packs functions with
+    // no padding between them.
+    let variants: [(&str, &[&str]); 5] = [
+        ("eh", &["-O2"]),
+        ("noeh", &["-O0", "-fno-asynchronous-unwind-tables"]),
+        ("noeh-o2", &["-O2", "-fno-asynchronous-unwind-tables"]),
+        ("noeh-os", &["-Os", "-fno-asynchronous-unwind-tables"]),
+        ("nopie", &["-O1", "-fno-pie", "-no-pie"]),
+    ];
     for cc in &ccs {
         for (tag, flags) in variants {
             let full = dir.join(format!("{cc}-{tag}"));

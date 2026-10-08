@@ -186,7 +186,12 @@ fn jump_tables_from_a_cdylib() {
 #[test]
 fn parallel_output_is_deterministic() {
     let bin = env!("CARGO_BIN_EXE_chungusite");
-    let run = |jobs: &str| Command::new(bin).arg(bin).args(["-j", jobs, "--mode", "safe"]).output().unwrap().stdout;
+    let run = |jobs: &str| {
+        let out = Command::new(bin).arg(bin).args(["-j", jobs, "--mode", "safe"]).output().unwrap();
+        // exit 1 only says some functions weren't lifted; anything else is a crash
+        assert!(out.status.code().is_some_and(|c| c <= 1), "-j {jobs}: {}\n{}", out.status, String::from_utf8_lossy(&out.stderr));
+        out.stdout
+    };
     let one = run("1");
     assert!(one.len() > 100_000);
     assert_eq!(one, run("4"));

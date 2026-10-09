@@ -22,11 +22,13 @@ use crate::ir::*;
 use iced_x86::{ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 
 mod sse;
+mod x87;
 
 const NGPR: usize = 16;
 /// The register file: the 16 GPRs, then xmm0-15 as (low, high) qword pairs,
-/// then the upper halves of ymm0-15 the same way.
-const NREG: usize = NGPR + 64;
+/// then the upper halves of ymm0-15 the same way, then the x87 stack's eight
+/// slots and its control word (`x87::X87`).
+const NREG: usize = NGPR + 64 + 9;
 /// Where the upper halves of the ymm registers start in the register file.
 const UPPER: usize = NGPR + 32;
 type RegFile = [Option<ValueId>; NREG];
@@ -203,6 +205,15 @@ pub struct Lifter {
     /// tracked too: undefined at the entry and after a call, zeroed by a VEX
     /// instruction that writes the xmm part.
     ymm: bool,
+    /// Pass 1: the function uses the x87 stack. Then its slots are cleared at
+    /// the entry and after calls.
+    x87: bool,
+    /// The x87 stack's depth in the current block, and at the start of each
+    /// block (from the first predecessor lifted).
+    fdepth: u8,
+    fdepth_in: Vec<Option<u8>>,
+    /// A block entered with two different x87 depths, by the branch at this address.
+    fdepth_clash: Option<u64>,
     /// Lifting the upper half of a ymm instruction: xmm register `n` means
     /// the upper half of ymm `n`, and memory 16 bytes further on.
     upper: bool,
@@ -250,6 +261,10 @@ impl Lifter {
             starts: Vec::with_capacity(256),
             xmm: false,
             ymm: false,
+            x87: false,
+            fdepth: 0,
+            fdepth_in: Vec::with_capacity(256),
+            fdepth_clash: None,
             upper: false,
             switch_index: None,
             switches: Vec::with_capacity(4),
@@ -295,6 +310,12 @@ impl Lifter {
         self.exits.clear();
         self.switches.clear();
         self.nstub = 0;
+        self.fdepth_in.clear();
+        self.fdepth_in.resize(self.leaders.len() + self.stubs.len(), None);
+        self.fdepth_clash = None;
+        if self.x87 {
+            self.x87_depths(code, ip);
+        }
         for _ in 0..self.leaders.len() + self.stubs.len() {
             self.state.push(EMPTY_STATE);
             f.blocks.push(Block { insts: ListRef::EMPTY, params: ListRef::EMPTY, term: Terminator::Unreachable });
@@ -308,6 +329,9 @@ impl Lifter {
         self.begin_block(0, f);
         if self.ymm {
             self.clear_upper(f, false);
+        }
+        if self.x87 {
+            self.x87_clear(f, true);
         }
         while dec.can_decode() {
             dec.decode_out(&mut self.insn);
@@ -348,6 +372,9 @@ impl Lifter {
         if open {
             self.end_block(f, Terminator::Unreachable); // ran off the end of the bytes
         }
+        if let Some(ip) = self.fdepth_clash {
+            return Err(LiftError::Unsupported { ip, mnemonic: Mnemonic::Fld });
+        }
         self.finalize(f)
     }
 
@@ -375,6 +402,7 @@ impl Lifter {
         self.stubs.clear();
         self.xmm = false;
         self.ymm = false;
+        self.x87 = false;
         let mut dec = Decoder::with_ip(64, code, ip, DecoderOptions::NONE);
         while dec.can_decode() {
             dec.decode_out(&mut self.insn);
@@ -390,6 +418,7 @@ impl Lifter {
             let i = &self.insn;
             self.xmm |= (0..i.op_count()).any(|k| i.op_kind(k) == OpKind::Register && i.op_register(k).is_vector_register());
             self.ymm |= (0..i.op_count()).any(|k| i.op_kind(k) == OpKind::Register && i.op_register(k).is_ymm());
+            self.x87 |= x87::handled(i.mnemonic());
             match self.insn.flow_control() {
                 FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch => {
                     let t = self.insn.near_branch_target();
@@ -628,6 +657,7 @@ impl Lifter {
 
     fn begin_block(&mut self, idx: usize, f: &mut Function) {
         self.cur = idx;
+        self.fdepth = self.fdepth_in[idx].unwrap_or(0);
         self.flags = Flags::Entry;
         self.switch_index = None;
         f.blocks[BlockId::new(idx)].insts.start = f.value_pool.len() as u32;
@@ -671,6 +701,21 @@ impl Lifter {
         let s = &mut self.state[self.cur];
         s.flags = self.flags;
         s.exit_ip = self.ip;
+        // (a block the code never reaches, like padding after a jump, says nothing)
+        if self.x87 && self.fdepth_in[self.cur].is_some() {
+            let mut succ: Vec<BlockId> = term.successors(&f.value_pool).collect();
+            if let Terminator::Switch { .. } = term {
+                let t = self.tables[self.table_of(self.cur)];
+                succ.extend(self.cases[t.start as usize..(t.start + t.len) as usize].iter().filter_map(|&c| self.block_at(c)));
+            }
+            for b in succ {
+                match self.fdepth_in[b.index()] {
+                    None => self.fdepth_in[b.index()] = Some(self.fdepth),
+                    Some(d) if d != self.fdepth => self.fdepth_clash = self.fdepth_clash.or(Some(self.ip)),
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Lift `self.insn`. Returns true if it ended the block.
@@ -741,6 +786,10 @@ impl Lifter {
                 Ok(true)
             }
             FlowControl::Return => {
+                // a long double result (in st0) isn't modelled
+                if self.fdepth != 0 {
+                    return Err(self.unsupported());
+                }
                 if self.track_exits {
                     let mut regs = [ValueId::from_u32(0); EXIT_LEN];
                     for (v, r) in regs.iter_mut().zip(EXIT_REGS) {
@@ -1105,6 +1154,7 @@ impl Lifter {
                 self.put(f, dst, v)?;
             }
             m if sse::handled(m) => self.sse(f, i)?,
+            m if x87::handled(m) => self.x87(f, i)?,
             _ => return Err(self.unsupported()),
         }
         Ok(())
@@ -1435,6 +1485,13 @@ impl Lifter {
         }
         if self.ymm {
             self.clear_upper(f, false);
+        }
+        if self.x87 {
+            // the stack is empty at a call; a long double result isn't modelled
+            if self.fdepth != 0 {
+                return Err(self.unsupported());
+            }
+            self.x87_clear(f, false);
         }
         self.flags = Flags::Unknown;
         Ok(())
@@ -1811,7 +1868,8 @@ impl Lifter {
         let reg = match n {
             _ if n < NGPR => n as u8,
             _ if n < UPPER => XMM_PARAM + (n - NGPR) as u8,
-            _ => YMM_PARAM + (n - UPPER) as u8,
+            _ if n < x87::X87 => YMM_PARAM + (n - UPPER) as u8,
+            _ => x87::X87_PARAM + (n - x87::X87) as u8,
         };
         let id = f.insts.push(Inst { kind: InstKind::BlockParam(reg), ty: TyId::B8 });
         f.origin.push(self.block_ip(b));
@@ -2090,6 +2148,7 @@ fn handled(i: &Instruction) -> bool {
                     | Shld | Shrd | Rol | Ror | Adc | Sbb | Bt | Bts | Btr | Btc | Xchg | Xadd | Cmpxchg | Pause
             ) || cmov_or_setcc(m).is_some()
                 || sse::handled(m)
+                || x87::handled(m)
         }
         FlowControl::ConditionalBranch => i.condition_code() != ConditionCode::None,
         FlowControl::UnconditionalBranch | FlowControl::IndirectBranch | FlowControl::Return | FlowControl::Call

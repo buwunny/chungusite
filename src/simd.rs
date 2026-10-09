@@ -11,6 +11,12 @@ use crate::ir::{BinOp, Function, InstKind, LaneOp, LaneUn, UnOp};
 /// The function the emitter calls for a two-operand lane op on `w`-byte lanes.
 pub fn name(op: LaneOp, w: u8) -> String {
     use LaneOp::*;
+    if let F80ToF64 | Fist = op {
+        return match op {
+            F80ToF64 => "simd::x87::f64_from_f80".into(),
+            _ => format!("simd::x87::i{}_from_f64", 8 * w),
+        };
+    }
     if let Cpuid | Xgetbv = op {
         let reg = ["eax", "ebx", "ecx", "edx"][w as usize & 3];
         return format!("simd::cpu::{}_{reg}", if op == Cpuid { "cpuid" } else { "xgetbv" });
@@ -56,7 +62,7 @@ pub fn name(op: LaneOp, w: u8) -> String {
         FCmpGt => "cmpgt",
         FCmpGe => "cmpge",
         FCmpLtGt => "cmplg",
-        Cpuid | Xgetbv => unreachable!("handled above"),
+        Cpuid | Xgetbv | F80ToF64 | Fist => unreachable!("handled above"),
     };
     match float {
         true => format!("simd::f{}::{f}", 8 * w),
@@ -78,6 +84,8 @@ pub fn un_name(op: LaneUn, w: u8) -> String {
         LaneUn::F64ToInt => format!("simd::cvt::i{bits}_from_f64"),
         LaneUn::F32ToF64 => "simd::cvt::f64_from_f32".into(),
         LaneUn::F64ToF32 => "simd::cvt::f32_from_f64".into(),
+        LaneUn::F64ToF80Lo => "simd::x87::f80_lo".into(),
+        LaneUn::F64ToF80Hi => "simd::x87::f80_hi".into(),
     }
 }
 
@@ -227,6 +235,7 @@ pub mod simd {
             let n = if v >= -lim && v < lim { v as i64 } else { i64::MIN >> (64 - bits) };
             n as u64 & (u64::MAX >> (64 - bits))
         }
+        pub fn f64_from_i16(x: u64) -> u64 { (x as i16 as f64).to_bits() }
         pub fn f32_from_i32(x: u64) -> u64 { (x as i32 as f32).to_bits() as u64 }
         pub fn f32_from_i64(x: u64) -> u64 { (x as i64 as f32).to_bits() as u64 }
         pub fn f64_from_i32(x: u64) -> u64 { (x as i32 as f64).to_bits() }
@@ -241,6 +250,71 @@ pub mod simd {
         pub fn i64_from_f32(x: u64) -> u64 { to_int((f32::from_bits(x as u32) as f64).round_ties_even(), 64) }
         pub fn i32_from_f64(x: u64) -> u64 { to_int(f64::from_bits(x).round_ties_even(), 32) }
         pub fn i64_from_f64(x: u64) -> u64 { to_int(f64::from_bits(x).round_ties_even(), 64) }
+    }
+
+    /// x87 values, which the lifted code keeps as f64: conversions from and to
+    /// the 80-bit format in memory, and `fist`'s rounding.
+    pub mod x87 {
+        pub fn f64_from_f80(lo: u64, hi: u64) -> u64 {
+            let sign = (hi >> 15 & 1) << 63;
+            let e = hi & 0x7fff;
+            if e == 0x7fff {
+                // infinity, or a NaN keeping its top payload bits
+                let frac = lo << 1 >> 12;
+                return sign | 0x7ff << 52 | if frac == 0 && lo << 1 != 0 { 1 << 51 } else { frac };
+            }
+            if lo == 0 {
+                return sign;
+            }
+            // lo * 2^(e - 16383 - 63), rounded to nearest by the conversion
+            let m = lo as f64;
+            // a denormal has the smallest exponent, without the integer bit
+            let mut k = e.max(1) as i64 - 16383 - 63;
+            let mut v = m;
+            while k > 0 {
+                let s = k.min(1000);
+                v *= 2f64.powi(s as i32);
+                k -= s;
+            }
+            while k < 0 {
+                let s = (-k).min(1000);
+                v /= 2f64.powi(s as i32);
+                k += s;
+            }
+            sign | v.to_bits()
+        }
+        fn split(x: u64) -> (u64, u64) {
+            let sign = x >> 63 << 15;
+            let e = x >> 52 & 0x7ff;
+            let frac = x & ((1 << 52) - 1);
+            match e {
+                0 if frac == 0 => (0, sign),
+                // subnormal: normalize
+                0 => {
+                    let z = frac.leading_zeros() as u64;
+                    (frac << z, sign | (16383 - 1023 + 1 + 11 - z))
+                }
+                0x7ff => (1 << 63 | frac << 11, sign | 0x7fff),
+                _ => (1 << 63 | frac << 11, sign | (e + 16383 - 1023)),
+            }
+        }
+        pub fn f80_lo(x: u64) -> u64 { split(x).0 }
+        pub fn f80_hi(x: u64) -> u64 { split(x).1 }
+        fn fist(x: u64, cw: u64, bits: u32) -> u64 {
+            let v = f64::from_bits(x);
+            let r = match cw >> 10 & 3 {
+                0 => v.round_ties_even(),
+                1 => v.floor(),
+                2 => v.ceil(),
+                _ => v.trunc(),
+            };
+            let lim = (1u64 << (bits - 1)) as f64;
+            let n = if r >= -lim && r < lim { r as i64 } else { i64::MIN >> (64 - bits) };
+            n as u64 & (u64::MAX >> (64 - bits))
+        }
+        pub fn i16_from_f64(x: u64, cw: u64) -> u64 { fist(x, cw, 16) }
+        pub fn i32_from_f64(x: u64, cw: u64) -> u64 { fist(x, cw, 32) }
+        pub fn i64_from_f64(x: u64, cw: u64) -> u64 { fist(x, cw, 64) }
     }
 
     /// `cpuid` and `xgetbv`, one output register each.

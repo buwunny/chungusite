@@ -486,13 +486,18 @@ pub enum LaneOp {
     /// the left operand in eax and the right in ecx, and of `xgetbv` with the
     /// left operand in ecx. The CPU's answer, so nothing folds them.
     Cpuid, Xgetbv,
+    /// Not lanes either: x87. An 80-bit float (the left operand the significand,
+    /// the right the sign and exponent) to an f64 bit pattern; and an f64 to a
+    /// signed `w`-byte integer, rounded as the x87 control word in the right
+    /// operand says (`fist`), out of range giving the minimum.
+    F80ToF64, Fist,
 }
 
 impl LaneOp {
     /// Arithmetic on float lanes (compares give masks, not floats).
     pub fn makes_float(self) -> bool {
         use LaneOp::*;
-        matches!(self, FAdd | FSub | FMul | FDiv | FMin | FMax)
+        matches!(self, FAdd | FSub | FMul | FDiv | FMin | FMax | F80ToF64)
     }
 }
 
@@ -508,6 +513,9 @@ pub enum LaneUn {
     /// rounding to nearest even (`cvt*`); out of range gives the minimum, as x86 does.
     F32ToIntTrunc, F64ToIntTrunc, F32ToInt, F64ToInt,
     F32ToF64, F64ToF32,
+    /// An f64 as an 80-bit x87 float: its significand (`F64ToF80Lo`), and its
+    /// sign and exponent (`F64ToF80Hi`, the low 16 bits).
+    F64ToF80Lo, F64ToF80Hi,
 }
 
 impl LaneUn {

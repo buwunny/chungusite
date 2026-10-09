@@ -18,6 +18,7 @@ pub mod loans;
 pub mod names;
 pub mod opt;
 pub mod program;
+pub mod project;
 pub mod refine;
 pub mod simd;
 pub mod sources;

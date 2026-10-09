@@ -11,6 +11,7 @@ chungusite ./prog --addr 0x401136          # the function starting there
 chungusite ./prog --addr 0x401136 --size 0x40   # no symbol there: lift exactly these bytes
 chungusite ./prog --list                   # which functions lift, and why the others don't
 chungusite --hex "48 8b 47 08 c3"          # raw bytes, loaded at 0x1000, no file needed
+chungusite ./prog --cargo prog-rs          # a Cargo project: cd prog-rs && cargo run -- ARGS
 chungusite ./prog -j 1                     # one worker thread (default: one per CPU)
 chungusite ./prog --no-dwarf               # ignore debug info: infer every type
 chungusite ./prog --refine models/types     # ask a trained type model (--features ml)
@@ -127,6 +128,31 @@ Without a symbol table, `src/discover.rs` finds functions from, most trusted fir
 This repeats until nothing new turns up. A function without unwind info ends at the last instruction its control flow reaches before the next known start. A candidate strictly inside an FDE's range is rejected. Discovered functions are named `sub_<addr>`, except `_start` (the entry point), `main` (what `_start` passes to `__libc_start_main` in `rdi`), and `_init`/`_fini` (the `.init`/`.fini` sections). Calls into imports are named as before, from the PLT stubs and GOT relocations, which `strip` keeps. The summary on stderr says how many functions were discovered.
 
 On chungusite's own debug build, `strip` keeps none of its 20,025 function symbols, and discovery finds all 20,025 starts. 20,021 sizes match the symbol table exactly; the other 4 are crtstuff's hand-written functions, whose symbol sizes include their trailing padding. Lifting and type-checking give the same results with and without symbols. Without unwind tables, a function's end is where its control flow ends: discovery follows jump tables, and stops at calls that don't return, so such a function doesn't run into the next one. A call doesn't return if it goes to an import that doesn't (`__stack_chk_fail`, `abort`, `exit`, `__cxa_throw`, `_Unwind_Resume`, ...), to one of Rust's `-> !` functions (all of `core::panicking`, `unwrap_failed`, `handle_alloc_error`, `alloc::raw_vec::handle_error`, the slice and `str` index failures, `std::process::exit`, ...), or to a function found not to return because every path through it ends in such a call, `ud2`, `hlt` or `int3`. This goes to a fixpoint, so a `die()` that calls `exit` stops its callers, and their callers if they only call it. The call can be direct, through the PLT, or through a GOT slot, including one the loader fills with a function in the binary itself (`R_X86_64_RELATIVE`), which is how a Rust PIE calls the standard library. The lifter uses the same set for every linked binary, stripped or not (in an object file, only the names), and ends the block at such a call.
+
+## Cargo projects
+
+`--cargo DIR` writes the output as a Cargo project instead of one file ([`src/project.rs`](../src/project.rs)), in either mode and with `--check`:
+
+```
+DIR/Cargo.toml                 package named after the binary, edition 2021, no dependencies
+DIR/src/main.rs                fn main(): argc, argv and envp from the process, then the decompiled main
+DIR/src/decompiled/mod.rs      lint allows, `simd`, and `pub use` of every module below
+DIR/src/decompiled/types.rs    recovered structs
+DIR/src/decompiled/ffi.rs      the externs, and todo!() stand-ins for functions of the binary that aren't in the output
+DIR/src/decompiled/data.rs     the statics
+DIR/src/decompiled/crt.rs      _start, _init, frame_dummy and the rest of the C runtime's code
+DIR/src/decompiled/*.rs        the functions
+```
+
+Functions are grouped by, in order: the C runtime's names (`crt`); the namespace of a Rust or C++ symbol, its first two path segments (`core::fmt::write` and `<core::fmt::Arguments as Display>::fmt` in `core_fmt`); the compilation unit in the debug info (`src/list.c` in `list_c`); and for the rest, address order, 64 functions to a module (`code`, or `code_1`, `code_2`, ...), since linkers keep each object file's functions together. Every module starts with `use super::*;`, so the code is the same as in one file. Identifiers are unique across the whole output, so the globs never clash, and a module name never matches a struct's or `core`/`std`/`alloc`.
+
+The generated `main` calls the decompiled `main` (`_main` on Mach-O) with as many of argc, argv and envp as its signature takes, and exits with what it returns. In safe mode it calls `main`'s raw twin, which takes integers: `--cargo` counts `main` as address-taken, as it is in the binary (`_start` passes it to `__libc_start_main`). Without a decompiled `main` (`-f` without it, `--hex`, a library) the crate is a library, `src/lib.rs`.
+
+Linking needs two things the single file leaves to whoever links it. A call to a function of the binary that isn't in the output (not selected, or not lifted) is an extern in the single file; in the project it is a `todo!()` in `ffi.rs` with the same signature, so it links and panics if called. And every shared library the binary needs (`DT_NEEDED`) other than the ones Rust's std links already (libc, libm, libpthread, libdl, librt, libutil, libgcc_s) gets a `#[link(name = "libselinux.so.1", modifiers = "+verbatim")]`, so it links against the installed library without its development package. The C runtime's code refers to weak symbols (`__gmon_start__`, `_ITM_registerTMCloneTable`); nothing calls it, so the linker drops it.
+
+Running it again replaces `src/` and `Cargo.toml`; it refuses a directory whose `Cargo.toml` it didn't write. `tests/cargo.rs` builds a three-file C program with `-g`, writes a project in both modes, and checks the modules, that `cargo build` has no warnings, and that the program prints and returns the same as the original.
+
+Small programs run as they did. Larger ones (`/bin/ls`, a Rust hello-world with its standard library) build and link but crash: a GOT slot for imported data (`stdout`, `program_invocation_name`) is still null in the statics ([Globals](#globals)).
 
 ## Tests
 

@@ -770,6 +770,10 @@ impl Program {
             .funcs
             .iter()
             .map(|f| {
+                // (a function that isn't selected has no identifier, and no twin)
+                if f.ident.is_empty() {
+                    return String::new();
+                }
                 let mut t = format!("{}_raw", f.ident);
                 while !used.insert(t.clone()) {
                     t.push('_');
@@ -1037,9 +1041,18 @@ fn summarize(f: &Function, sig: Sig, a: &Analysis) -> Callee {
                 if p.returned && pos < 64 {
                     c.ret_from |= 1 << pos;
                 }
+                if p.returned2 && pos < 64 {
+                    c.ret2_from |= 1 << pos;
+                }
+                if p.returns_contents.0 && pos < 64 {
+                    c.ret_contents |= 1 << pos;
+                }
+                if p.returns_contents.1 && pos < 64 {
+                    c.ret2_contents |= 1 << pos;
+                }
                 match p.class {
                     Class::Shared | Class::Mut if p.reg != crate::borrow::RSP => {
-                        Pass::Borrow { mutbl: p.class == Class::Mut, nullable: p.nullable, len: p.extent }
+                        Pass::Borrow { mutbl: p.class == Class::Mut, nullable: p.nullable, len: p.extent, keeps: p.keeps }
                     }
                     Class::NotPointer if !a.escaped.get(e).copied().unwrap_or(true) => Pass::Ignore,
                     _ => Pass::Escape,

@@ -1141,3 +1141,18 @@ __attribute__((visibility("hidden"))) NOINLINE void tmark(struct tnode *p, int v
 NOINLINE struct tnode *tmk(struct tnode *n, int i) { n->l = 0; n->r = 0; n->kids = 0; n->nk = 0; n->a = i; return n; }
 // @diff keep_across: i64(i64)
 int64_t keep_across(int64_t x) { struct tnode n; struct tnode *p = tmk(&n, (int)x); tmark(p, (int)x & 3, 1); return (int64_t)(p == &n) + p->a; }
+
+// A pointer to a local (`&head`) that later points into memory from a call
+// (`&s->next`), as when building a linked list in order.
+struct lnk { int64_t v; struct lnk *next; };
+static struct lnk lnk_pool[8];
+struct lnk *lnk_base = lnk_pool;
+NOINLINE struct lnk *lnk_new(int64_t i) { struct lnk *s = &lnk_base[i & 7]; s->v = i * 3 + 1; s->next = 0; return s; }
+// @diff chain_build: i64(i64:0..8)
+int64_t chain_build(int64_t n) {
+    struct lnk *head = 0, **pp = &head;
+    for (int64_t i = 0; i < n; i++) { struct lnk *s = lnk_new(i); *pp = s; pp = &s->next; }
+    int64_t t = 0;
+    for (struct lnk *s = head; s; s = s->next) t = t * 7 + s->v;
+    return t;
+}

@@ -1106,3 +1106,18 @@ uint64_t goto_calls(uint64_t code, uint64_t x) {
     }
     return x;
 }
+
+// Two functions that tail-call each other: each returns what the other does.
+NOINLINE int64_t walk_b(uint64_t x, int64_t n);
+NOINLINE int64_t walk_a(uint64_t x, int64_t n) {
+    if (n <= 0) return 101;
+    if (x & 1) return walk_b(x >> 1, n - 1);
+    return n * 3;
+}
+NOINLINE int64_t walk_b(uint64_t x, int64_t n) {
+    if (n <= 0) return 7;
+    if (x & 2) return walk_a(x >> 2, n - 1);
+    return -n;
+}
+// @diff walk_ab: i64(u64, i64:0..40)
+int64_t walk_ab(uint64_t x, int64_t n) { return walk_a(x, n) * 2 + 1; }

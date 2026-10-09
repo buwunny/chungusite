@@ -210,6 +210,52 @@ fn loaded_sections(data: &[u8]) -> Vec<(u64, Vec<u8>)> {
     out
 }
 
+/// Which nodes of the graph `succ` lie on a cycle of two or more nodes
+/// (Tarjan's strongly connected components, without recursion).
+fn in_cycle(succ: &[Vec<usize>]) -> Vec<bool> {
+    let n = succ.len();
+    let (mut index, mut low) = (vec![usize::MAX; n], vec![0usize; n]);
+    let (mut on, mut stack, mut out) = (vec![false; n], Vec::new(), vec![false; n]);
+    let mut next = 0;
+    for root in 0..n {
+        if index[root] != usize::MAX {
+            continue;
+        }
+        let mut work = vec![(root, 0usize)];
+        while let Some(&mut (v, ref mut k)) = work.last_mut() {
+            if *k == 0 && index[v] == usize::MAX {
+                index[v] = next;
+                low[v] = next;
+                next += 1;
+                stack.push(v);
+                on[v] = true;
+            }
+            if let Some(&w) = succ[v].get(*k) {
+                *k += 1;
+                if index[w] == usize::MAX {
+                    work.push((w, 0));
+                } else if on[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(u, _)) = work.last() {
+                low[u] = low[u].min(low[v]);
+            }
+            if low[v] == index[v] {
+                let at = stack.iter().rposition(|&w| w == v).unwrap();
+                let many = stack.len() - at > 1;
+                for w in stack.drain(at..) {
+                    on[w] = false;
+                    out[w] = many;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn konst(f: &Function, v: ValueId) -> Option<u64> {
     match f.insts[v].kind {
         InstKind::Const(c) => Some(f.consts[c.index()] as u64),
@@ -425,6 +471,22 @@ impl Program {
         //    change last round gets the same result again, so only the others
         //    are re-inferred.
         let mut sigs: Vec<Sig> = stack_args.iter().map(|&s| Sig { stack_args: s, ..Sig::default() }).collect();
+        // Functions that call each other in a cycle (`next()` tail-calling
+        // `step()`, which tail-calls `next()`) start from keeping every
+        // register and returning a value, which the rounds drop where it
+        // doesn't hold: starting from nothing, a cycle could never show
+        // that it returns what each member returns.
+        let succ: Vec<Vec<usize>> = funcs
+            .iter()
+            .map(|f| f.targets.iter().filter_map(|t| if let Target::Func(j) = t { Some(*j) } else { None }).collect())
+            .collect();
+        for (i, c) in in_cycle(&succ).into_iter().enumerate() {
+            if c && funcs[i].ir.is_ok() {
+                sigs[i].ret = true;
+                sigs[i].preserves = abi::CALLER_SAVED;
+                sigs[i].xpreserves = u32::MAX;
+            }
+        }
         let mut wanted_by = vec![0u8; funcs.len()];
         let mut callers: Vec<Vec<usize>> = vec![Vec::new(); funcs.len()];
         for (i, f) in funcs.iter().enumerate() {

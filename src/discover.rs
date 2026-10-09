@@ -373,7 +373,15 @@ fn walk(img: &Image, bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk 
                     if insn.op0_kind() == OpKind::NearBranch64 =>
                 {
                     let t = insn.near_branch_target();
-                    if t >= start && t < limit {
+                    // a `jmp` to the next instruction, or over nothing but
+                    // padding, goes to the next function: inside one, the
+                    // code would fall through
+                    let next = insn.next_ip();
+                    let over_padding = insn.flow_control() == FlowControl::UnconditionalBranch
+                        && t >= next
+                        && t < limit
+                        && is_padding(&bytes[(next - start) as usize..(t - start) as usize]);
+                    if t >= start && t < limit && !over_padding {
                         todo.push(t);
                     } else {
                         refs.push(t); // tail call
@@ -694,6 +702,26 @@ fn code_after_padding(gap: &[u8], addr: u64) -> Option<u64> {
     None
 }
 
+/// `b` is all padding: nops, `int3` or zeros.
+fn is_padding(b: &[u8]) -> bool {
+    let mut dec = Decoder::new(64, b, DecoderOptions::NONE);
+    let mut insn = Instruction::default();
+    while dec.can_decode() {
+        let pos = dec.position();
+        if b[pos] == 0 {
+            if dec.set_position(pos + 1).is_err() {
+                return true;
+            }
+            continue;
+        }
+        dec.decode_out(&mut insn);
+        if !matches!(insn.mnemonic(), Mnemonic::Nop | Mnemonic::Int3) {
+            return false;
+        }
+    }
+    true
+}
+
 /// The first few instructions of `b` are valid code, not padding.
 fn decodes(b: &[u8], ip: u64) -> bool {
     for i in Decoder::with_ip(64, b, ip, DecoderOptions::NONE).iter().take(4) {
@@ -922,10 +950,10 @@ mod tests {
     }
 
     /// A stripped x86_64 Mach-O executable: `__TEXT,__text` at 0x100000100
-    /// holding `xor eax, eax; jmp next` and then `next: mov rax, rdi; ret`, and,
+    /// holding `xor eax, eax; jz next` and then `next: mov rax, rdi; ret`, and,
     /// if `starts`, an `LC_FUNCTION_STARTS` that lists both.
     fn macho(starts: bool) -> Vec<u8> {
-        let code = [0x31, 0xc0, 0xeb, 0x00, 0x48, 0x89, 0xf8, 0xc3];
+        let code = [0x31, 0xc0, 0x74, 0x00, 0x48, 0x89, 0xf8, 0xc3];
         let (base, code_at, blob_at) = (0x1_0000_0000u64, 0x100usize, 0x180usize);
         let mut d = Vec::new();
         let u32s = |d: &mut Vec<u8>, v: &[u32]| v.iter().for_each(|x| d.extend(x.to_le_bytes()));

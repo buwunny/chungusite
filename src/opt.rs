@@ -399,10 +399,10 @@ pub fn map_operands(k: &mut InstKind, pool: &mut [ValueId], r: impl Fn(&mut Valu
     use InstKind::*;
     match k {
         Const(_) | Undef | Param(_) | BlockParam(_) | FuncRef(_) | ImportRef(_) | AddrOfLocal(_)
-        | AddrOfGlobal(_) | Opaque { .. } | Copy(_) | Move(_) | Borrow { .. } => {}
+        | AddrOfGlobal(_) | Copy(_) | Move(_) | Borrow { .. } => {}
         Bin { lhs, rhs, .. } | Cmp { lhs, rhs, .. } => { r(lhs); r(rhs) }
-        Un { v, .. } | Cast { v, .. } | IntToPtr(v) | PtrToInt(v) | CallOut { call: v, .. } => r(v),
-        Exit { regs } => map_list(pool, *regs, r),
+        Un { v, .. } | Cast { v, .. } | IntToPtr(v) | PtrToInt(v) | CallOut { call: v, .. } | AsmOut { asm: v, .. } => r(v),
+        Exit { regs } | Opaque { args: regs, .. } => map_list(pool, *regs, r),
         Select { c, t, f } => { r(c); r(t); r(f) }
         Call { callee, args } => { r(callee); map_list(pool, *args, r) }
         PtrOffset { base, index, .. } => { r(base); if let Some(i) = index { r(i) } }
@@ -413,6 +413,47 @@ pub fn map_operands(k: &mut InstKind, pool: &mut [ValueId], r: impl Fn(&mut Valu
         Aggregate { fields, .. } => map_list(pool, *fields, r),
         Assign { val, .. } => r(val),
     }
+}
+
+/// Move the statements of a block that ends in a plain jump into the block it
+/// jumps to, when that block has no other predecessor (and its parameters are
+/// then just the jump's arguments). Nothing changes where control goes, but
+/// values computed before such a jump and used after it are now in the block
+/// that uses them, so they can be written into their use instead of declared
+/// up front and assigned: `if v98 as u8 & 1 != 0` rather than
+/// `let v139: u8 = v98 as u8; if (v139 & 1) != 0`. The emptied block stays as
+/// a jump, which the structurer skips. Returns how many blocks were emptied.
+pub fn merge_straight(f: &mut Function) -> usize {
+    let preds = preds(f);
+    let cfg = crate::cfg::Cfg::new(f);
+    let mut repl: Vec<Option<ValueId>> = vec![None; f.insts.len()];
+    let mut merged = 0;
+    // A block's only predecessor comes before it in reverse postorder, so it has
+    // taken in its own chain by then.
+    for &b in &cfg.rpo {
+        let &[a] = &preds[b.index()] else { continue };
+        let Terminator::Jump { to, args } = f.blocks[a].term else { continue };
+        let (ai, bi, params) = (f.blocks[a].insts, f.blocks[b].insts, f.blocks[b].params);
+        if b == f.entry || a == b || to != b || ai.len + params.len == 0 {
+            continue;
+        }
+        for k in 0..params.len as usize {
+            let p = f.value_pool[params.start as usize + k];
+            repl[p.index()] = Some(f.value_pool[args.start as usize + k]);
+        }
+        let start = f.value_pool.len() as u32;
+        let moved: Vec<ValueId> = ai.get(&f.value_pool).iter().chain(bi.get(&f.value_pool)).copied().collect();
+        f.value_pool.extend(moved);
+        f.blocks[b].insts = ListRef { start, len: ai.len + bi.len };
+        f.blocks[b].params = ListRef::EMPTY;
+        f.blocks[a].insts = ListRef::EMPTY;
+        f.blocks[a].term = Terminator::Jump { to: b, args: ListRef::EMPTY };
+        merged += 1;
+    }
+    if merged > 0 {
+        rewrite_uses(f, &repl);
+    }
+    merged
 }
 
 /// Most instructions a return block may have and still be copied into each of

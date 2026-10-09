@@ -271,6 +271,8 @@ pub struct Function {
     pub noreturn_falls: Vec<(ValueId, BlockId)>,
     /// Saves its argument registers for `va_arg` (`Lifter::spill_skip`).
     pub variadic: bool,
+    /// The instructions kept as inline assembly, indexed by `Opaque::asm`.
+    pub asm: Vec<Asm>,
 }
 
 impl Function {
@@ -290,6 +292,7 @@ impl Function {
             origin: Vec::with_capacity(insts),
             noreturn_falls: Vec::new(),
             variadic: false,
+            asm: Vec::new(),
         }
     }
 
@@ -304,7 +307,38 @@ impl Function {
         self.origin.clear();
         self.noreturn_falls.clear();
         self.variadic = false;
+        self.asm.clear();
     }
+}
+
+/// An instruction the lifter has no model of, kept as it is: the template of an
+/// `asm!` that runs it on the values of the registers it uses (`InstKind::Opaque`).
+#[derive(Clone, Debug)]
+pub struct Asm {
+    /// The `asm!` template, in Intel syntax. A memory operand is `[{k}]`, its
+    /// address computed outside; registers are named as they are, except rbx
+    /// and rbp (which `asm!` can't bind by name) and the flags, which are `{k}`.
+    pub text: String,
+    /// The operands in `asm!` order: the `{k}` ones first, then those bound
+    /// to a named register.
+    pub ops: Vec<AsmOp>,
+    /// The template pushes and pops (to read or write the flags).
+    pub stack: bool,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct AsmOp {
+    /// A register class (`reg`, `reg_abcd`), or a register's name (`rax`, `xmm1`).
+    pub reg: &'static str,
+    /// `reg` is a register's name.
+    pub named: bool,
+    /// An xmm register: two values, its low and high halves.
+    pub xmm: bool,
+    /// Where its value is in the `Opaque`'s arguments, if the instruction reads it.
+    pub input: Option<u8>,
+    /// Its result (`AsmOut::k`; the low half's, for an xmm register), if the
+    /// instruction writes it.
+    pub output: Option<u8>,
 }
 
 #[derive(Debug)]
@@ -346,6 +380,9 @@ pub enum InstKind {
     /// is known not to touch. `abi::apply` resolves each one from the callee's
     /// signature.
     CallOut { call: ValueId, reg: u8 },
+    /// Result `k` of the inline assembly `asm` (an `Opaque`): a register's new
+    /// value, in the order of `Asm::ops`.
+    AsmOut { asm: ValueId, k: u8 },
     /// The caller-saved registers at a return (`lift::EXIT_REGS` order), recorded
     /// when `Lifter::track_exits` is set, so `abi` can tell which registers a
     /// function preserves and whether it returns rdx too. `abi::apply` removes it.
@@ -373,7 +410,10 @@ pub enum InstKind {
     Aggregate { ty: TyId, fields: ListRef },   // struct/array literal
 
     // ---- escape hatch ----
-    Opaque { addr_idx: u32 },    // inline asm / unliftable instruction, always unsafe
+    /// An instruction kept as inline assembly, `Function::asm[asm]`, reading
+    /// `args`. Its results are `AsmOut`s. It touches memory only through its
+    /// arguments; always unsafe.
+    Opaque { asm: u32, args: ListRef },
 }
 
 /// A Rust place expression: base + projections, e.g. (*p).items[i].len
@@ -543,7 +583,7 @@ impl InstKind {
         use InstKind::*;
         match self {
             Const(_) | Undef | Param(_) | BlockParam(_) | Bin { .. } | Un { .. } | Cmp { .. } | Cast { .. }
-            | Select { .. } | FuncRef(_) | ImportRef(_) | Call { .. } | CallOut { .. } | Exit { .. } => Tier::Pure,
+            | Select { .. } | FuncRef(_) | ImportRef(_) | Call { .. } | CallOut { .. } | AsmOut { .. } | Exit { .. } => Tier::Pure,
             PtrOffset { .. } | AddrOfLocal(_) | AddrOfGlobal(_) | IntToPtr(_) | PtrToInt(_)
             | Load { .. } | Store { .. } | MemCopy { .. } | MemFill { .. } | Opaque { .. } => Tier::Raw,
             Copy(_) | Move(_) | Assign { .. } | Borrow { .. } | Aggregate { .. } => Tier::Safe,

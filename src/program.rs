@@ -18,7 +18,7 @@ use crate::borrow::{analyze_with, Analysis, Callee, Class, Ctx, Pass};
 use crate::emit::{emit_function_in, CallInfo, EmitStats, Env, Mode};
 use crate::ir::*;
 use crate::lift::Lifter;
-use crate::opt::{clean, split_returns};
+use crate::opt::{clean, merge_straight, split_returns};
 use crate::types::{FnTypes, TypeModel, TypeStats};
 use crate::verify::verify;
 use object::{Object, ObjectKind, ObjectSection, ObjectSymbol, RelocationTarget, SectionKind};
@@ -29,6 +29,8 @@ use std::fmt::Write as _;
 /// Signature inference stops after this many rounds even if a cycle of
 /// signatures keeps changing (it is monotone in practice, so this is a backstop).
 const MAX_ROUNDS: usize = 64;
+/// The round from which summaries only grow.
+const WIDEN_ROUND: usize = 16;
 
 /// A function to decompile.
 pub struct Input<'a> {
@@ -100,9 +102,12 @@ pub struct Program {
     got_addr: HashMap<u64, u64>,
 }
 
-/// How `Program::build_with` recovers types.
+/// How `Program::build_with` lifts functions and recovers types.
 #[derive(Copy, Clone)]
 pub struct BuildOptions<'a> {
+    /// Keep an instruction the lifter has no model of as inline assembly
+    /// (`Lifter::asm`) instead of failing its function.
+    pub asm: bool,
     /// Use DWARF debug info when the file has it.
     pub dwarf: bool,
     /// Proposes argument and return types; the facts accept or reject them.
@@ -113,7 +118,7 @@ pub struct BuildOptions<'a> {
 
 impl Default for BuildOptions<'_> {
     fn default() -> Self {
-        BuildOptions { dwarf: true, model: None, dataset: false }
+        BuildOptions { asm: true, dwarf: true, model: None, dataset: false }
     }
 }
 
@@ -316,6 +321,7 @@ impl Program {
                         let mut l = Lifter::new();
                         l.track_exits = true;
                         l.thread_pointer = thread_pointer;
+                        l.asm = opts.asm;
                         l
                     },
                     |lifter, x| {
@@ -485,6 +491,24 @@ impl Program {
                         stack_args[*j] = stack_args[*j].max(g.2);
                     }
                 }
+            }
+        }
+        // A tail call passes on the caller's own stack arguments, where the
+        // callee reads its own: the caller takes as many as the callee does.
+        loop {
+            let mut changed = false;
+            for (i, f) in funcs.iter().enumerate() {
+                for (t, s) in f.targets.iter().zip(&f.sites) {
+                    if let (Target::Func(j), Site::Tail(_)) = (t, s) {
+                        if stack_args[*j] > stack_args[i] {
+                            stack_args[i] = stack_args[*j];
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
             }
         }
 
@@ -689,6 +713,7 @@ impl Program {
             if made + entries > 0 {
                 clean(ir);
             }
+            merge_straight(ir);
             for (old, new) in copied {
                 let k = f.sites.iter().position(|&s| s == old).expect("a call site");
                 f.sites.push(new);
@@ -1077,7 +1102,7 @@ impl Program {
                         if s.raw_sites.contains(&(i, site)) {
                             // the raw twin: what it borrows, it still only accesses
                             let c = s.callee(self, i, k)?;
-                            return Some(Callee { args: c.args, raw: true, ..Callee::default() });
+                            return Some(Callee { args: c.args, raw: true, stores: c.stores, ..Callee::default() });
                         }
                         s.callee(self, i, k)
                     };
@@ -1096,7 +1121,26 @@ impl Program {
                         dirty[i] = true;
                     }
                 }
-                let new = summarize(ir, f.sig, &a);
+                let mut new = summarize(ir, f.sig, &a);
+                // Past the first rounds, a summary only grows, so cycles whose
+                // summaries feed back on each other settle.
+                if round >= WIDEN_ROUND {
+                    if let Some(old) = &s.summary[i] {
+                        new = widen(old, new);
+                    }
+                }
+                // An argument it takes as a slice that callers don't lend one for
+                // (it escapes through what it is stored into, or the widened
+                // summary says so) takes an integer, so the two agree.
+                for (pos, pass) in new.args.iter().enumerate() {
+                    let Some(e) = entry_index(ir, pos) else { continue };
+                    let p = &a.params[e];
+                    let slice = matches!(p.class, Class::Shared | Class::Mut) && p.reg != crate::borrow::RSP;
+                    if slice && !matches!(pass, Pass::Borrow { .. }) && !demoted[i][e] {
+                        demoted[i][e] = true;
+                        dirty[i] = true;
+                    }
+                }
                 if s.summary[i].as_ref() != Some(&new) {
                     s.summary[i] = Some(new);
                     for &c in &callers[i] {
@@ -1299,6 +1343,40 @@ fn entry_index(f: &Function, k: usize) -> Option<usize> {
     f.blocks[f.entry].params.get(&f.value_pool).iter().position(|&x| x == p)
 }
 
+/// A summary at least as conservative as both.
+fn widen(old: &Callee, new: Callee) -> Callee {
+    // (`old`, `new`): the function's own analysis gave `new`, and an argument
+    // it doesn't take as a slice can't be lent one
+    let pass = |a: Pass, b: Pass| match (a, b) {
+        (Pass::Borrow { mutbl, keeps, .. }, Pass::Ignore) => Pass::Raw { mutbl, keeps },
+        (Pass::Ignore, x) | (x, Pass::Ignore) => x,
+        (
+            Pass::Borrow { mutbl: m1, nullable: n1, len: l1, keeps: k1 },
+            Pass::Borrow { mutbl: m2, nullable: n2, len: l2, keeps: k2 },
+        ) => Pass::Borrow { mutbl: m1 | m2, nullable: n1 | n2, len: l1.zip(l2).map(|(a, b)| a.max(b)), keeps: k1 | k2 },
+        (Pass::Borrow { mutbl: m1, keeps: k1, .. } | Pass::Raw { mutbl: m1, keeps: k1 }, Pass::Borrow { mutbl: m2, keeps: k2, .. } | Pass::Raw { mutbl: m2, keeps: k2 }) => {
+            Pass::Raw { mutbl: m1 | m2, keeps: k1 | k2 }
+        }
+        (a, b) if a == b => a,
+        _ => Pass::Escape,
+    };
+    let n = old.args.len().max(new.args.len());
+    let at = |c: &Callee, k: usize| c.args.get(k).copied().unwrap_or(Pass::Escape);
+    let mut stores = old.stores.clone();
+    stores.extend_from_slice(&new.stores);
+    stores.sort();
+    stores.dedup();
+    Callee {
+        args: (0..n).map(|k| pass(at(old, k), at(&new, k))).collect(),
+        ret_from: old.ret_from | new.ret_from,
+        ret2_from: old.ret2_from | new.ret2_from,
+        ret_contents: old.ret_contents | new.ret_contents,
+        ret2_contents: old.ret2_contents | new.ret2_contents,
+        stores,
+        ..new
+    }
+}
+
 /// What a function does with each argument, from its borrow analysis.
 fn summarize(f: &Function, sig: Sig, a: &Analysis) -> Callee {
     let n = sig.args as usize + sig.stack_args as usize;
@@ -1321,11 +1399,31 @@ fn summarize(f: &Function, sig: Sig, a: &Analysis) -> Callee {
                 if p.returns_contents.1 && pos < 64 {
                     c.ret2_contents |= 1 << pos;
                 }
+                // where it stores the argument, or what it loads from its
+                // object, by position; into a parameter that isn't an argument,
+                // or at an offset it doesn't know, the argument escapes or keeps.
+                // (An argument it never dereferences may be an integer: one stored
+                // as it is escapes, so the caller doesn't take it for a pointer.)
+                let (mut keeps, mut escapes) = (p.keeps, false);
+                if p.reg != crate::borrow::RSP {
+                    for &(j, off, deref) in &p.into {
+                        let into = (0..n).map(|q| if q < sig.args as usize { q } else { 6 + q - sig.args as usize }).find(|&q| entry_index(f, q) == Some(j as usize));
+                        match (into, off) {
+                            (Some(q), Some(off)) if q <= u8::MAX as usize && pos <= u8::MAX as usize && (deref || p.class != Class::NotPointer) => {
+                                c.stores.push(crate::borrow::Store { from: pos as u8, into: q as u8, off, deref })
+                            }
+                            _ if deref => keeps = true,
+                            _ => escapes = true,
+                        }
+                    }
+                }
                 match p.class {
+                    _ if escapes => Pass::Escape,
                     Class::Shared | Class::Mut if p.reg != crate::borrow::RSP => {
-                        Pass::Borrow { mutbl: p.class == Class::Mut, nullable: p.nullable, len: p.extent, keeps: p.keeps }
+                        Pass::Borrow { mutbl: p.class == Class::Mut, nullable: p.nullable, len: p.extent, keeps }
                     }
                     Class::NotPointer if !a.escaped.get(e).copied().unwrap_or(true) => Pass::Ignore,
+                    Class::Raw if p.during_call => Pass::Raw { mutbl: a.written.get(e).copied().unwrap_or(true), keeps },
                     _ => Pass::Escape,
                 }
             }
@@ -1337,6 +1435,8 @@ fn summarize(f: &Function, sig: Sig, a: &Analysis) -> Callee {
             c.args[pos] = pass;
         }
     }
+    c.stores.sort();
+    c.stores.dedup();
     c
 }
 
@@ -1441,5 +1541,25 @@ pub fn describe(e: &crate::lift::LiftError) -> String {
         LiftError::FlagsNotInBlock { ip } => format!("branch at {ip:#x} reads flags set in another block"),
         LiftError::BranchOutOfRange { ip, target } => format!("branch at {ip:#x} leaves the function (to {target:#x})"),
         LiftError::TargetInsideInstruction { target } => format!("branch into the middle of an instruction at {target:#x}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with(args: Vec<Pass>) -> Callee {
+        Callee { args, ..Callee::default() }
+    }
+
+    #[test]
+    fn widening_never_lends_a_slice_the_function_doesnt_take() {
+        let borrow = Pass::Borrow { mutbl: true, nullable: false, len: Some(8), keeps: false };
+        // callers lent a slice before, and now the function takes an integer
+        let w = widen(&with(vec![borrow]), with(vec![Pass::Ignore]));
+        assert_eq!(w.args, vec![Pass::Raw { mutbl: true, keeps: false }]);
+        // growing from the optimistic start is unchanged
+        let w = widen(&with(vec![Pass::Ignore]), with(vec![borrow]));
+        assert_eq!(w.args, vec![borrow]);
     }
 }

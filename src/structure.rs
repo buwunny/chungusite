@@ -715,12 +715,111 @@ pub fn tidy(nodes: Vec<Node>) -> Vec<Node> {
                 if let Some(Node::Loop { head, body: lb } | Node::While { head, body: lb, .. }) = body.last_mut() {
                     retarget(lb, Label::Block(label), Label::Loop(*head));
                 }
+                if uses(&body, Label::Block(label)) {
+                    let mut budget = UNBREAK_COPIES;
+                    if let Some(b) = unbreak(body.clone(), Label::Block(label), &mut budget) {
+                        body = b;
+                    }
+                }
                 Node::Block { label, body }
             }
             n => n,
         })
         .collect();
     level(nodes)
+}
+
+/// Most nodes `unbreak` may copy to do away with one labeled block.
+const UNBREAK_COPIES: usize = 8;
+
+/// `'l: { nodes }` as plain nesting, or `None` if it needs the label. Each
+/// `break 'l` must be the last thing on its path through nested `if`s; it becomes
+/// falling off the end, and what follows such an `if` moves into the arms that
+/// fall off it: `'l: { if c { A; break 'l; } B }` is `if c { A } else { B }`.
+/// What follows is copied when both arms fall off, at most `budget` nodes in all.
+fn unbreak(mut nodes: Vec<Node>, l: Label, budget: &mut usize) -> Option<Vec<Node>> {
+    // From the last node that leaves to `'l` back: each takes in what follows it.
+    while let Some(i) = nodes.iter().rposition(|n| uses(std::slice::from_ref(n), l)) {
+        let rest = nodes.split_off(i + 1);
+        match nodes.pop() {
+            // (anything after it is dead)
+            Some(Node::Break(x)) if x == l => {}
+            Some(Node::If { c, mut then, mut els }) => {
+                let (tf, ef) = (!diverges(&then), !diverges(&els));
+                if tf && ef {
+                    *budget = budget.checked_sub(size(&rest))?;
+                    then.extend(rest.iter().cloned());
+                    els.extend(rest);
+                } else if tf {
+                    then.extend(rest);
+                } else if ef {
+                    els.extend(rest);
+                }
+                let then = level(unbreak(then, l, budget)?);
+                let els = level(unbreak(els, l, budget)?);
+                nodes.push(Node::If { c, then, els });
+            }
+            // Leaving the loop goes on to `rest`: copy it in front of each of the
+            // loop's own `break`s, and the loop ends the block, so `break 'l` is
+            // a `break` of the loop.
+            Some(Node::Loop { head, mut body }) => {
+                let me = Label::Loop(head);
+                if !rest.is_empty() {
+                    let n = breaks(&body, me);
+                    *budget = budget.checked_sub(size(&rest) * n.saturating_sub(1))?;
+                    before_breaks(&mut body, me, &rest);
+                }
+                retarget(&mut body, l, me);
+                nodes.push(Node::Loop { head, body });
+            }
+            Some(Node::While { head, c, mut body }) if rest.is_empty() => {
+                retarget(&mut body, l, Label::Loop(head));
+                nodes.push(Node::While { head, c, body });
+            }
+            _ => return None,
+        }
+    }
+    Some(nodes)
+}
+
+/// How many `break`s in `nodes` leave `l`.
+fn breaks(nodes: &[Node], l: Label) -> usize {
+    nodes
+        .iter()
+        .map(|n| match n {
+            Node::Break(x) => (*x == l) as usize,
+            Node::If { then, els, .. } => breaks(then, l) + breaks(els, l),
+            Node::Loop { body, .. } | Node::While { body, .. } | Node::Block { body, .. } => breaks(body, l),
+            Node::Dispatch { arms } => arms.iter().map(|(_, a)| breaks(a, l)).sum(),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Put `rest` in front of each `break` of `l` in `nodes`, or in its place if
+/// `rest` never falls off its end.
+fn before_breaks(nodes: &mut Vec<Node>, l: Label, rest: &[Node]) {
+    let keep = !diverges(rest);
+    let mut out = Vec::with_capacity(nodes.len());
+    for mut n in std::mem::take(nodes) {
+        match &mut n {
+            Node::Break(x) if *x == l => {
+                out.extend(rest.iter().cloned());
+                if !keep {
+                    continue;
+                }
+            }
+            Node::If { then, els, .. } => {
+                before_breaks(then, l, rest);
+                before_breaks(els, l, rest);
+            }
+            Node::Loop { body, .. } | Node::While { body, .. } | Node::Block { body, .. } => before_breaks(body, l, rest),
+            Node::Dispatch { arms } => arms.iter_mut().for_each(|(_, a)| before_breaks(a, l, rest)),
+            _ => {}
+        }
+        out.push(n);
+    }
+    *nodes = out;
 }
 
 fn retarget(nodes: &mut [Node], from: Label, to: Label) {
@@ -751,8 +850,8 @@ fn level(nodes: Vec<Node>) -> Vec<Node> {
             Node::If { c, then, els } => {
                 let (td, ed) = (diverges(&then), diverges(&els));
                 match (then.is_empty(), els.is_empty()) {
-                    // the condition may read memory (an inlined load), so keep it
-                    (true, true) if may_fault(&c) => out.push(Node::Line(format!("let _ = {c};"))),
+                    // the condition may read memory (an inlined load) or call, so keep it
+                    (true, true) if may_fault(&c) || calls(&c) => out.push(Node::Line(format!("let _ = {c};"))),
                     (true, true) => {}
                     // `if a { if b { .. } }` is `if a && b { .. }`
                     (false, true) => {
@@ -1169,6 +1268,58 @@ mod tests {
 
     fn line(s: &str) -> Node {
         Node::Line(s.to_string())
+    }
+
+    fn text(nodes: &[Node]) -> String {
+        let mut out = String::new();
+        print(nodes, 0, &mut out);
+        out
+    }
+
+    #[test]
+    fn a_labeled_block_left_from_nested_ifs_becomes_if_else() {
+        // 'b1: { if a { if b { x; break 'b1; } } y; }  z;
+        let body = vec![
+            Node::If {
+                c: "a".into(),
+                then: vec![Node::If { c: "b".into(), then: vec![line("x;"), Node::Break(Label::Block(1))], els: vec![] }],
+                els: vec![],
+            },
+            Node::Copy("y;".into()),
+        ];
+        let nodes = tidy(vec![Node::Block { label: 1, body }, line("z;")]);
+        assert_eq!(text(&nodes), "if a && b {\n    x;\n} else {\n    y;\n}\nz;\n");
+    }
+
+    #[test]
+    fn code_after_a_loop_left_by_break_moves_to_the_loops_exits() {
+        // 'b1: { loop { if d { x; break 'b1; } if c { break; } } y; }
+        let lp = Node::Loop {
+            head: 2,
+            body: vec![
+                Node::If { c: "d".into(), then: vec![line("x;"), Node::Break(Label::Block(1))], els: vec![] },
+                Node::If { c: "c".into(), then: vec![Node::Break(Label::Loop(2))], els: vec![] },
+            ],
+        };
+        let nodes = tidy(vec![Node::Block { label: 1, body: vec![lp, line("y;")] }, Node::Exit("return;".into())]);
+        assert_eq!(text(&nodes), "loop {\n    if d {\n        x;\n        break;\n    }\n    if c {\n        y;\n        break;\n    }\n}\nreturn;\n");
+    }
+
+    #[test]
+    fn a_label_stays_where_removing_it_would_copy_too_much() {
+        let big: Vec<Node> = (0..UNBREAK_COPIES + 1).map(|k| line(&format!("y{k};"))).collect();
+        let body = vec![
+            Node::If {
+                c: "a".into(),
+                then: vec![Node::If { c: "b".into(), then: vec![Node::Break(Label::Block(1))], els: vec![] }, line("x;")],
+                els: vec![],
+            },
+        ]
+        .into_iter()
+        .chain(big)
+        .collect();
+        let nodes = tidy(vec![Node::Block { label: 1, body }, line("z;")]);
+        assert!(text(&nodes).contains("'b1: {"));
     }
 
     #[test]

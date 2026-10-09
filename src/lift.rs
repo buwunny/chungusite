@@ -21,6 +21,7 @@
 use crate::ir::*;
 use iced_x86::{ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 
+mod asm;
 mod sse;
 mod x87;
 
@@ -113,6 +114,9 @@ enum Flags {
     /// ucomis / comis of the low `w`-byte floats `a` and `b`: ZF, PF and CF
     /// (all set when unordered), with OF = SF = 0.
     Float { a: ValueId, b: ValueId, w: u8 },
+    /// rflags as an instruction kept as inline assembly left them
+    /// (`Lifter::lift_asm`); `valid` is the status flags it holds for sure.
+    Raw { rflags: ValueId, valid: u16 },
 }
 
 /// How many instructions before an indirect `jmp` pass 1 keeps, to recognize the
@@ -255,6 +259,15 @@ pub struct Lifter {
     /// the block `load::tls` lays out (`program.rs` sets this). `None` leaves
     /// them unsupported.
     pub thread_pointer: Option<u64>,
+    /// Keep an instruction the lifter has no model of as inline assembly
+    /// (`InstKind::Opaque`) instead of failing the function (`lift/asm.rs`).
+    pub asm: bool,
+    /// Instructions the lifter models, but not in the form found at these
+    /// addresses: kept as inline assembly on the next try.
+    forced: Vec<u64>,
+    /// Each `Opaque` and where its arguments are in `asm_vals`, for `finalize`.
+    asm_args: Vec<(ValueId, u32, u32)>,
+    asm_vals: Vec<ValueId>,
     cur: usize,
     flags: Flags,
     ip: u64,
@@ -299,6 +312,10 @@ impl Lifter {
             nstub: 0,
             track_exits: false,
             thread_pointer: None,
+            asm: false,
+            forced: Vec::new(),
+            asm_args: Vec::new(),
+            asm_vals: Vec::new(),
             cur: 0,
             flags: Flags::Unknown,
             ip: 0,
@@ -335,6 +352,33 @@ impl Lifter {
         noreturn: &dyn Fn(u64, Option<u64>) -> bool,
         f: &mut Function,
     ) -> Result<(), LiftError> {
+        self.forced.clear();
+        loop {
+            match self.lift_once(code, ip, data, noreturn, f) {
+                // an instruction the lifter knows, in a form it doesn't: again,
+                // with that one kept as inline assembly
+                Err(LiftError::Unsupported { ip: at, .. }) if self.asm && !self.forced.contains(&at) => {
+                    let mut i = Instruction::default();
+                    let mut dec = Decoder::with_ip(64, code.get(at.wrapping_sub(ip) as usize..).unwrap_or(&[]), at, DecoderOptions::NONE);
+                    dec.decode_out(&mut i);
+                    if !handled(&i) || !self.asm_fits(&i) {
+                        return Err(LiftError::Unsupported { ip: at, mnemonic: i.mnemonic() });
+                    }
+                    self.forced.push(at);
+                }
+                r => return r,
+            }
+        }
+    }
+
+    fn lift_once(
+        &mut self,
+        code: &[u8],
+        ip: u64,
+        data: &[(u64, &[u8])],
+        noreturn: &dyn Fn(u64, Option<u64>) -> bool,
+        f: &mut Function,
+    ) -> Result<(), LiftError> {
         f.clear();
         // Decode linearly first, the fast path for compiled code. If that
         // fails, the bytes may hold something no path reaches (junk after a
@@ -352,6 +396,8 @@ impl Lifter {
         self.tails.clear();
         self.exits.clear();
         self.switches.clear();
+        self.asm_args.clear();
+        self.asm_vals.clear();
         self.nstub = 0;
         self.fdepth_in.clear();
         self.fdepth_in.resize(self.leaders.len() + self.stubs.len(), None);
@@ -497,7 +543,7 @@ impl Lifter {
             // Pass 2 lifts every instruction (code after a `ret` starts a block
             // too), so the first one it has no case for fails the function now,
             // before any IR is built.
-            if !handled(&self.insn) {
+            if !handled(&self.insn) && !(self.asm && { let i = self.insn; self.asm_fits(&i) }) {
                 return Err(self.unsupported());
             }
             let i = &self.insn;
@@ -652,7 +698,9 @@ impl Lifter {
             use Register::*;
             // What a callee may change, and what instructions change besides
             // their destination (`mul`'s rdx, `rep movsb`'s pointers).
-            let mut clobbered = if i.flow_control() == FlowControl::Call {
+            let mut clobbered = if !handled(&i) {
+                u16::MAX // inline assembly: whatever it writes
+            } else if i.flow_control() == FlowControl::Call {
                 bits(&[RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11])
             } else if i.is_string_instruction() {
                 bits(&[RAX, RCX, RSI, RDI])
@@ -1015,6 +1063,9 @@ impl Lifter {
         if matches!(i.mnemonic(), Mnemonic::Ud2 | Mnemonic::Int3 | Mnemonic::Hlt) {
             self.end_block(f, Terminator::Unreachable);
             return Ok(true);
+        }
+        if self.asm && (!handled(&i) || self.forced.contains(&self.ip)) {
+            return self.lift_asm(f, &i).map(|_| false);
         }
         match i.flow_control() {
             FlowControl::Next => self.lift_data(f, &i).map(|_| false),
@@ -1921,6 +1972,7 @@ impl Lifter {
         use ConditionCode as C;
         let (cond, lhs, rhs) = match self.flags {
             Flags::Unknown => return Err(LiftError::FlagsNotInBlock { ip: self.ip }),
+            Flags::Raw { rflags, valid } => return self.raw_condition(f, cc, rflags, valid),
             Flags::Entry => return Ok(self.cond_in(f, self.cur, cc, self.ip)),
             // inc / dec: add / sub of 1, without the carry conditions
             Flags::Dec { .. } | Flags::Inc { .. } if matches!(cc, C::b | C::ae | C::be | C::a) => return Err(self.unsupported()),
@@ -2405,6 +2457,13 @@ impl Lifter {
             f.value_pool.extend_from_slice(&regs);
             if let InstKind::Exit { regs } = &mut f.insts[exit].kind {
                 *regs = ListRef { start, len: if self.xmm { EXIT_LEN } else { EXIT_XMM0 } as u32 };
+            }
+        }
+        for &(op, start, len) in &self.asm_args {
+            let at = f.value_pool.len() as u32;
+            f.value_pool.extend_from_slice(&self.asm_vals[start as usize..(start + len) as usize]);
+            if let InstKind::Opaque { args, .. } = &mut f.insts[op].kind {
+                *args = ListRef { start: at, len };
             }
         }
         for &(b, args) in &self.tails {

@@ -154,6 +154,10 @@ pub enum Pass {
         /// the objects the caller's pointers stored there point to escape.
         keeps: bool,
     },
+    /// Accesses it as a raw pointer, but only during the call: it doesn't keep
+    /// it (`keeps` as for `Borrow`). The caller passes a pointer made from its
+    /// slice at the call, as to a raw twin.
+    Raw { mutbl: bool, keeps: bool },
     /// Frees it (`free`, `operator delete`): a move of an owned allocation.
     Free,
     /// Reads (or writes) through it during the call only, like `memcpy`. Safe
@@ -185,6 +189,23 @@ pub struct Callee {
     /// as addresses (they escape), but it still accesses only `len` bytes of
     /// them during the call.
     pub raw: bool,
+    /// Pointers loaded from one argument's object that it may store into
+    /// another's, without keeping them otherwise.
+    pub stores: Vec<Store>,
+}
+
+/// A callee may store argument `from`, or a pointer it loads from `from`'s
+/// object (or from what that points to), into argument `into`'s object, `off`
+/// bytes from the argument: `out.r = x`, `*out = in.ptr`. The caller follows it
+/// there.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Store {
+    pub from: u8,
+    pub into: u8,
+    pub off: i64,
+    /// What it stores is loaded from `from`'s object; otherwise it is the
+    /// argument itself (`out.r = &*x`): for the caller, a store of its address.
+    pub deref: bool,
 }
 
 /// What the analysis needs from the rest of the program.
@@ -211,6 +232,10 @@ pub enum FactKind {
     /// follow, passed to a callee that keeps it, or fed to an operation that isn't
     /// pointer arithmetic.
     Escape,
+    /// Read and written during the call through a pointer into several roots
+    /// (which can't be bounds-checked against one), or lent so to a callee that
+    /// keeps nothing: the root is raw, but the pointer isn't kept.
+    Unbounded,
     /// Returned to the caller (a reborrow if the root turns out to be a pointer).
     Return,
     /// Returned in rdx, the high half of a 16-byte result.
@@ -232,6 +257,15 @@ pub enum FactKind {
     CopyTo(u8),
     /// The contents of this root leave what we can track (copied elsewhere).
     Spill,
+    /// What this root holds (what is stored in it, or for an argument, its
+    /// contents) is copied into root `.0` (a `memcpy`), or a callee may store it
+    /// there (`Callee::stores`); `OTHER` for an object that isn't followed.
+    /// `facts` turns it into the facts of each object held.
+    Flow(u8),
+    /// A pointer loaded from an argument's object (on its `Contents` root) is
+    /// stored into argument `.0`'s object (by entry parameter index) at the
+    /// fact's offset, where the caller follows it (`Callee::stores`).
+    StoreInto(u8),
 }
 
 /// One observation about root `root`.
@@ -248,6 +282,10 @@ pub struct Fact {
     pub point: u32,
     /// The call, for `Borrow` and `Free`, and the argument position.
     pub site: Option<(Site, u8)>,
+    /// The bytes of a container `[lo, hi)` the fact is about, when known: for
+    /// `Stash`, where in the container the pointer is stored; for `Flow`, what
+    /// is copied out of it.
+    pub span: Option<(i64, i64)>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -278,6 +316,12 @@ pub struct ParamBorrow {
     pub returns_contents: (bool, bool),
     /// A pointer loaded from its object may be kept (`Pass::Borrow::keeps`).
     pub keeps: bool,
+    /// Entry parameters (by index) whose objects a pointer loaded from its
+    /// object may be stored into, and where (`None`: an unknown offset), for
+    /// `Callee::stores`.
+    /// `true` for a pointer loaded from its object, `false` for the argument
+    /// itself (`Store::deref`).
+    pub into: Vec<(u8, Option<i64>, bool)>,
     /// Compared against null: emit as `Option<&T>` / `Option<&mut T>`.
     pub nullable: bool,
     /// Constant offsets read or written through it, sorted; `true` if written.
@@ -289,6 +333,9 @@ pub struct ParamBorrow {
     /// is lent to; `None` if that isn't known (an indexed access, a callee that
     /// indexes).
     pub extent: Option<u32>,
+    /// Dereferenced, and kept by nothing: a raw one is only accessed during the
+    /// call (`Pass::Raw`).
+    pub during_call: bool,
 }
 
 #[derive(Clone)]
@@ -579,7 +626,7 @@ fn fact_len(f: &Function, x: &Fact, callee: impl Fn(Site) -> Option<Callee>) -> 
             konst(f, *args.get(&f.value_pool).get(2)?).filter(|&n| n >= 0)
         }
         // lent, to a slice-taking callee or its raw twin
-        (FactKind::Borrow { .. } | FactKind::RawLend { .. } | FactKind::Escape, _) => {
+        (FactKind::Borrow { .. } | FactKind::RawLend { .. } | FactKind::Escape | FactKind::Unbounded, _) => {
             let (site, k) = x.site?;
             match callee(site)?.args.get(k as usize)? {
                 Pass::Borrow { len, .. } => len.map(i64::from),
@@ -599,7 +646,7 @@ fn frame_pieces(f: &Function, facts: &[Fact], fr: u8, callees: &Callees, end: i6
     let mut ranges: Vec<(i64, i64)> = Vec::new();
     // (a pointer stored in the frame or an allocation is followed: its uses after
     // it is loaded back are facts of their own)
-    for x in facts.iter().filter(|x| x.root == fr && !matches!(x.kind, FactKind::NullCheck | FactKind::Stash(_))) {
+    for x in facts.iter().filter(|x| x.root == fr && !matches!(x.kind, FactKind::NullCheck | FactKind::Stash(_) | FactKind::Flow(_) | FactKind::StoreInto(_))) {
         let lo = match x.off {
             Off::Known(o) => o,
             Off::Unknown => x.lo,
@@ -651,6 +698,69 @@ fn split_frame(roots: &mut Vec<Root>, origin: &mut [Origin], fr: u8, pieces: &[(
         }
         o.roots = bits;
     }
+}
+
+/// What a call moves between its arguments' objects: `(from, into, at, len)`,
+/// argument positions, where in `into`'s object (from the argument) and how many
+/// bytes (`None`: unknown). What `memcpy(dst, src, n)` copies, and what a callee
+/// stores (`Callee::stores`), a pointer.
+fn flows(f: &Function, c: &Callee, args: &[ValueId]) -> Vec<(usize, usize, Option<i64>, Option<i64>)> {
+    let mut out = Vec::new();
+    let writes: Vec<usize> = (0..c.args.len()).filter(|&k| c.args[k] == Pass::Access { write: true }).collect();
+    for (k, p) in c.args.iter().enumerate() {
+        if *p == (Pass::Access { write: false }) {
+            let len = args.get(2).and_then(|&n| konst(f, n)).filter(|&n| n >= 0);
+            out.extend(writes.iter().map(|&d| (k, d, Some(0), len)));
+        }
+    }
+    out.extend(c.stores.iter().filter(|s| s.deref).map(|s| (s.from as usize, s.into as usize, Some(s.off), Some(8))));
+    out
+}
+
+/// Origins: what `src` points into is copied (`len` bytes, if known) into what
+/// `dst` points into, `at` bytes on: slot by slot when the offsets are known,
+/// so a load of one field doesn't see the pointers of every other one.
+fn copy_mem(mem: &mut Mem, roots: &[Root], dst: Origin, src: Origin, at: Option<i64>, len: Option<i64>) -> bool {
+    let (Some(d), Some(s)) = (dst.single().filter(|&d| is_container(roots, d)), src.single()) else { return false };
+    let start = match (dst.off, at) {
+        (Off::Known(o), Some(a)) => o.checked_add(a),
+        _ => None,
+    };
+    let mut changed = false;
+    match (is_container(roots, s), src.off) {
+        // slot by slot, as far as `len` reaches
+        (true, Off::Known(so)) => {
+            let moved: Vec<((u8, Option<i64>), Origin)> = mem
+                .iter()
+                .filter(|((c, _), _)| *c == s)
+                .filter_map(|(&(_, x), &v)| match x {
+                    Some(x) if x >= so && len.is_none_or(|n| x - so < n) => {
+                        // (an unknown length: anywhere, so that copies feeding
+                        // each other still reach a fixpoint)
+                        let at = len.and(start).and_then(|t| t.checked_add(x - so));
+                        Some(((d, at), v))
+                    }
+                    Some(_) => None,
+                    None => Some(((d, None), v)),
+                })
+                .collect();
+            for (k, v) in moved {
+                changed |= mem_join(mem, k, v);
+            }
+        }
+        _ => {
+            let all = held(s, roots, mem);
+            match (start, len.filter(|&n| n <= 4096)) {
+                (Some(start), Some(len)) if !is_container(roots, s) => {
+                    for x in (0..len / 8).map(|i| start + 8 * i) {
+                        changed |= mem_join(mem, (d, Some(x)), all);
+                    }
+                }
+                _ => changed |= mem_join(mem, (d, None), all),
+            }
+        }
+    }
+    changed
 }
 
 fn is_container(roots: &[Root], r: u8) -> bool {
@@ -733,11 +843,11 @@ fn transfer(f: &Function, id: ValueId, o: &[Origin], starts: &HashMap<ValueId, u
             _ => Origin::NONE,
         },
         Call { args, .. } => match callees.call.get(&id) {
-            Some(c) => returned(f, args, c.ret_from, c.ret_contents, o, roots, mem),
+            Some(c) => returned(f, args, c, false, o, roots, mem),
             None => Origin::NONE,
         },
         CallOut { call, reg: 2 } => match (f.insts[call].kind, callees.call.get(&call)) {
-            (Call { args, .. }, Some(c)) => returned(f, args, c.ret2_from, c.ret2_contents, o, roots, mem),
+            (Call { args, .. }, Some(c)) => returned(f, args, c, true, o, roots, mem),
             _ => Origin::NONE,
         },
         _ => Origin::NONE,
@@ -747,11 +857,36 @@ fn transfer(f: &Function, id: ValueId, o: &[Origin], starts: &HashMap<ValueId, u
 /// What a call returns: derived from the arguments in `from`, or loaded from what
 /// those in `contents` point to, which is whatever is stored there and in what
 /// that points to, and so on.
-fn returned(f: &Function, args: ListRef, from: u64, contents: u64, o: &[Origin], roots: &[Root], mem: &Mem) -> Origin {
+///
+/// A container lent at a known offset to a callee that says how far it reaches
+/// returns only what is stored in that range (and in what that points to): one
+/// field of a frame doesn't hand back the pointers in every other one.
+fn returned(f: &Function, args: ListRef, c: &Callee, rdx: bool, o: &[Origin], roots: &[Root], mem: &Mem) -> Origin {
+    let (from, contents) = if rdx { (c.ret2_from, c.ret2_contents) } else { (c.ret_from, c.ret_contents) };
     let args = args.get(&f.value_pool);
-    let picked = |bits: u64| (0..args.len().min(64)).filter(move |&k| bits & (1 << k) != 0).map(|k| o[args[k].index()]);
-    let r = picked(from).fold(Origin::NONE, |a, x| a.join(x)).unknown();
-    picked(contents).fold(r, |r, x| r.join(reach(x, roots, mem)))
+    let picked = |bits: u64| (0..args.len().min(64)).filter(move |&k| bits & (1 << k) != 0);
+    let r = picked(from).fold(Origin::NONE, |a, k| a.join(o[args[k].index()])).unknown();
+    picked(contents).fold(r, |r, k| {
+        let x = o[args[k].index()];
+        let len = match c.args.get(k) {
+            Some(Pass::Borrow { len: Some(n), .. }) => Some(*n as i64),
+            _ => None,
+        };
+        let range = match (x.single().filter(|&d| is_container(roots, d)), x.off, len) {
+            (Some(d), Off::Known(lo), Some(n)) => Some((d, lo, lo + n)),
+            _ => None,
+        };
+        let Some((d, lo, hi)) = range else { return r.join(reach(x, roots, mem)) };
+        let first = mem
+            .iter()
+            .filter(|&(&(c, y), _)| c == d && y.is_none_or(|y| (lo..hi).contains(&y)))
+            .fold(Origin::NONE, |a, (_, &v)| a.join(v));
+        if first.is_none() {
+            return r;
+        }
+        let first = Origin { lo: i64::MIN, ..first.unknown() };
+        r.join(first).join(reach(first, roots, mem))
+    })
 }
 
 /// What pointers stored in the objects root `c` stands for may point to.
@@ -814,6 +949,20 @@ fn sum(roots: &[Root], a: Origin, b: Origin) -> Origin {
         (false, true) => b.unknown(),
         _ => a.join(b).unknown(),
     }
+}
+
+/// The calls that never return: the last call of a block that ends in
+/// `Unreachable` (`abi::noreturn_sites`).
+fn noreturn_calls(f: &Function) -> std::collections::HashSet<ValueId> {
+    let mut out = std::collections::HashSet::new();
+    for (_, blk) in f.blocks.iter() {
+        if matches!(blk.term, Terminator::Unreachable) {
+            if let Some(&id) = blk.insts.get(&f.value_pool).iter().rev().find(|&&id| matches!(f.insts[id].kind, InstKind::Call { .. })) {
+                out.insert(id);
+            }
+        }
+    }
+    out
 }
 
 /// An operand of pointer arithmetic that `sum` treated as an index.
@@ -903,10 +1052,26 @@ fn origins_with(f: &Function, cfg: &Cfg, roots: &[Root], starts: &HashMap<ValueI
                             changed |= mem_join(&mut mem, (r, None), o[val.index()]);
                         }
                     }
-                    InstKind::MemCopy { dst, src, .. } => {
-                        if let (Some(d), Some(s)) = (o[dst.index()].single().filter(|&d| is_container(roots, d)), o[src.index()].single()) {
-                            let all = held(s, roots, &mem);
-                            changed |= mem_join(&mut mem, (d, None), all);
+                    InstKind::MemCopy { dst, src, len } => {
+                        changed |= copy_mem(&mut mem, roots, o[dst.index()], o[src.index()], Some(0), konst(f, len).filter(|&n| n >= 0));
+                    }
+                    // what a callee copies or stores from one argument's object
+                    // into another's
+                    InstKind::Call { args, .. } => {
+                        if let Some(c) = callees.call.get(&id) {
+                            let args = args.get(&f.value_pool);
+                            for (from, into, at, len) in flows(f, c, args) {
+                                let (Some(&src), Some(&dst)) = (args.get(from), args.get(into)) else { continue };
+                                changed |= copy_mem(&mut mem, roots, o[dst.index()], o[src.index()], at, len);
+                            }
+                            // an argument stored as it is: like a `Store`
+                            for st in c.stores.iter().filter(|s| !s.deref) {
+                                let (Some(&val), Some(&dst)) = (args.get(st.from as usize), args.get(st.into as usize)) else { continue };
+                                let ptr = o[dst.index()].shift(st.off);
+                                if let Some(r) = ptr.single().filter(|&r| is_container(roots, r)) {
+                                    changed |= mem_join(&mut mem, mem_key(r, ptr.off), o[val.index()]);
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -949,15 +1114,16 @@ type FactsOut = (Vec<Fact>, Vec<(Site, u8)>, Vec<Site>);
 
 fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callees, points: &Points) -> FactsOut {
     use InstKind::*;
+    // (the stack pointer is no argument's object)
+    let stack = f.blocks[f.entry].params.get(&f.value_pool).iter().position(|&p| matches!(f.insts[p].kind, BlockParam(RSP))).map(|k| k as u8);
     let mut out = Vec::new();
     let mut unprovable = Vec::new();
     let mut bad_calls = Vec::new();
-    let mut opaque = false;
     let users = std::cell::OnceCell::new();
     let users = || users.get_or_init(|| Users::new(f, cfg));
     for &b in &cfg.rpo {
         let blk = &f.blocks[b];
-        let mut fx = FactSink { o, out: &mut out, unprovable: &mut unprovable, bad_calls: &mut bad_calls, point: 0, at: None };
+        let mut fx = FactSink { o, out: &mut out, unprovable: &mut unprovable, bad_calls: &mut bad_calls, point: 0, at: None, stack };
         for (i, &id) in blk.insts.get(&f.value_pool).iter().enumerate() {
             fx.point = points.at(b, i);
             fx.at = Some(id);
@@ -965,37 +1131,22 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callee
                 Load { ptr, .. } => fx.access(ptr, FactKind::Read),
                 Store { ptr, val, .. } => {
                     fx.access(ptr, FactKind::Write);
-                    fx.stash(roots, val, ptr);
+                    fx.stash(roots, val, o[ptr.index()]);
                 }
                 MemFill { dst, val, count } => {
                     fx.access(dst, FactKind::Write);
-                    fx.stash(roots, val, dst);
+                    fx.stash(roots, val, o[dst.index()].unknown());
                     fx.add(count, FactKind::Escape);
                 }
                 MemCopy { dst, src, len } => {
                     fx.access(dst, FactKind::Write);
                     fx.access(src, FactKind::Read);
                     fx.add(len, FactKind::Escape);
-                    // copying an argument's object into one that isn't followed
-                    // copies the pointers the caller stored in it there
-                    if let Some(s) = o[src.index()].single().filter(|&s| matches!(roots.get(s as usize), Some(Root::Param(_)))) {
-                        if !o[dst.index()].single().is_some_and(|d| is_container(roots, d)) {
-                            let lo = o[src.index()].lo;
-                            fx.out.push(Fact { root: s, off: Off::Unknown, lo, kind: FactKind::Spill, at: fx.at, point: fx.point, site: None });
-                        }
-                    }
-                    if let Some(s) = o[src.index()].single().filter(|&s| is_container(roots, s)) {
-                        let kind = match o[dst.index()].single().filter(|&d| is_container(roots, d)) {
-                            Some(d) => FactKind::CopyTo(d),
-                            None => FactKind::Spill,
-                        };
-                        let lo = o[src.index()].lo;
-                        fx.out.push(Fact { root: s, off: Off::Unknown, lo, kind, at: fx.at, point: fx.point, site: None });
-                    }
+                    fx.copy(roots, dst, src, konst(f, len).filter(|&n| n >= 0));
                 }
                 Call { callee, args } => {
                     let site = Site::Call(id);
-                    fx.call(f, site, callee, args, callees.get(site));
+                    fx.call(f, roots, site, callee, args, callees.get(site));
                 }
                 // Pointer arithmetic the origin pass followed: no fact. If the
                 // result lost track of a rooted operand, that operand escapes.
@@ -1036,7 +1187,6 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callee
                 Cmp { .. } => {}
                 // registers after a call, and at a return: bookkeeping, not uses
                 CallOut { .. } | Exit { .. } => {}
-                Opaque { .. } => opaque = true,
                 // what is only compared doesn't let the pointer out
                 Bin { .. } | Un { .. } | Cast { .. } if only_compared(f, users(), id) => {}
                 // rax:rdx returned: rax is the return value, the sret pointer of a
@@ -1060,7 +1210,7 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callee
             Terminator::TailCall { callee, args } => {
                 let site = Site::Tail(b);
                 let c = callees.get(site);
-                fx.call(f, site, callee, args, c);
+                fx.call(f, roots, site, callee, args, c);
                 // what the callee returns is our return value
                 if let Some(c) = c {
                     for (k, &a) in args.get(&f.value_pool).iter().enumerate().take(64) {
@@ -1080,13 +1230,85 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callee
             _ => {}
         }
     }
-    // Unliftable code may do anything with any root.
-    if opaque {
-        for root in 0..roots.len() as u8 {
-            out.push(Fact { root, off: Off::Unknown, lo: i64::MIN, kind: FactKind::Escape, at: None, point: 0, site: None });
-        }
+    expand_flows(&mut out, roots, stack);
+    // A call that never returns can't hand what it keeps back to this
+    // function: the frame's objects die with it, and an argument's object is
+    // only accessed during the call as far as this function can tell.
+    let cold = noreturn_calls(f);
+    if !cold.is_empty() {
+        out.retain_mut(|x| {
+            if x.kind != FactKind::Escape || !x.at.is_some_and(|v| cold.contains(&v)) {
+                return true;
+            }
+            match roots.get(x.root as usize) {
+                Some(Root::Frame(_)) => false,
+                Some(Root::Param(_) | Root::Contents(_)) => {
+                    x.kind = FactKind::Unbounded;
+                    true
+                }
+                _ => true,
+            }
+        });
     }
     (out, unprovable, bad_calls)
+}
+
+/// Turns each `Flow` into facts about the objects its root holds, to a fixpoint
+/// (a flow into a container adds to what that container holds):
+///
+/// - into a container: they are stashed there (`Stash`);
+/// - into an argument's object: a pointer loaded from that same object stays
+///   there, one loaded from another argument's object is `StoreInto`, and
+///   anything else (the function's own objects) escapes, since the caller may
+///   keep the object;
+/// - into anything else: they escape.
+///
+/// An argument holds its contents, contents hold themselves, and a container
+/// holds what is stashed in it.
+fn expand_flows(out: &mut Vec<Fact>, roots: &[Root], stack: Option<u8>) {
+    if !out.iter().any(|x| matches!(x.kind, FactKind::Flow(_))) {
+        return;
+    }
+    let contents = |k: u8| roots.iter().position(|&c| c == Root::Contents(k)).map(|c| c as u8);
+    loop {
+        let mut new: Vec<Fact> = Vec::new();
+        for x in out.iter() {
+            let FactKind::Flow(d) = x.kind else { continue };
+            let held: Vec<u8> = match roots.get(x.root as usize) {
+                Some(&Root::Param(k)) => vec![contents(k).unwrap_or(OTHER)],
+                Some(Root::Contents(_)) => vec![x.root],
+                Some(Root::Frame(_) | Root::Alloc(_)) => {
+                    // (what is stored in the bytes copied)
+                    let overlaps = |y: &Fact| match (x.span, y.span) {
+                        (Some((a, b)), Some((c, d))) => a < d && c < b,
+                        _ => true,
+                    };
+                    out.iter().filter_map(|y| (matches!(y.kind, FactKind::Stash(c) if c == x.root) && overlaps(y)).then_some(y.root)).collect()
+                }
+                _ => continue,
+            };
+            for h in held {
+                let kind = match roots.get(d as usize) {
+                    Some(Root::Frame(_) | Root::Alloc(_)) => FactKind::Stash(d),
+                    Some(&Root::Param(j)) if Some(j) != stack => match roots.get(h as usize) {
+                        Some(Root::Contents(m)) if *m == j => continue,
+                        Some(Root::Contents(_)) => FactKind::StoreInto(j),
+                        Some(&Root::Param(k)) if Some(k) != stack => FactKind::StoreInto(j),
+                        _ => FactKind::Escape,
+                    },
+                    _ => FactKind::Escape,
+                };
+                let fact = Fact { root: h, off: Off::Unknown, lo: i64::MIN, kind, at: x.at, point: x.point, site: None, span: None };
+                if !out.iter().chain(&new).any(|y| y.root == h && y.kind == kind) {
+                    new.push(fact);
+                }
+            }
+        }
+        if new.is_empty() {
+            return;
+        }
+        out.extend(new);
+    }
 }
 
 struct FactSink<'a> {
@@ -1096,6 +1318,8 @@ struct FactSink<'a> {
     bad_calls: &'a mut Vec<Site>,
     point: u32,
     at: Option<ValueId>,
+    /// The parameter holding the stack pointer.
+    stack: Option<u8>,
 }
 
 impl FactSink<'_> {
@@ -1106,7 +1330,7 @@ impl FactSink<'_> {
     fn add_site(&mut self, v: ValueId, kind: FactKind, site: Option<(Site, u8)>) {
         let og = self.o[v.index()];
         for root in og.each_root() {
-            self.out.push(Fact { root, off: og.off, lo: og.lo, kind, at: self.at, point: self.point, site });
+            self.out.push(Fact { root, off: og.off, lo: og.lo, kind, at: self.at, point: self.point, site, span: None });
         }
     }
 
@@ -1114,20 +1338,96 @@ impl FactSink<'_> {
     /// one root, so a pointer into several roots makes them all escape.
     fn access(&mut self, ptr: ValueId, kind: FactKind) {
         let og = self.o[ptr.index()];
-        self.add(ptr, if og.roots.count_ones() > 1 { FactKind::Escape } else { kind });
+        self.add(ptr, if og.roots.count_ones() > 1 { FactKind::Unbounded } else { kind });
     }
 
     /// `val` is stored through `ptr`: tracked if `ptr` is in the frame or an
     /// allocation, an escape anywhere else.
-    fn stash(&mut self, roots: &[Root], val: ValueId, ptr: ValueId) {
-        match self.o[ptr.index()].single().filter(|&r| is_container(roots, r)) {
-            Some(c) => self.add(val, FactKind::Stash(c)),
-            None => self.add(val, FactKind::Escape),
+    /// Stored into an argument's object, a pointer loaded from an argument's
+    /// object stays among the caller's (`StoreInto`; nothing if it is the same
+    /// object), which the caller follows.
+    fn stash(&mut self, roots: &[Root], val: ValueId, ptr: Origin) {
+        let p = ptr.single();
+        match p.map(|r| (r, roots.get(r as usize))) {
+            Some((c, _)) if is_container(roots, c) => {
+                let og = self.o[val.index()];
+                let span = match ptr.off {
+                    Off::Known(o) => Some((o, o.saturating_add(8))),
+                    Off::Unknown => None,
+                };
+                for root in og.each_root() {
+                    let kind = FactKind::Stash(c);
+                    self.out.push(Fact { root, off: og.off, lo: og.lo, kind, at: self.at, point: self.point, site: None, span });
+                }
+            }
+            Some((_, Some(&Root::Param(j)))) if Some(j) != self.stack => {
+                let og = self.o[val.index()];
+                for root in og.each_root() {
+                    let (kind, off) = match roots.get(root as usize) {
+                        Some(&Root::Contents(m)) if m == j => continue,
+                        // (where in the argument's object)
+                        Some(Root::Contents(_)) => (FactKind::StoreInto(j), ptr.off),
+                        Some(&Root::Param(k)) if Some(k) != self.stack => (FactKind::StoreInto(j), ptr.off),
+                        _ => (FactKind::Escape, og.off),
+                    };
+                    self.out.push(Fact { root, off, lo: og.lo, kind, at: self.at, point: self.point, site: None, span: None });
+                }
+            }
+            _ => self.add(val, FactKind::Escape),
         }
     }
 
-    fn call(&mut self, f: &Function, site: Site, callee: ValueId, args: ListRef, c: Option<&Callee>) {
+    /// What `src` points into is copied into what `dst` points into (a
+    /// `memcpy`), or a callee may store what it holds there: the pointers stored
+    /// in it go with it.
+    fn copy(&mut self, roots: &[Root], dst: ValueId, src: ValueId, len: Option<i64>) {
+        let (o, at, point) = (self.o, self.at, self.point);
+        let Some(s) = o[src.index()].single() else { return };
+        let lo = o[src.index()].lo;
+        let kind = match o[dst.index()].single() {
+            Some(d) if is_container(roots, s) && is_container(roots, d) => FactKind::CopyTo(d),
+            Some(d) => FactKind::Flow(d),
+            None => FactKind::Flow(OTHER),
+        };
+        if matches!(roots.get(s as usize), Some(Root::Param(_) | Root::Contents(_) | Root::Frame(_) | Root::Alloc(_))) {
+            let span = match (o[src.index()].off, len) {
+                (Off::Known(so), Some(n)) => Some((so, so.saturating_add(n))),
+                _ => None,
+            };
+            self.out.push(Fact { root: s, off: Off::Unknown, lo, kind, at, point, site: None, span });
+        }
+    }
+
+    fn call(&mut self, f: &Function, roots: &[Root], site: Site, callee: ValueId, args: ListRef, c: Option<&Callee>) {
+        if let Some(c) = c {
+            let a = args.get(&f.value_pool);
+            for st in c.stores.iter().filter(|s| !s.deref) {
+                if let (Some(&val), Some(&dst)) = (a.get(st.from as usize), a.get(st.into as usize)) {
+                    self.stash(roots, val, self.o[dst.index()].shift(st.off));
+                }
+            }
+            for (from, into, _, len) in flows(f, c, a) {
+                if let (Some(&src), Some(&dst)) = (a.get(from), a.get(into)) {
+                    // (a callee's `Store` takes one pointer from anywhere in the object)
+                    let len = if matches!(c.args[from], Pass::Access { .. }) { len } else { None };
+                    self.copy(roots, dst, src, len);
+                }
+            }
+        }
         self.add(callee, FactKind::Escape);
+        // the roots lent as slices at this call (the frame's objects are one array)
+        let mut lent = 0u128;
+        if let Some(c) = c.filter(|c| !c.raw) {
+            for (&v, p) in args.get(&f.value_pool).iter().zip(&c.args) {
+                if matches!(p, Pass::Borrow { .. }) {
+                    lent |= self.o[v.index()].roots;
+                }
+            }
+        }
+        if lent & frame_mask(roots) != 0 {
+            lent |= frame_mask(roots);
+        }
+        let lent_here = |og: Origin| og.roots & lent != 0;
         for (k, &a) in args.get(&f.value_pool).iter().enumerate() {
             let pass = c.and_then(|c| c.args.get(k)).copied().unwrap_or(Pass::Escape);
             let og = self.o[a.index()];
@@ -1135,19 +1435,29 @@ impl FactSink<'_> {
             if c.is_some_and(|c| c.raw) {
                 match pass {
                     Pass::Borrow { mutbl, .. } if og.single().is_some() => self.add_site(a, FactKind::RawLend { mutbl }, Some((site, k))),
+                    Pass::Borrow { keeps: false, .. } => self.add_site(a, FactKind::Unbounded, Some((site, k))),
                     Pass::Borrow { .. } => self.add_site(a, FactKind::Escape, Some((site, k))),
-                    _ => {}
+                    Pass::Ignore | Pass::Raw { .. } => {}
+                    // (the twin keeps it as the function does)
+                    _ => self.add(a, FactKind::Escape),
                 }
-                continue;
+                if !matches!(pass, Pass::Raw { .. }) {
+                    continue;
+                }
             }
             match pass {
                 Pass::Ignore => {}
+                // (a slice of the same root lent at the call would alias it)
+                Pass::Raw { keeps, .. } if og.single().is_none() || lent_here(og) => {
+                    self.add(a, if keeps { FactKind::Escape } else { FactKind::Unbounded })
+                }
+                Pass::Raw { mutbl, .. } => self.add_site(a, FactKind::RawLend { mutbl }, Some((site, k))),
                 Pass::Escape => self.add(a, FactKind::Escape),
                 Pass::Access { write } if og.single().is_some() => {
                     self.add_site(a, if write { FactKind::Write } else { FactKind::Read }, Some((site, k)))
                 }
                 Pass::Access { .. } => {
-                    self.add(a, FactKind::Escape);
+                    self.add(a, FactKind::Unbounded);
                     self.bad_calls.push(site);
                 }
                 Pass::Free if og.single().is_some() => self.add_site(a, FactKind::Free, Some((site, k))),
@@ -1157,8 +1467,8 @@ impl FactSink<'_> {
                 Pass::Borrow { mutbl, .. } if og.single().is_some() => {
                     self.add_site(a, FactKind::Borrow { mutbl }, Some((site, k)))
                 }
-                Pass::Borrow { .. } => {
-                    self.add(a, FactKind::Escape);
+                Pass::Borrow { keeps, .. } => {
+                    self.add(a, if keeps { FactKind::Escape } else { FactKind::Unbounded });
                     self.unprovable.push((site, k));
                 }
             }
@@ -1177,6 +1487,7 @@ struct Uses {
     read: bool,
     write: bool,
     escape: bool,
+    unbounded: bool,
     returned: bool,
     returned2: bool,
     nullable: bool,
@@ -1205,6 +1516,16 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
             FactKind::Read => r.read = true,
             FactKind::Write => r.write = true,
             FactKind::Escape => r.escape = true,
+            FactKind::Unbounded => {
+                r.unbounded = true;
+                // (accessed, or lent to a callee that accesses it, is evidence of
+                // a pointer; given to a call that never returns isn't)
+                let kind = x.at.map(|v| f.insts[v].kind);
+                if x.site.is_some() || matches!(kind, Some(InstKind::Load { .. } | InstKind::Store { .. } | InstKind::MemCopy { .. } | InstKind::MemFill { .. })) {
+                    r.read = true;
+                    r.write = true;
+                }
+            }
             FactKind::Return => r.returned = true,
             FactKind::Return2 => r.returned2 = true,
             FactKind::NullCheck => r.nullable = true,
@@ -1224,7 +1545,7 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
                 r.borrowed = true;
             }
             FactKind::Spill => r.spill = true,
-            FactKind::Stash(_) | FactKind::CopyTo(_) => {}
+            FactKind::Stash(_) | FactKind::CopyTo(_) | FactKind::Flow(_) | FactKind::StoreInto(_) => {}
         }
         if matches!(x.kind, FactKind::Read | FactKind::Write | FactKind::Borrow { .. } | FactKind::RawLend { .. }) {
             r.negative |= matches!(x.off, Off::Known(o) if o < 0);
@@ -1234,10 +1555,11 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
     // its pointers point to escapes. Lent only to callees that don't, the objects
     // reachable from it are read and written during the call through them.
     let mut lent_keeps = vec![false; n];
-    for x in &a.facts {
+    let cold = noreturn_calls(f);
+    for x in a.facts.iter().filter(|x| !x.at.is_some_and(|v| cold.contains(&v))) {
         if let (FactKind::Borrow { .. } | FactKind::RawLend { .. }, Some((site, k))) = (x.kind, x.site) {
             let keeps = match (ctx.callee)(site).and_then(|c| c.args.get(k as usize).copied()) {
-                Some(Pass::Borrow { keeps, .. }) => keeps,
+                Some(Pass::Borrow { keeps, .. } | Pass::Raw { keeps, .. }) => keeps,
                 _ => true,
             };
             if let Some(l) = lent_keeps.get_mut(x.root as usize) {
@@ -1255,6 +1577,9 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
                 u[r].read = true;
                 u[r].write = true;
                 u[r].borrowed = true;
+                // (an argument stored there may be an integer: it can be no
+                // reference, only a raw pointer used during the call)
+                u[r].unbounded |= matches!(a.roots[r], Root::Param(_));
                 work.push(r);
             }
         }
@@ -1288,23 +1613,25 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
                 break;
             }
         }
-        let mut escape: Vec<bool> = u.iter().map(|x| x.escape).collect();
+        // (`kept`: escapes in a way that outlives the call)
+        let mut kept: Vec<bool> = u.iter().map(|x| x.escape).collect();
         for x in &a.facts {
             let r = x.root as usize;
             if r >= n {
                 continue;
             }
             match x.kind {
-                FactKind::Stash(c) if c as usize >= n || contents_escape[c as usize] => escape[r] = true,
-                FactKind::Borrow { .. } | FactKind::Free if bad_loans.contains(&x.site.unwrap()) => escape[r] = true,
+                FactKind::Stash(c) if c as usize >= n || contents_escape[c as usize] => kept[r] = true,
+                FactKind::Borrow { .. } | FactKind::Free if bad_loans.contains(&x.site.unwrap()) => kept[r] = true,
                 // a call like `memcpy` that isn't inlined gets a pointer made from
                 // the root's slice, except to write a read-only global
-                FactKind::Write if matches!(a.roots[r], Root::Global(_)) && x.site.is_some_and(|(s, _)| a.raw_calls.contains(&s)) => escape[r] = true,
+                FactKind::Write if matches!(a.roots[r], Root::Global(_)) && x.site.is_some_and(|(s, _)| a.raw_calls.contains(&s)) => kept[r] = true,
                 // a nullable argument may be null at the call
-                FactKind::RawLend { .. } if matches!(a.roots[r], Root::Param(_)) && u[r].nullable => escape[r] = true,
+                FactKind::RawLend { .. } if matches!(a.roots[r], Root::Param(_)) && u[r].nullable => kept[r] = true,
                 _ => {}
             }
         }
+        let escape: Vec<bool> = (0..n).map(|r| kept[r] || u[r].unbounded).collect();
         let why: Vec<&'static str> = (0..n)
             .map(|r| {
                 let x = u[r];
@@ -1390,7 +1717,7 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
             }
         }
         safe = new;
-        escaped = escape;
+        escaped = kept;
         reasons = why;
         if !changed {
             break;
@@ -1416,7 +1743,7 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
             let mut indexed = false;
             let mut extent = Some(0i64);
             for y in a.facts.iter().filter(|y| y.root as usize == r) {
-                if !matches!(y.kind, FactKind::NullCheck | FactKind::Return) {
+                if !matches!(y.kind, FactKind::NullCheck | FactKind::Return | FactKind::Flow(_) | FactKind::StoreInto(_)) {
                     let end = match y.off {
                         Off::Known(o) if o >= 0 => fact_len(f, y, |s| (ctx.callee)(s)).map(|n| o + n),
                         _ => None,
@@ -1453,17 +1780,31 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
             let extent = extent.and_then(|e| u32::try_from(e).ok());
             // what the caller stored in the object leaves if a pointer loaded from
             // it escapes, or the object is copied or lent where that may happen
+            let contents = a.roots.iter().position(|&c| c == Root::Contents(k.min(255) as u8));
+            // the arguments whose objects it, or a pointer loaded from its
+            // object, is stored into (`StoreInto`)
+            let mut into: Vec<(u8, Option<i64>, bool)> = Vec::new();
+            for y in a.facts.iter().filter(|y| Some(y.root as usize) == contents || y.root as usize == r) {
+                if let FactKind::StoreInto(j) = y.kind {
+                    let at = match y.off {
+                        Off::Known(o) => Some(o),
+                        Off::Unknown => None,
+                    };
+                    let e = (j, at, y.root as usize != r);
+                    if !into.contains(&e) {
+                        into.push(e);
+                    }
+                }
+            }
             let keeps = x.spill
                 || lent_keeps.get(r).copied().unwrap_or(true)
-                || a.facts.iter().any(|y| y.root as usize == r && y.kind == FactKind::Read && y.site.is_some())
-                || match a.roots.iter().position(|&c| c == Root::Contents(k.min(255) as u8)) {
+                || match contents {
                     Some(c) => {
                         let y = u[c];
                         a.escaped[c] || y.freed || y.spill || lent_keeps[c]
                     }
                     None => true,
                 };
-            let contents = a.roots.iter().position(|&c| c == Root::Contents(k.min(255) as u8));
             let returns_contents = contents.map_or((false, false), |c| (u[c].returned, u[c].returned2));
             ParamBorrow {
                 value,
@@ -1473,10 +1814,12 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
                 returned2: x.returned2,
                 returns_contents,
                 keeps,
+                into,
                 nullable: x.nullable,
                 fields,
                 indexed,
                 extent,
+                during_call: (x.read || x.write || x.borrowed) && !a.escaped[r] && !x.freed && !x.bad_free && reg(k) != RSP,
             }
         })
         .collect();

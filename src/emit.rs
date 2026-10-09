@@ -60,6 +60,8 @@ pub struct EmitStats {
     pub raw_by: [usize; 4],
     /// Instructions or terminators the emitter can't express yet (`todo!()`).
     pub todo: usize,
+    /// Instructions kept as inline assembly (`asm!`).
+    pub asm: usize,
     /// Raw twins emitted after this function (`program.rs`), and their raw
     /// loads, stores and copies (not counted in `raw` or `raw_by`).
     pub twins: usize,
@@ -322,7 +324,7 @@ pub fn emit_function_in(f: &Function, name: &str, mode: Mode, env: &Env, out: &m
 
     let hoisted = hoisted(f, &cfg);
     let skip = callee_only(f, &cfg, env.call);
-    let inline = inlined(f, &cfg, &hoisted, &skip, mode == Mode::Safe);
+    let inline = inlined(f, &cfg, &hoisted, &skip, mode == Mode::Safe, env.call);
     let mut e = Emitter {
         f,
         sig: env.sig,
@@ -391,7 +393,7 @@ fn struct_arg(
                 InstKind::MemFill { dst, .. } if through(dst) => return false,
                 InstKind::Call { args, .. } => {
                     let pass = call(Site::Call(id)).map(|c| c.args).unwrap_or_default();
-                    let lent = args.get(&f.value_pool).iter().zip(&pass).any(|(&v, x)| matches!(x, Pass::Borrow { .. }) && through(v));
+                    let lent = args.get(&f.value_pool).iter().zip(&pass).any(|(&v, x)| matches!(x, Pass::Borrow { .. } | Pass::Raw { .. }) && through(v));
                     if lent {
                         return false;
                     }
@@ -414,7 +416,7 @@ fn struct_arg(
     for &b in &cfg.rpo {
         if let Terminator::TailCall { args, .. } = f.blocks[b].term {
             let pass = call(Site::Tail(b)).map(|c| c.args).unwrap_or_default();
-            if args.get(&f.value_pool).iter().zip(&pass).any(|(&v, x)| matches!(x, Pass::Borrow { .. }) && through(v)) {
+            if args.get(&f.value_pool).iter().zip(&pass).any(|(&v, x)| matches!(x, Pass::Borrow { .. } | Pass::Raw { .. }) && through(v)) {
                 return false;
             }
         }
@@ -741,7 +743,21 @@ fn movable(k: InstKind) -> bool {
 /// expression ends up, which is the use of the user when that is inlined too.
 /// In safe mode a load stays out of a store, which may borrow the same slice
 /// mutably.
-fn inlined(f: &Function, cfg: &Cfg, hoisted: &[bool], skip: &[bool], safe: bool) -> Vec<bool> {
+///
+/// A call's result goes into its use too (`return f(x);`, `if f(x) != 0`) when
+/// nothing but pure values comes between them, so the call still runs exactly
+/// once and in the same place relative to every other memory access: not into
+/// an `if`-expression (`Select`) that would run it on one arm only, nor into a
+/// `match` scrutinee repeated on each arm. In safe mode only into a `return` or
+/// an `if` condition, where no other borrow of the same slice can be live.
+fn inlined(
+    f: &Function,
+    cfg: &Cfg,
+    hoisted: &[bool],
+    skip: &[bool],
+    safe: bool,
+    call: &dyn Fn(Site) -> Option<CallInfo>,
+) -> Vec<bool> {
     let n = f.insts.len();
     let mut uses = vec![0u32; n];
     for &b in &cfg.rpo {
@@ -754,6 +770,11 @@ fn inlined(f: &Function, cfg: &Cfg, hoisted: &[bool], skip: &[bool], safe: bool)
     let mut inline = vec![false; n];
     let mut user = vec![u32::MAX; n];
     let mut pos = vec![0u32; n];
+    // inside the arm of an `if`-expression, once written into its use
+    let mut in_select = vec![false; n];
+    // part of the condition of the block's `Branch`, once written into its use
+    // (an edge argument is assigned on that edge only)
+    let mut in_cond = vec![false; n];
     for &b in &cfg.rpo {
         let blk = &f.blocks[b];
         let insts = blk.insts.get(&f.value_pool);
@@ -766,13 +787,14 @@ fn inlined(f: &Function, cfg: &Cfg, hoisted: &[bool], skip: &[bool], safe: bool)
         let mut barriers = vec![0u32; insts.len() + 1];
         for (i, &id) in insts.iter().enumerate() {
             let k = f.insts[id].kind;
-            let barrier = !skip[id.index()] && !pure(k) && !movable(k) && !matches!(k, InstKind::Const(_) | InstKind::Undef | InstKind::CallOut { .. } | InstKind::BlockParam(_));
+            let barrier = !skip[id.index()] && !pure(k) && !movable(k) && !matches!(k, InstKind::Const(_) | InstKind::Undef | InstKind::CallOut { .. } | InstKind::AsmOut { .. } | InstKind::BlockParam(_));
             barriers[i + 1] = barriers[i] + barrier as u32;
         }
         for (i, &id) in insts.iter().enumerate().rev() {
             let k = f.insts[id].kind;
             let v = id.index();
-            if uses[v] != 1 || hoisted[v] || skip[v] || !(pure(k) || movable(k)) {
+            let is_call = matches!(k, InstKind::Call { .. }) && plain_call(call(Site::Call(id)), safe);
+            if uses[v] != 1 || hoisted[v] || skip[v] || !(pure(k) || movable(k) || is_call) {
                 continue;
             }
             let mut p = user[v];
@@ -780,15 +802,58 @@ fn inlined(f: &Function, cfg: &Cfg, hoisted: &[bool], skip: &[bool], safe: bool)
             if matches!(k, InstKind::Select { .. }) && p < end && matches!(f.insts[insts[p as usize]].kind, InstKind::Select { .. }) {
                 continue;
             }
+            let first = p;
             if p < end && inline[insts[p as usize].index()] {
                 p = pos[insts[p as usize].index()];
             }
             pos[v] = p;
+            if first < end {
+                let u = insts[first as usize].index();
+                in_select[v] = matches!(f.insts[insts[first as usize]].kind, InstKind::Select { .. }) || inline[u] && in_select[u];
+                in_cond[v] = inline[u] && in_cond[u];
+            } else {
+                in_cond[v] = matches!(blk.term, Terminator::Branch { c, .. } if c == id);
+            }
             let into_store = p < end && matches!(f.insts[insts[p as usize]].kind, InstKind::Store { .. });
-            inline[v] = !movable(k) || barriers[p as usize] == barriers[i + 1] && !(safe && into_store);
+            inline[v] = if is_call {
+                let inert = |j: usize| {
+                    let w = insts[j];
+                    skip[w.index()] || pure(f.insts[w].kind) || matches!(f.insts[w].kind, InstKind::Const(_) | InstKind::Undef | InstKind::BlockParam(_))
+                };
+                let into = if p < end {
+                    let d = insts[p as usize];
+                    !safe && !skip[d.index()] && matches!(f.insts[d].kind, InstKind::Store { .. } | InstKind::Call { .. } | InstKind::Load { .. })
+                } else {
+                    match blk.term {
+                        Terminator::Return(_) => true,
+                        Terminator::Branch { .. } => in_cond[v],
+                        Terminator::Jump { .. } | Terminator::TailCall { .. } => !safe,
+                        _ => false,
+                    }
+                };
+                into && !in_select[v] && (i + 1..p as usize).all(inert)
+            } else {
+                !movable(k) || barriers[p as usize] == barriers[i + 1] && !(safe && into_store)
+            };
         }
     }
     inline
+}
+
+/// Is a call emitted as a plain expression of its one result (not a pair, not
+/// an allocation, free or `memcpy` safe mode rewrites), so it can be written into
+/// its use?
+fn plain_call(info: Option<CallInfo>, safe: bool) -> bool {
+    match info {
+        Some(c @ CallInfo { path: Some(_), .. }) => {
+            c.ret
+                && !c.ret2
+                && !c.free
+                && c.builtin.is_none()
+                && !(safe && (c.alloc.is_some() || c.args.iter().any(|a| matches!(a, Pass::Borrow { .. }))))
+        }
+        _ => true,
+    }
 }
 
 /// Values used, and only used, as the base of an address with a variable
@@ -1657,6 +1722,8 @@ impl Emitter<'_> {
                 _ => self.val(v, vt),
             },
             PtrToInt(v) => self.val(v, vt),
+            Opaque { asm, args } => return Stmt::Effect(self.asm(id, asm, args)),
+            AsmOut { asm, k } => self.conv(&format!("{}_asm[{k}]", n(asm)), self.u64_ty, vt),
             Load { ptr, .. } => self.load(id, ptr),
             Store { ptr, val, .. } => return Stmt::Effect(self.store(ptr, val)),
             MemCopy { dst, src, len } => {
@@ -1697,6 +1764,52 @@ impl Emitter<'_> {
         Stmt::Value(e)
     }
 
+    /// An instruction kept as inline assembly: an `asm!` on a copy of each
+    /// register it uses, then `let vN_asm = [..]` with what it wrote (`AsmOut`
+    /// reads it). An xmm register is a `__m128i` made of its two halves.
+    fn asm(&mut self, id: ValueId, a: u32, args: ListRef) -> String {
+        let f = self.f;
+        let a = &f.asm[a as usize];
+        let args = args.get(&f.value_pool);
+        let (mut lets, mut operands, mut post, mut outs) = (String::new(), Vec::new(), String::new(), Vec::new());
+        for (k, op) in a.ops.iter().enumerate() {
+            let spec = if op.named { format!("\"{}\"", op.reg) } else { op.reg.to_string() };
+            let x = format!("asm{k}");
+            let input = match (op.xmm, op.input) {
+                (true, Some(j)) => format!(
+                    "core::mem::transmute::<[u64; 2], core::arch::x86_64::__m128i>([{}, {}])",
+                    self.as_u64(args[j as usize]),
+                    self.as_u64(args[j as usize + 1])
+                ),
+                (true, None) => "core::mem::transmute::<[u64; 2], core::arch::x86_64::__m128i>([0; 2])".to_string(),
+                (false, Some(j)) => self.as_u64(args[j as usize]),
+                (false, None) => "0_u64".to_string(),
+            };
+            if op.output.is_none() {
+                operands.push(format!("in({spec}) {input}"));
+                continue;
+            }
+            let _ = write!(lets, "let mut {x} = {input}; ");
+            operands.push(format!("inout({spec}) {x}"));
+            if op.xmm {
+                let _ = write!(post, "let {x} = core::mem::transmute::<core::arch::x86_64::__m128i, [u64; 2]>({x}); ");
+                outs.extend([format!("{x}[0]"), format!("{x}[1]")]);
+            } else {
+                outs.push(x);
+            }
+        }
+        if !a.stack {
+            operands.push("options(nostack)".to_string());
+        }
+        self.stats.raw += 1;
+        self.stats.asm += 1;
+        let call = format!("core::arch::asm!({:?}, {})", a.text, operands.join(", "));
+        if outs.is_empty() {
+            return format!("unsafe {{ {lets}{call}; }}");
+        }
+        format!("let {}_asm: [u64; {}] = unsafe {{ {lets}{call}; {post}[{}] }}", self.name(id), outs.len(), outs.join(", "))
+    }
+
     /// Does the call `call` return rax:rdx?
     fn ret2(&self, call: ValueId) -> bool {
         (self.call)(Site::Call(call)).is_some_and(|c| c.ret2)
@@ -1720,7 +1833,8 @@ impl Emitter<'_> {
         let a = typed.join(", ");
         let rty = info.as_ref().and_then(|c| c.ret_ty).unwrap_or(self.u64_ty);
         match info {
-            Some(CallInfo { path: Some(p), ret, ret2, foreign: false, raw: false, args: pass, .. }) if pass.iter().any(|x| matches!(x, Pass::Borrow { .. })) => {
+            Some(CallInfo { path: Some(p), ret, ret2, foreign: false, raw: false, args: pass, arg_tys, .. }) if pass.iter().any(|x| matches!(x, Pass::Borrow { .. })) => {
+                let typed = self.raw_lends(args, &pass, &arg_tys, typed, false);
                 let (lets, a) = self.call_args(args, &pass, typed);
                 (format!("unsafe {{ {lets}{p}({}) }}", a.join(", ")), ret, ret2, rty)
             }
@@ -1728,7 +1842,7 @@ impl Emitter<'_> {
                 if foreign || raw {
                     self.stats.raw += 1;
                 }
-                let a = self.raw_lends(args, &pass, &arg_tys, typed).join(", ");
+                let a = self.raw_lends(args, &pass, &arg_tys, typed, true).join(", ");
                 if ret2 && foreign {
                     // an extern returns `ffi::Pair`, which is FFI-safe; a tuple isn't
                     return (format!("unsafe {{ let pair_ = {p}({a}); (pair_.0, pair_.1) }}"), ret, ret2, rty);
@@ -2268,12 +2382,14 @@ impl Emitter<'_> {
     /// borrows or accesses whose root is safe is a pointer made from the root's
     /// slice at the call (`borrow::FactKind::RawLend`), not the address kept
     /// from earlier.
-    fn raw_lends(&self, args: &[ValueId], pass: &[Pass], tys: &[Option<TyId>], mut out: Vec<String>) -> Vec<String> {
+    /// Only `Pass::Raw` arguments unless `all` (beside slices lent at the call).
+    fn raw_lends(&self, args: &[ValueId], pass: &[Pass], tys: &[Option<TyId>], mut out: Vec<String>, all: bool) -> Vec<String> {
         let Some(a) = self.borrow else { return out };
         for (k, &v) in args.iter().enumerate() {
             let mutbl = match pass.get(k) {
-                Some(&Pass::Borrow { mutbl, .. }) => mutbl,
-                Some(&Pass::Access { write }) => write,
+                Some(&Pass::Borrow { mutbl, .. }) if all => mutbl,
+                Some(&Pass::Access { write }) if all => write,
+                Some(&Pass::Raw { mutbl, .. }) => mutbl,
                 _ => continue,
             };
             let Some(place) = a.safe_root(v).and_then(|r| self.places.get(r as usize)).and_then(|p| p.as_ref()) else { continue };

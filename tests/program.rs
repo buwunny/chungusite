@@ -450,7 +450,7 @@ fn a_type_models_proposals_pass_the_gate_or_change_nothing() {
     });
     // `int` fits the argument; a `char` result says less than the code shows.
     let m = Fixed { arg: "int", ret: "char" };
-    let (p, _) = program_with(&[f], BuildOptions { dwarf: true, model: Some(&m), dataset: false });
+    let (p, _) = program_with(&[f], BuildOptions { asm: true, dwarf: true, model: Some(&m), dataset: false });
     assert_eq!((p.type_stats.accepted, p.type_stats.rejected), (1, 1));
     let src = emitted(&p, Mode::Fast);
     assert!(src[0].contains("fn f(rdi: i32) -> u32 {"), "{}", src[0]);
@@ -508,6 +508,111 @@ fn a_callee_that_keeps_a_lent_reference_makes_it_escape() {
     let a = p.analyses(&Options::default())[0].clone().unwrap();
     assert!(a.params[0].keeps, "{:?}", a.params[0]);
     assert_ne!(raw_frame(&p, 1), []);
+}
+
+/// `caller(x)`: `x` in a local, its address in a second local, and `callee`
+/// (index 1) called with a third local and the second, `(&q, &p)`; then
+/// `*q` is read back, and if `leak`, `q` is stored in a global.
+fn copy_a_reference(leak: bool) -> impl Fn(&mut CodeAssembler) {
+    move |a| {
+        a.sub(rsp, 40).unwrap();
+        a.mov(qword_ptr(rsp + 16), rdi).unwrap();
+        a.lea(rax, qword_ptr(rsp + 16)).unwrap();
+        a.mov(qword_ptr(rsp), rax).unwrap();
+        a.lea(rdi, qword_ptr(rsp + 8)).unwrap();
+        a.mov(rsi, rsp).unwrap();
+        a.mov(edx, 8).unwrap();
+        a.call(addr(1)).unwrap();
+        a.mov(rax, qword_ptr(rsp + 8)).unwrap();
+        if leak {
+            a.mov(qword_ptr(0x9000), rax).unwrap();
+        }
+        a.mov(rax, qword_ptr(rax)).unwrap();
+        a.add(rsp, 40).unwrap();
+        a.ret().unwrap();
+    }
+}
+
+#[test]
+fn a_memcpy_call_copies_the_pointers_in_what_it_copies() {
+    // memcpy(&q, &p, 8) with p = &x, then q stored in a global: x escapes
+    let caller = copy_a_reference(true);
+    let (p, _) = program(&[("caller", &caller), ("memcpy", &stub_memcpy)]);
+    assert_ne!(raw_frame(&p, 0), []);
+}
+
+#[test]
+fn a_pointer_a_callee_moves_between_arguments_is_followed() {
+    // move_ptr(dst, src): *dst = *src. The caller's x is reached through q
+    // after the call, and stays safe; stored in a global, it escapes.
+    let move_ptr = |a: &mut CodeAssembler| {
+        a.mov(rax, qword_ptr(rsi)).unwrap();
+        a.mov(qword_ptr(rdi), rax).unwrap();
+        a.ret().unwrap();
+    };
+    let caller = copy_a_reference(false);
+    let (p, _) = program(&[("caller", &caller), ("move_ptr", &move_ptr)]);
+    let a = p.analyses(&Options::default())[1].clone().unwrap();
+    let src = a.params.iter().find(|x| x.reg == 6).unwrap();
+    assert!(!src.keeps, "{:?}", src);
+    let dst = a.params.iter().position(|x| x.reg == 7).unwrap() as u8;
+    assert_eq!(src.into, [(dst, Some(0), true)], "{:?}", src);
+    assert_eq!(raw_frame(&p, 0), []);
+
+    let caller = copy_a_reference(true);
+    let (p, _) = program(&[("caller", &caller), ("move_ptr", &move_ptr)]);
+    assert_ne!(raw_frame(&p, 0), []);
+}
+
+#[test]
+fn a_local_given_to_a_call_that_never_returns_stays_safe() {
+    // keep(p) stores p in a global; caller(x) passes &x and then traps
+    let (p, _) = program(&[
+        ("keep", &|a| {
+            a.mov(qword_ptr(0x9000), rdi).unwrap();
+            a.ret().unwrap();
+        }),
+        ("caller", &|a| {
+            a.sub(rsp, 24).unwrap();
+            a.mov(qword_ptr(rsp + 8), rdi).unwrap();
+            a.lea(rdi, qword_ptr(rsp + 8)).unwrap();
+            a.call(addr(0)).unwrap();
+            a.ud2().unwrap();
+        }),
+    ]);
+    assert_eq!(raw_frame(&p, 1), []);
+}
+
+#[test]
+fn a_callee_that_uses_a_pointer_raw_only_during_the_call_gets_a_pointer_from_the_slice() {
+    // poke(p, q, c): *(c ? q : p) = 1, through a pointer into either object;
+    // caller(a, b) lends &x and &y and reads them back
+    let (p, _) = program(&[
+        ("poke", &|a| {
+            a.mov(rax, rdi).unwrap();
+            a.test(edx, edx).unwrap();
+            a.cmovne(rax, rsi).unwrap();
+            a.mov(qword_ptr(rax), 1).unwrap();
+            a.ret().unwrap();
+        }),
+        ("caller", &|a| {
+            a.sub(rsp, 24).unwrap();
+            a.mov(qword_ptr(rsp), rdi).unwrap();
+            a.mov(qword_ptr(rsp + 8), rsi).unwrap();
+            a.mov(rdi, rsp).unwrap();
+            a.lea(rsi, qword_ptr(rsp + 8)).unwrap();
+            a.call(addr(0)).unwrap();
+            a.mov(rax, qword_ptr(rsp)).unwrap();
+            a.add(rax, qword_ptr(rsp + 8)).unwrap();
+            a.add(rsp, 24).unwrap();
+            a.ret().unwrap();
+        }),
+    ]);
+    let a = p.analyses(&Options::default())[0].clone().unwrap();
+    assert!(a.params.iter().filter(|x| x.reg == 7 || x.reg == 6).all(|x| x.during_call), "{:?}", a.params);
+    assert_eq!(raw_frame(&p, 1), []);
+    let src = emitted(&p, Mode::Safe);
+    assert!(src[1].contains("frame.0.as_mut_ptr() as u64"), "{}", src[1]);
 }
 
 #[test]
@@ -636,4 +741,56 @@ fn each_path_returns_on_its_own() {
     assert_eq!(src[0].matches("return ").count(), 3, "{}", src[0]);
     // the loaded value is declared where it is loaded, not up front
     assert!(!src[0].contains("let mut v"), "{}", src[0]);
+}
+
+#[test]
+fn a_local_a_raw_twin_keeps_is_raw() {
+    // keep(p, q) reads *p and stores q in a global; caller(p) lends an escaping
+    // p, so the call goes to `keep_raw`, which still keeps the local's address
+    let (p, _) = program(&[
+        ("keep", &|a| {
+            a.mov(rax, qword_ptr(rdi)).unwrap();
+            a.mov(qword_ptr(0x9000), rsi).unwrap();
+            a.ret().unwrap();
+        }),
+        ("caller", &|a| {
+            a.sub(rsp, 24).unwrap();
+            a.mov(qword_ptr(rsp + 8), rsi).unwrap();
+            a.mov(qword_ptr(0x9008), rdi).unwrap();
+            a.lea(rsi, qword_ptr(rsp + 8)).unwrap();
+            a.call(addr(0)).unwrap();
+            a.mov(rax, qword_ptr(rsp + 8)).unwrap();
+            a.add(rsp, 24).unwrap();
+            a.ret().unwrap();
+        }),
+    ]);
+    let src = emitted(&p, Mode::Safe);
+    assert!(src[1].contains("keep_raw("), "{}", src[1]);
+    assert!(!raw_frame(&p, 1).is_empty(), "{}", src[1]);
+}
+
+#[test]
+fn an_argument_stored_where_the_caller_cant_follow_takes_no_slice() {
+    // put(dst, src, i): reads *src, then stores src at dst[i]. Callers can't
+    // follow a store at an unknown offset, so src escapes, and put must take it
+    // as an integer as its callers pass it, not as a slice.
+    let (p, _) = program(&[
+        ("put", &|a| {
+            a.mov(rax, qword_ptr(rsi)).unwrap();
+            a.mov(qword_ptr(rdi + rdx * 8), rsi).unwrap();
+            a.ret().unwrap();
+        }),
+        ("caller", &|a| {
+            a.sub(rsp, 24).unwrap();
+            a.mov(qword_ptr(rsp + 8), rsi).unwrap();
+            a.lea(rsi, qword_ptr(rsp + 8)).unwrap();
+            a.call(addr(0)).unwrap();
+            a.add(rsp, 24).unwrap();
+            a.ret().unwrap();
+        }),
+    ]);
+    let a = p.analyses(&Options::default())[0].clone().unwrap();
+    let src = a.params.iter().find(|x| x.reg == 6).unwrap();
+    assert_eq!(src.class, chungusite::borrow::Class::Raw, "{:?}", src);
+    assert_ne!(raw_frame(&p, 1), []);
 }

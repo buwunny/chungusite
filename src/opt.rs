@@ -559,7 +559,7 @@ fn copy_block(f: &mut Function, b: BlockId, sites: &mut Vec<(Site, Site)>, map: 
 }
 /// Point every edge from `p` into `from` at `to` instead (a block with the same
 /// parameters).
-fn redirect(f: &mut Function, p: BlockId, from: BlockId, to: BlockId) {
+pub(crate) fn redirect(f: &mut Function, p: BlockId, from: BlockId, to: BlockId) {
     match &mut f.blocks[p].term {
         Terminator::Jump { to: t, .. } => {
             if *t == from {

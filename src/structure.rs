@@ -317,7 +317,7 @@ fn short_circuit(f: &Function, cfg: &Cfg, node_of: &[BlockId], vterm: &mut [VTer
 /// Steensgaard's decomposition. Find the SCCs; one with a single entry is a natural
 /// loop, so drop the edges back to its header and look inside it again; one with
 /// several entries is a region.
-fn irreducible_regions(f: &Function, cfg: &Cfg) -> Vec<Vec<BlockId>> {
+pub fn irreducible_regions(f: &Function, cfg: &Cfg) -> Vec<Vec<BlockId>> {
     let n = f.blocks.len();
     let mut cut = vec![false; n]; // headers whose in-edges inside their loop are gone
     let mut in_set = vec![false; n];

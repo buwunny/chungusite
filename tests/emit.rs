@@ -2,6 +2,7 @@
 //! These tests shell out to `rustc`, the same one cargo uses.
 mod common;
 use chungusite::{
+    dispatch::single_entry,
     emit::{emit_function, emit_function_with, Mode},
     ir::*,
     lift::Lifter,
@@ -356,6 +357,8 @@ fn cli_decompiles_an_elf() {
 /// valid), both forms run on the same random inputs. Loops get fuel so a program
 /// that doesn't terminate is skipped instead of hanging the test; the state
 /// machine counts every block, so it gets far more than the structured form.
+/// A third form gives each irreducible cycle one entry first (`dispatch`), so
+/// that it is structured too, and must agree with both.
 #[test]
 fn structured_control_flow_matches_the_state_machine() {
     let gprs = [rax, rcx, rdx, rbx, rsi, rdi, r8, r9];
@@ -363,7 +366,7 @@ fn structured_control_flow_matches_the_state_machine() {
     let mut rng = Rng(0x5EED_0FC0_FFEE);
     let mut lib = String::new();
     let mut calls = String::new();
-    let (mut structured, mut machines) = (0, 0);
+    let (mut structured, mut machines, mut one_entry) = (0, 0, 0);
     for p in 0..300 {
         let n = 3 + rng.below(20) as usize;
         let mut a = CodeAssembler::new(64).unwrap();
@@ -402,6 +405,18 @@ fn structured_control_flow_matches_the_state_machine() {
         } else if st.contains("loop {") || st.contains("while ") || st.contains("if ") {
             structured += 1;
         }
+        let mut g = Function::with_capacity(64, 8);
+        Lifter::new().lift(&code, common::BASE, &mut g).unwrap();
+        clean(&mut g);
+        let made = single_entry(&mut g);
+        clean(&mut g);
+        verify(&g).unwrap();
+        let mut one = String::new();
+        let dstats = emit_function_with(&g, &format!("dx{p}"), Mode::Fast, true, &|_| None, &|_| None, &mut one);
+        if made > 0 {
+            one_entry += 1;
+            assert!(dstats.state_machines < stats.state_machines || stats.state_machines == 0, "program {p}: {one}");
+        }
         // every loop, `while` loops included, burns fuel each time round
         let fuel = |src: String, n: u32| {
             let is_loop = |l: &str| {
@@ -411,17 +426,19 @@ fn structured_control_flow_matches_the_state_machine() {
             };
             src.lines().map(|l| if is_loop(l) { format!("{l} fuel!({n});\n") } else { format!("{l}\n") }).collect::<String>()
         };
-        lib.push_str(&format!("// {code:02x?}\n{}{}", fuel(st, 1_000), fuel(sm, 1_000_000)));
+        lib.push_str(&format!("// {code:02x?}\n{}{}{}", fuel(st, 1_000), fuel(sm, 1_000_000), fuel(one, 1_000_000)));
         let arity = sm_arity(&lib, p);
         let args = (0..arity).map(|k| format!("x[{k}]")).collect::<Vec<_>>().join(", ");
         calls.push_str(&format!(
             "    for x in &inputs {{ FUEL.set(0); let a = catch(|| unsafe {{ st{p}({args}) }}); \
              if a.is_none() {{ continue; }} FUEL.set(0); let b = catch(|| unsafe {{ sm{p}({args}) }}); \
-             assert_eq!(a, b, \"program {p} on {{x:?}}\"); compared += 1; }}\n"
+             assert_eq!(a, b, \"program {p} on {{x:?}}\"); FUEL.set(0); let c = catch(|| unsafe {{ dx{p}({args}) }}); \
+             assert_eq!(a, c, \"program {p}, one entry, on {{x:?}}\"); compared += 1; }}\n"
         ));
     }
     assert!(structured > 100, "only {structured} programs with control flow were structured");
     assert!(machines > 0, "no irreducible program exercised the fallback");
+    assert!(one_entry > 0, "no irreducible cycle was given one entry");
 
     let main = format!(
         r#"{PRELUDE}
@@ -445,7 +462,7 @@ fn main() {{
     rustc(&dir, "main.rs", &main, &["-O", "-o", dir.join("run").to_str().unwrap()]);
     let out = Command::new(dir.join("run")).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    eprintln!("{structured} structured, {machines} state machines, {} runs compared", String::from_utf8_lossy(&out.stdout).trim());
+    eprintln!("{structured} structured, {machines} state machines ({one_entry} given one entry), {} runs compared", String::from_utf8_lossy(&out.stdout).trim());
 }
 
 /// Number of parameters of `sm{p}` in `src`.

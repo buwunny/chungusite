@@ -261,6 +261,13 @@ impl Program {
                                 if keep_raw_ir && x.selected {
                                     raw = Some(crate::dump::dump(&f));
                                 }
+                                // Code that hides from a linear sweep may also hide behind branches
+                                // that always go one way. (Compiled code has them too, Rust's
+                                // overflow checks on constants, but its panic paths are evidence
+                                // the register summaries rely on, so it is left as it is.)
+                                if lifter.followed_flow() {
+                                    crate::opt::fold_branches(&mut f);
+                                }
                                 clean(&mut f);
                                 verify(&f).map_err(|e| format!("cleaned IR failed verification: {e:?}"))
                             });

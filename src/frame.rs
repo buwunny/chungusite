@@ -324,7 +324,9 @@ pub fn promote(f: &mut Function, stack_args: u8) {
             let at = accesses.iter().filter(|a| a.off == off);
             let size = at.clone().map(|a| a.size).max().unwrap();
             let stores_ok = at.clone().all(|a| !a.store || a.size == size);
-            let in_args = off >= 8;
+            // (stack arguments are the first 64 words above the return
+            // address, as `hi` below; a slot further up is something else)
+            let in_args = (8..8 + 8 * 64).contains(&off);
             let ok = stores_ok
                 && !tainted(off, off + size)
                 && (off + size <= 0 || (in_args && off % 8 == 0 && size <= 8));

@@ -13,10 +13,41 @@ fn lift(code: &[u8]) -> (Result<(), LiftError>, Function) {
 }
 
 #[test]
-fn branch_into_middle_of_instruction_is_an_error() {
-    // 1000: jmp 1003 ; 1002: mov eax, 1 (1002..1007) ; 1007: ret
+fn branch_into_middle_of_instruction_decodes_from_there() {
+    // 1000: jmp 1003 ; 1002: mov eax, 1 (1002..1007) ; 1007: ret. Only the
+    // path from the entry is decoded: 1003 is `add [rax], al; add bl, al; ret`.
     let code = [0xEB, 0x01, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3];
-    assert_eq!(lift(&code).0, Err(LiftError::TargetInsideInstruction { target: 0x1003 }));
+    let (r, f) = lift(&code);
+    r.unwrap();
+    assert!(!f.blocks.iter().any(|(_, b)| matches!(b.term, Terminator::Unreachable)));
+}
+
+#[test]
+fn overlapping_instructions_lift() {
+    // mov eax, edi ; 1002: jmp 1003 (EB FF), whose second byte starts
+    // 1003: inc eax (FF C0) ; add eax, 2 ; ret
+    let code = [0x89, 0xF8, 0xEB, 0xFF, 0xC0, 0x83, 0xC0, 0x02, 0xC3];
+    let (r, f) = lift(&code);
+    r.unwrap();
+    assert_eq!(f.blocks.len(), 2);
+}
+
+#[test]
+fn junk_no_path_reaches_is_skipped() {
+    // lea eax, [rdi+1] ; jmp over a byte that starts a 5-byte call ; add eax, esi ; ret
+    let code = [0x8D, 0x47, 0x01, 0xEB, 0x01, 0xE8, 0x01, 0xF0, 0xC3];
+    lift(&code).0.unwrap();
+    // without the jump, the junk is reached and fails as before
+    let code = [0x8D, 0x47, 0x01, 0x90, 0x90, 0xE8, 0x01, 0xF0, 0xC3];
+    assert!(matches!(lift(&code).0, Err(LiftError::Unsupported { .. })));
+}
+
+#[test]
+fn branch_into_garbage_is_still_an_error() {
+    // je into the middle of a mov, where the bytes decode to nothing valid
+    // 1000: test edi, edi ; je 1005 ; 1004: mov eax, 0xffff0f06 ... ; ret
+    let code = [0x85, 0xFF, 0x74, 0x01, 0xB8, 0x06, 0x0F, 0xFF, 0xFF, 0xC3];
+    assert!(lift(&code).0.is_err());
 }
 
 #[test]

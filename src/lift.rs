@@ -179,6 +179,11 @@ pub struct Lifter {
     /// newest at `recent[(nrecent - 1) % RECENT]`.
     recent: [Instruction; RECENT],
     nrecent: usize,
+    /// Pass 1: the address each general register was last set to by a
+    /// `lea r, [rip + k]` (0 once anything else writes it), in address order.
+    /// A loop over a switch sets the table's base once, before the loop,
+    /// further back than `recent` reaches.
+    rip_lea: [u64; 16],
     /// Pass 1: the address of every instruction, in order.
     starts: Vec<u64>,
     /// Pass 1: some instruction names an xmm (or wider) register. Without one,
@@ -221,6 +226,7 @@ impl Lifter {
             cases: Vec::with_capacity(64),
             recent: [Instruction::default(); RECENT],
             nrecent: 0,
+            rip_lea: [0; 16],
             starts: Vec::with_capacity(256),
             xmm: false,
             switch_index: None,
@@ -335,6 +341,7 @@ impl Lifter {
         self.tables.clear();
         self.cases.clear();
         self.nrecent = 0;
+        self.rip_lea = [0; 16];
         self.starts.clear();
         self.xmm = false;
         let mut dec = Decoder::with_ip(64, code, ip, DecoderOptions::NONE);
@@ -364,6 +371,7 @@ impl Lifter {
                 FlowControl::Return if in_range(next) => self.leaders.push(next),
                 _ => {}
             }
+            self.note_rip_lea();
             self.recent[self.nrecent % RECENT] = self.insn;
             self.nrecent += 1;
         }
@@ -381,6 +389,60 @@ impl Lifter {
         self.leaders.sort_unstable();
         self.leaders.dedup();
         Ok(())
+    }
+
+    /// The address `reg` holds where `before(k)` runs, when a `lea reg, [rip + a]`
+    /// set it: the last write before it in `recent`, or, if nothing in `recent`
+    /// writes it, from `rip_lea`.
+    fn rip_value(&self, reg: Register, k: usize) -> Option<u64> {
+        let n = self.nrecent.min(RECENT);
+        match (k + 1..n).find_map(|m| self.before(m).filter(|w| writes(w, reg))) {
+            Some(w) => (w.mnemonic() == Mnemonic::Lea && w.is_ip_rel_memory_operand()).then(|| w.ip_rel_memory_address()),
+            None if reg.is_gpr64() && !(0..=k.min(n.saturating_sub(1))).any(|m| self.before(m).is_some_and(|w| writes(w, reg))) => {
+                Some(self.rip_lea[gpr(reg)]).filter(|&a| a != 0)
+            }
+            None => None,
+        }
+    }
+
+    /// Update `rip_lea` for the current instruction.
+    fn note_rip_lea(&mut self) {
+        if self.rip_lea.iter().any(|&a| a != 0) {
+            let i = self.insn;
+            let bits = |rs: &[Register]| rs.iter().fold(0u16, |m, &r| m | 1 << gpr(r));
+            use Register::*;
+            // What a callee may change, and what instructions change besides
+            // their destination (`mul`'s rdx, `rep movsb`'s pointers).
+            let mut clobbered = if i.flow_control() == FlowControl::Call {
+                bits(&[RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11])
+            } else if i.is_string_instruction() {
+                bits(&[RAX, RCX, RSI, RDI])
+            } else if (i.mnemonic() == Mnemonic::Imul && i.op_count() == 1)
+                || matches!(
+                    i.mnemonic(),
+                    Mnemonic::Mul | Mnemonic::Div | Mnemonic::Idiv | Mnemonic::Cqo | Mnemonic::Cdq | Mnemonic::Cwd
+                        | Mnemonic::Cpuid | Mnemonic::Rdtsc | Mnemonic::Rdtscp | Mnemonic::Syscall | Mnemonic::Cmpxchg
+                        | Mnemonic::Cmpxchg8b | Mnemonic::Cmpxchg16b | Mnemonic::Xgetbv
+                )
+            {
+                bits(&[RAX, RCX, RDX, RBX, R11])
+            } else {
+                0
+            };
+            // `xchg`'s and `xadd`'s source
+            if matches!(i.mnemonic(), Mnemonic::Xchg | Mnemonic::Xadd) && i.op1_kind() == OpKind::Register && i.op1_register().is_gpr() {
+                clobbered |= 1 << gpr(i.op1_register().full_register());
+            }
+            for (n, a) in self.rip_lea.iter_mut().enumerate() {
+                if clobbered & 1 << n != 0 || writes(&i, gpr_register(n)) {
+                    *a = 0;
+                }
+            }
+        }
+        let i = &self.insn;
+        if i.mnemonic() == Mnemonic::Lea && i.is_ip_rel_memory_operand() && i.op0_register().is_gpr64() {
+            self.rip_lea[gpr(i.op0_register())] = i.ip_rel_memory_address();
+        }
     }
 
     /// The `k`-th instruction before the current one in pass 1 (0 is the one
@@ -407,6 +469,8 @@ impl Lifter {
     /// add  rax, rdx            ; targets relative to the table (PIC)
     /// jmp  rax
     /// ```
+    ///
+    /// The `lea` may also come well before, outside a loop around the switch.
     fn find_table(&mut self, data: &[(u64, &[u8])], lo: u64, hi: u64) -> Result<(), LiftError> {
         let j = self.insn;
         // (instructions back to the table load, the index register, table address, entry size)
@@ -421,17 +485,44 @@ impl Lifter {
                         && a.op1_kind() == OpKind::Register
                 }) else { return Ok(()) };
                 let other = add.op1_register();
-                let Some(k) = (1..RECENT).find(|&k| self.before(k).is_some_and(|m| {
-                    m.mnemonic() == Mnemonic::Movsxd && m.op1_kind() == OpKind::Memory && m.memory_index_scale() == 4
-                        && m.memory_displacement64() == 0
-                        && ((m.op0_register() == r && m.memory_base() == other) || (m.op0_register() == other && m.memory_base() == r))
-                })) else { return Ok(()) };
-                let load = *self.before(k).unwrap();
-                let base = load.memory_base();
-                let Some(lea) = (k + 1..RECENT).find_map(|k| self.before(k).filter(|l| {
-                    l.mnemonic() == Mnemonic::Lea && l.op0_register() == base && l.is_ip_rel_memory_operand()
-                })) else { return Ok(()) };
-                (k + 1, load.memory_index(), lea.ip_rel_memory_address(), 4)
+                // The entry, sign-extended into one of the two: `movsxd`, or
+                // `mov eax, [..]; cdqe` (gcc -O0).
+                let Some((k, load, dst)) = (1..RECENT).find_map(|k| {
+                    let m = self.before(k)?;
+                    let dst = m.op0_register();
+                    match m.mnemonic() {
+                        Mnemonic::Movsxd if m.op1_kind() == OpKind::Memory && (dst == r || dst == other) => Some((k, *m, dst)),
+                        Mnemonic::Cdqe if r == Register::RAX || other == Register::RAX => {
+                            let l = self.before(k + 1)?;
+                            (l.mnemonic() == Mnemonic::Mov && l.op0_register() == Register::EAX && l.op1_kind() == OpKind::Memory)
+                                .then_some((k + 1, *l, Register::RAX))
+                        }
+                        _ => None,
+                    }
+                }) else { return Ok(()) };
+                // the table, added to the entry
+                let Some(table) = self.rip_value(if dst == r { other } else { r }, 0) else { return Ok(()) };
+                if load.memory_displacement64() != 0 {
+                    return Ok(());
+                }
+                let (b, i) = (load.memory_base(), load.memory_index());
+                let at = |reg: Register| reg != Register::None && self.rip_value(reg, k) == Some(table);
+                match load.memory_index_scale() {
+                    4 if at(b) => (k + 1, i, table, 4),
+                    // [table + x] where `lea x, [i*4]` before
+                    1 => {
+                        let x = if at(b) { i } else if at(i) { b } else { return Ok(()) };
+                        let Some(m) = (k + 1..RECENT).find(|&m| self.before(m).is_some_and(|w| writes(w, x))) else { return Ok(()) };
+                        let w = self.before(m).unwrap();
+                        if w.mnemonic() != Mnemonic::Lea || w.memory_base() != Register::None || w.memory_index_scale() != 4
+                            || w.memory_displacement64() != 0
+                        {
+                            return Ok(());
+                        }
+                        (m + 1, w.memory_index(), table, 4)
+                    }
+                    _ => return Ok(()),
+                }
             }
             _ => return Ok(()),
         };
@@ -1985,4 +2076,26 @@ fn cmov_or_setcc(m: Mnemonic) -> Option<bool> {
         | Setle | Setg => Some(false),
         _ => None,
     }
+}
+
+/// Does `i` (probably) write `reg`, as its destination register or as `cdqe`?
+fn writes(i: &Instruction, reg: Register) -> bool {
+    let full = reg.full_register();
+    (i.op_count() > 0 && i.op0_kind() == OpKind::Register && i.op0_register().full_register() == full
+        && !matches!(i.mnemonic(), Mnemonic::Cmp | Mnemonic::Test))
+        || (matches!(i.mnemonic(), Mnemonic::Cdqe | Mnemonic::Cqo) && full == Register::RAX)
+}
+
+/// Index of a 64-bit general register (rax = 0 .. r15 = 15).
+fn gpr(r: Register) -> usize {
+    r as usize - Register::RAX as usize
+}
+
+/// The 64-bit general register with index `n` (`gpr`'s inverse).
+fn gpr_register(n: usize) -> Register {
+    const ALL: [Register; 16] = [
+        Register::RAX, Register::RCX, Register::RDX, Register::RBX, Register::RSP, Register::RBP, Register::RSI, Register::RDI,
+        Register::R8, Register::R9, Register::R10, Register::R11, Register::R12, Register::R13, Register::R14, Register::R15,
+    ];
+    ALL[n]
 }

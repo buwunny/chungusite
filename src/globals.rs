@@ -131,6 +131,14 @@ impl<'b, 'a> Globals<'b, 'a> {
         })
     }
 
+    /// `at` as the end of the item holding `base`: a loop over one array may
+    /// stop at the address of the next item, or past the end of the section.
+    pub fn end_expr(&self, base: u64, at: u64) -> Option<String> {
+        let item = self.item_at(base)?;
+        (item.start + item.len == at && self.item_at(at).is_none_or(|i| i.start == at))
+            .then(|| format!("({} as u64).wrapping_add({:#x})", self.addr_of(&item), item.len))
+    }
+
     /// The static holding `addr`, if safe code can read it as a slice: a
     /// read-only item emitted as `Bytes<N>` (no pointer slots in it).
     pub fn slice(&self, addr: u64) -> Option<String> {
@@ -150,6 +158,9 @@ impl<'b, 'a> Globals<'b, 'a> {
     /// `item`'s static with the right name and type but zero contents, which
     /// rustc checks much faster than the real initializer (`--check`).
     pub fn emit_static_stub(&self, item: &Item, out: &mut String) {
+        if self.emit_copied(item, out) {
+            return;
+        }
         let m = if self.bin.data[item.section].writable { "mut " } else { "" };
         let name = self.ident(item);
         let n = item.len;
@@ -157,6 +168,15 @@ impl<'b, 'a> Globals<'b, 'a> {
             true => writeln!(out, "pub static {m}{name}: Words<{k}> = Words {{ w: [Word {{ b: [0; 8] }}; {k}] }};", k = n.div_ceil(8)),
             false => writeln!(out, "pub static {m}{name}: Bytes<{n}> = Bytes {{ b: [0; {n}] }};"),
         };
+    }
+
+    /// An item the loader copies from a shared library (`Binary::copied`) is
+    /// that library's variable: `stdin` holds the `FILE *` only once libc is
+    /// running, so the file's bytes (zeros) would be wrong.
+    fn emit_copied(&self, item: &Item, out: &mut String) -> bool {
+        let Some(lib) = self.bin.copied.get(&item.start) else { return false };
+        let _ = writeln!(out, "extern \"C\" {{\n    #[link_name = \"{lib}\"]\n    pub static mut {}: [u8; {}];\n}}", self.ident(item), item.len);
+        true
     }
 
     /// A raw pointer to `item`'s static.
@@ -208,6 +228,11 @@ impl<'b, 'a> Globals<'b, 'a> {
             None => "no symbol".to_string(),
         };
         let _ = write!(out, "\n// {} {:#x}, {n} bytes ({what})", sec.name, item.start);
+        if self.bin.copied.contains_key(&item.start) {
+            out.push_str(", the C library's own\n");
+            self.emit_copied(item, out);
+            return;
+        }
         let bytes = sec.bytes.as_deref().map(|b| &b[(item.start - sec.addr) as usize..][..n as usize]);
         if let Some(text) = bytes.and_then(preview) {
             let _ = write!(out, ": {text:?}");

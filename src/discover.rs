@@ -116,7 +116,8 @@ pub fn functions(file: &object::File, known: &[(u64, u64)], pointers: &BTreeMap<
             let c = &code[in_code(a).expect("starts are in code")];
             let section_end = c.addr + c.bytes.len() as u64;
             let limit = match exact.get(&a) {
-                Some(&n) => a + n,
+                // (an unwind entry's size can run past the section in a corrupt file)
+                Some(&n) => a.saturating_add(n).min(section_end),
                 None => list.get(k + 1).copied().unwrap_or(section_end).min(section_end),
             };
             let w = match walked.get(&a) {

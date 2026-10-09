@@ -92,6 +92,9 @@ impl<'b, 'a> Globals<'b, 'a> {
                 return Some(Item { start: s.addr, len: s.size, section, sym: Some(k) });
             }
         }
+        if sec.code {
+            return None; // code, not a labeled table in it
+        }
         // code reaches every thread-local from the thread pointer, so the block
         // can't be split
         if sec.name == TLS_SECTION {

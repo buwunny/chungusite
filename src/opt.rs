@@ -563,3 +563,84 @@ fn redirect(f: &mut Function, p: BlockId, from: BlockId, to: BlockId) {
         _ => {}
     }
 }
+
+/// Turn each branch whose condition is a constant into a jump: `xor ecx, ecx;
+/// test ecx, ecx; jnz junk` never goes to `junk`, which obfuscators fill with
+/// bytes meant to derail a disassembler (an opaque predicate). The condition is
+/// evaluated through constants, casts, arithmetic and comparisons; anything that
+/// depends on an input stays a branch. Returns the number of branches folded.
+/// The block no longer branched to keeps its code but loses the edge.
+pub fn fold_branches(f: &mut Function) -> usize {
+    let mut n = 0;
+    for b in 0..f.blocks.len() {
+        let b = BlockId::new(b);
+        let Terminator::Branch { c, t, f: e, args } = f.blocks[b].term else { continue };
+        let Some(v) = eval(f, c, 16) else { continue };
+        let tn = f.blocks[t].params.len;
+        let (to, start, len) = if v != 0 { (t, args.start, tn) } else { (e, args.start + tn, f.blocks[e].params.len) };
+        f.blocks[b].term = Terminator::Jump { to, args: ListRef { start, len } };
+        n += 1;
+    }
+    n
+}
+
+/// The value of `v` if it is a constant expression, truncated to its width.
+fn eval(f: &Function, v: ValueId, depth: u32) -> Option<u64> {
+    let width = |v: ValueId| match f.insts[v].ty {
+        TyId::B1 | TyId::BOOL => 8,
+        TyId::B2 => 16,
+        TyId::B4 => 32,
+        TyId::B8 | TyId::PTR => 64,
+        _ => 0,
+    };
+    let mask = |bits: u32, x: u64| if bits >= 64 { x } else { x & ((1u64 << bits) - 1) };
+    let sext = |bits: u32, x: u64| if bits >= 64 { x } else { ((x << (64 - bits)) as i64 >> (64 - bits)) as u64 };
+    let w = width(v);
+    if w == 0 || depth == 0 {
+        return None;
+    }
+    let go = |x: ValueId| eval(f, x, depth - 1);
+    let r = match f.insts[v].kind {
+        InstKind::Const(k) => f.consts[k.index()] as u64,
+        InstKind::Cast { kind: CastKind::Trunc | CastKind::ZExt, v: x } => go(x)?,
+        InstKind::Cast { kind: CastKind::SExt, v: x } => sext(width(x), go(x)?),
+        InstKind::Un { op: UnOp::Not, v: x } => !go(x)?,
+        InstKind::Un { op: UnOp::Neg, v: x } => go(x)?.wrapping_neg(),
+        InstKind::Bin { op, lhs, rhs } => {
+            let (a, b) = (go(lhs)?, go(rhs)?);
+            match op {
+                BinOp::Add => a.wrapping_add(b),
+                BinOp::Sub => a.wrapping_sub(b),
+                BinOp::Mul => a.wrapping_mul(b),
+                BinOp::And => a & b,
+                BinOp::Or => a | b,
+                BinOp::Xor => a ^ b,
+                BinOp::Shl => a.checked_shl(b as u32).unwrap_or(0),
+                BinOp::LShr => mask(w, a).checked_shr(b as u32).unwrap_or(0),
+                _ => return None,
+            }
+        }
+        InstKind::Cmp { cc, lhs, rhs } => {
+            let bits = width(lhs);
+            if bits == 0 {
+                return None;
+            }
+            let (a, b) = (mask(bits, go(lhs)?), mask(bits, go(rhs)?));
+            let (sa, sb) = (sext(bits, a) as i64, sext(bits, b) as i64);
+            (match cc {
+                Cond::Eq => a == b,
+                Cond::Ne => a != b,
+                Cond::Ult => a < b,
+                Cond::Ule => a <= b,
+                Cond::Ugt => a > b,
+                Cond::Uge => a >= b,
+                Cond::Slt => sa < sb,
+                Cond::Sle => sa <= sb,
+                Cond::Sgt => sa > sb,
+                Cond::Sge => sa >= sb,
+            }) as u64
+        }
+        _ => return None,
+    };
+    Some(mask(w, r))
+}

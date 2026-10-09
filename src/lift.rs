@@ -203,6 +203,9 @@ pub struct Lifter {
     info: iced_x86::InstructionInfoFactory,
     /// Pass 1: the address of every instruction, in order.
     starts: Vec<u64>,
+    /// The instructions to decode when following the control flow
+    /// (`follow_flow`), in address order; empty for a linear sweep.
+    walk: Vec<u64>,
     /// Pass 1: some instruction names an xmm (or wider) register. Without one,
     /// calls and returns don't track xmm registers: they can only hold what the
     /// function was entered with, or what its callees left, which `abi` works
@@ -279,6 +282,7 @@ impl Lifter {
             fixed_lea: [0; 16],
             info: iced_x86::InstructionInfoFactory::new(),
             starts: Vec::with_capacity(256),
+            walk: Vec::new(),
             xmm: false,
             ymm: false,
             x87: false,
@@ -299,6 +303,12 @@ impl Lifter {
             flags: Flags::Unknown,
             ip: 0,
         }
+    }
+
+    /// Did the last `lift` decode only what the control flow reaches
+    /// (`follow_flow`), because a linear sweep of the bytes failed?
+    pub fn followed_flow(&self) -> bool {
+        !self.walk.is_empty()
     }
 
     /// Lift one function's bytes, loaded at `ip`, into `f` (which is cleared first).
@@ -326,7 +336,17 @@ impl Lifter {
         f: &mut Function,
     ) -> Result<(), LiftError> {
         f.clear();
-        self.find_leaders(code, ip, data)?;
+        // Decode linearly first, the fast path for compiled code. If that
+        // fails, the bytes may hold something no path reaches (junk after a
+        // `jmp`, data in hand-written code) or instructions that overlap (a
+        // jump into the middle of one): decode only what the control flow
+        // reaches, from each place it reaches.
+        self.walk.clear();
+        if let Err(e) = self.find_leaders(code, ip, data) {
+            if !matches!(e, LiftError::TargetInsideInstruction { .. } | LiftError::Unsupported { .. }) || !self.follow_flow(code, ip, data, noreturn) {
+                return Err(e);
+            }
+        }
         self.state.clear();
         self.calls.clear();
         self.tails.clear();
@@ -347,6 +367,8 @@ impl Lifter {
         let mut dec = Decoder::with_ip(64, code, ip, DecoderOptions::NONE);
         let mut next_leader = 1;
         let mut open = true;
+        // Where the previous instruction falls through to.
+        let mut fall_to = ip;
         self.fall = None;
         self.upper = false;
         self.begin_block(0, f);
@@ -356,9 +378,25 @@ impl Lifter {
         if self.x87 {
             self.x87_clear(f, true);
         }
-        while dec.can_decode() {
+        for k in 0..self.starts.len() {
+            let at = self.starts[k];
+            if at != fall_to {
+                // Following the control flow: the previous instruction falls
+                // through to code decoded elsewhere (a leader).
+                if dec.set_position((at - ip) as usize).is_err() {
+                    break;
+                }
+                dec.set_ip(at);
+                if open {
+                    let to = self.block_at(fall_to).ok_or(LiftError::TargetInsideInstruction { target: fall_to })?;
+                    self.end_block(f, Terminator::Jump { to, args: ListRef::EMPTY });
+                    open = false;
+                }
+                self.fall = None;
+            }
             dec.decode_out(&mut self.insn);
             self.ip = self.insn.ip();
+            fall_to = self.insn.next_ip();
             if next_leader < self.leaders.len() && self.ip >= self.leaders[next_leader] {
                 if self.ip > self.leaders[next_leader] {
                     return Err(LiftError::TargetInsideInstruction { target: self.leaders[next_leader] });
@@ -431,11 +469,31 @@ impl Lifter {
         self.ymm = false;
         self.x87 = false;
         let mut dec = Decoder::with_ip(64, code, ip, DecoderOptions::NONE);
-        while dec.can_decode() {
+        let mut k = 0;
+        loop {
+            if self.walk.is_empty() {
+                if !dec.can_decode() {
+                    break;
+                }
+            } else {
+                // Following the control flow: only the instructions it reaches,
+                // in address order, each decoded from its own start.
+                let Some(&at) = self.walk.get(k) else { break };
+                k += 1;
+                if dec.set_position((at - ip) as usize).is_err() {
+                    break;
+                }
+                dec.set_ip(at);
+            }
             dec.decode_out(&mut self.insn);
             self.ip = self.insn.ip();
             self.starts.push(self.ip);
             let next = self.insn.next_ip();
+            // Falling through to code that isn't decoded next (it overlaps
+            // this instruction, or comes after code no path reaches): a leader.
+            if !self.walk.is_empty() && self.walk.get(k) != Some(&next) && self.walk.binary_search(&next).is_ok() && falls_through(&self.insn) {
+                self.leaders.push(next);
+            }
             // Pass 2 lifts every instruction (code after a `ret` starts a block
             // too), so the first one it has no case for fails the function now,
             // before any IR is built.
@@ -468,7 +526,7 @@ impl Lifter {
                     } else if self.insn.flow_control() == FlowControl::ConditionalBranch {
                         self.stubs.push(self.ip);
                     }
-                    if in_range(next) { self.leaders.push(next); }
+                    if in_range(next) && self.walked(next) { self.leaders.push(next); }
                 }
                 FlowControl::IndirectBranch => {
                     self.find_table(data, ip, end)?;
@@ -482,9 +540,9 @@ impl Lifter {
                             }
                         }
                     }
-                    if in_range(next) { self.leaders.push(next); }
+                    if in_range(next) && self.walked(next) { self.leaders.push(next); }
                 }
-                FlowControl::Return if in_range(next) => self.leaders.push(next),
+                FlowControl::Return if in_range(next) && self.walked(next) => self.leaders.push(next),
                 _ => {}
             }
             self.note_rip_lea();
@@ -505,7 +563,70 @@ impl Lifter {
         }
         self.leaders.sort_unstable();
         self.leaders.dedup();
+        // Every leader must start an instruction: one that starts inside
+        // another needs `follow_flow`.
+        if let Some(&target) = self.leaders.iter().find(|l| self.starts.binary_search(l).is_err()) {
+            return Err(LiftError::TargetInsideInstruction { target });
+        }
         Ok(())
+    }
+
+    /// Is `a` decoded? Every instruction is in a linear sweep; following the
+    /// control flow, the code after a `jmp` or `ret` may be junk no path reaches.
+    fn walked(&self, a: u64) -> bool {
+        self.walk.is_empty() || self.walk.binary_search(&a).is_ok()
+    }
+
+    /// Retry pass 1 on just the instructions the control flow reaches from the
+    /// entry (`walk`), decoding each from where a path reaches it, so the same
+    /// bytes can be two different instructions. A jump table found on the way
+    /// adds its cases, and the walk repeats. False if pass 1 still fails.
+    fn follow_flow(&mut self, code: &[u8], ip: u64, data: &[(u64, &[u8])], noreturn: &dyn Fn(u64, Option<u64>) -> bool) -> bool {
+        let end = ip + code.len() as u64;
+        let mut dec = Decoder::with_ip(64, code, ip, DecoderOptions::NONE);
+        let mut insn = Instruction::default();
+        let mut seen = std::collections::HashSet::new();
+        let mut todo = vec![ip];
+        for _ in 0..8 {
+            while let Some(mut at) = todo.pop() {
+                while (ip..end).contains(&at) && seen.insert(at) && dec.set_position((at - ip) as usize).is_ok() {
+                    dec.set_ip(at);
+                    dec.decode_out(&mut insn);
+                    self.walk.push(at);
+                    if insn.is_invalid() || matches!(insn.mnemonic(), Mnemonic::Ud2 | Mnemonic::Int3 | Mnemonic::Hlt) {
+                        break;
+                    }
+                    let target = match insn.op0_kind() {
+                        OpKind::NearBranch64 => Some(insn.near_branch_target()),
+                        OpKind::Memory if insn.is_ip_rel_memory_operand() => Some(insn.ip_rel_memory_address()),
+                        _ => None,
+                    };
+                    match insn.flow_control() {
+                        FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch => todo.extend(target.filter(|t| (ip..end).contains(t))),
+                        FlowControl::Call | FlowControl::IndirectCall if noreturn(at, target) => break,
+                        _ => {}
+                    }
+                    if !falls_through(&insn) {
+                        break;
+                    }
+                    at = insn.next_ip();
+                }
+            }
+            self.walk.sort_unstable();
+            match self.find_leaders(code, ip, data) {
+                Ok(()) => {
+                    // A case or branch target the walk didn't reach yet.
+                    todo.extend(self.leaders.iter().copied().filter(|l| !seen.contains(l)));
+                    if todo.is_empty() {
+                        return true;
+                    }
+                }
+                Err(LiftError::TargetInsideInstruction { target }) if !seen.contains(&target) => todo.push(target),
+                Err(_) => break,
+            }
+        }
+        self.walk.clear();
+        false
     }
 
     /// The address `reg` holds where `before(k)` runs, when a `lea reg, [rip + a]`
@@ -2346,6 +2467,12 @@ fn succs(t: Terminator) -> [Option<BlockId>; 2] {
         Terminator::Branch { t, f, .. } => [Some(t), Some(f)],
         _ => [None, None],
     }
+}
+
+/// Does execution go on to the next instruction (always or sometimes)?
+fn falls_through(i: &Instruction) -> bool {
+    !matches!(i.mnemonic(), Mnemonic::Ud2 | Mnemonic::Int3 | Mnemonic::Hlt)
+        && !matches!(i.flow_control(), FlowControl::UnconditionalBranch | FlowControl::IndirectBranch | FlowControl::Return | FlowControl::Exception)
 }
 
 /// Could `Lifter::lift_insn` lift this instruction? False only when it can't

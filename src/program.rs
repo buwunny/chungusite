@@ -93,6 +93,9 @@ pub struct Program {
     /// The types `Func::types` refer to, structs included.
     pub tys: TyTable,
     pub type_stats: TypeStats,
+    /// Training examples for a type model from the debug info's prototypes, if
+    /// `BuildOptions::dataset` asked for them; `func` indexes `funcs`.
+    pub examples: Vec<crate::types::Example>,
     /// GOT slot -> the address in the binary the loader fills it with.
     got_addr: HashMap<u64, u64>,
 }
@@ -104,11 +107,13 @@ pub struct BuildOptions<'a> {
     pub dwarf: bool,
     /// Proposes argument and return types; the facts accept or reject them.
     pub model: Option<&'a dyn TypeModel>,
+    /// Collect `Program::examples` (`--emit dataset`).
+    pub dataset: bool,
 }
 
 impl Default for BuildOptions<'_> {
     fn default() -> Self {
-        BuildOptions { dwarf: true, model: None }
+        BuildOptions { dwarf: true, model: None, dataset: false }
     }
 }
 
@@ -325,6 +330,13 @@ impl Program {
                             .and_then(|()| {
                                 if keep_raw_ir && x.selected {
                                     raw = Some(crate::dump::dump(&f));
+                                }
+                                // Code that hides from a linear sweep may also hide behind branches
+                                // that always go one way. (Compiled code has them too, Rust's
+                                // overflow checks on constants, but its panic paths are evidence
+                                // the register summaries rely on, so it is left as it is.)
+                                if lifter.followed_flow() {
+                                    crate::opt::fold_branches(&mut f);
                                 }
                                 clean(&mut f);
                                 verify(&f).map_err(|e| format!("cleaned IR failed verification: {e:?}"))
@@ -720,6 +732,10 @@ impl Program {
             })
             .collect();
         let (fn_types, type_stats) = crate::types::recover(&type_inputs, debug.as_ref(), opts.model, &mut tys);
+        let examples = match (&debug, opts.dataset) {
+            (Some(d), true) => crate::types::examples(&type_inputs, d, &tys),
+            _ => Vec::new(),
+        };
         drop(type_inputs);
         for (f, t) in funcs.iter_mut().zip(fn_types) {
             f.types = t;
@@ -756,7 +772,7 @@ impl Program {
                 externs.push(Extern { name, ident, sig });
             }
         }
-        Program { funcs, externs, extern_of, tys, type_stats, got_addr: syms.got_addr }
+        Program { funcs, externs, extern_of, tys, type_stats, examples, got_addr: syms.got_addr }
     }
 
     /// The callee of each call site in function `i`, for the emitter. With

@@ -1440,6 +1440,80 @@ fn infer_ret(r: &RetFacts, fa: &Facts, pointee_of: &HashMap<u32, TyId>, table: &
     (r.bytes != 8 || signed).then(|| table.int(r.bytes as usize, signed))
 }
 
+/// A training example for a type model (`--emit dataset`): one of the
+/// questions `model_vars` asks, about a function whose prototype is known, with
+/// the prototype's answer.
+#[derive(Clone, Debug)]
+pub struct Example {
+    /// Index into `examples`' inputs.
+    pub func: usize,
+    pub var: Var,
+    /// The value the model is asked about.
+    pub value: ValueId,
+    /// The C type, spelled the way `parse_label` reads it.
+    pub label: String,
+    /// The parameter's name in the source (`None` for the return value).
+    pub name: Option<String>,
+}
+
+/// The questions a type model would be asked about each function that has a
+/// usable prototype, answered from the prototype. Functions are in input
+/// order, and their questions in `model_vars` order; a question whose type
+/// has no C label (a struct by value, a 128-bit integer) is left out.
+pub fn examples(inputs: &[Option<Input>], debug: &DebugInfo, table: &TyTable) -> Vec<Example> {
+    let per: Vec<Vec<Example>> = inputs
+        .par_iter()
+        .enumerate()
+        .map(|(i, x)| {
+            let Some(x) = x else { return Vec::new() };
+            let Some(d) = debug.funcs.get(&x.addr).filter(|d| usable(d, x, table)) else { return Vec::new() };
+            let fa = facts(x.f);
+            model_vars(x, &fa)
+                .into_iter()
+                .filter_map(|var| {
+                    let (value, ty, name) = match var {
+                        Var::Arg { j, value: Some(v) } => (v, d.params[j].1, Some(d.params[j].0.clone())),
+                        Var::Arg { value: None, .. } => return None,
+                        Var::Ret { value } => (value, d.ret?, None),
+                    };
+                    Some(Example { func: i, var, value, label: c_label(table, ty)?, name })
+                })
+                .collect()
+        })
+        .collect();
+    per.into_iter().flatten().collect()
+}
+
+/// A type as `parse_label` spells it: `unsigned int`, `char *`, `struct *` for a
+/// pointer to a struct. `None` for what has no such spelling.
+pub fn c_label(table: &TyTable, t: TyId) -> Option<String> {
+    Some(match table.tys[t] {
+        Ty::Int { bits, signed } => {
+            let base = match bits {
+                8 => "char",
+                16 => "short",
+                32 => "int",
+                64 => "long",
+                _ => return None,
+            };
+            if signed { base.to_string() } else { format!("unsigned {base}") }
+        }
+        Ty::Bool => "_Bool".to_string(),
+        Ty::F32 => "float".to_string(),
+        Ty::F64 => "double".to_string(),
+        Ty::RawPtr { pointee, .. } | Ty::Ref { pointee, .. } => {
+            let inner = match table.tys[pointee] {
+                Ty::Struct(_) | Ty::Array { .. } | Ty::Slice { .. } => "struct".to_string(),
+                Ty::Fn(_) => "void".to_string(),
+                Ty::Unknown { .. } => "void".to_string(),
+                _ => c_label(table, pointee).unwrap_or_else(|| "void".to_string()),
+            };
+            format!("{inner} *")
+        }
+        _ => return None,
+    })
+}
+
 /// What the model is asked about a function without a prototype: each argument,
 /// then the return value.
 fn model_vars(x: &Input, fa: &Facts) -> Vec<Var> {

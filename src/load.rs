@@ -36,6 +36,9 @@ pub struct DataSection<'a> {
     pub bytes: Option<Cow<'a, [u8]>>,
     /// Writable at run time (`.data`, `.bss`), so its static must be `static mut`.
     pub writable: bool,
+    /// Code (`.text`): only the data in it a label marks is a static, such as
+    /// a table after a function in hand-written assembly.
+    pub code: bool,
 }
 
 /// A data object symbol (`STT_OBJECT`): a named static, string or table.
@@ -63,6 +66,9 @@ pub struct Import {
     pub data: bool,
     pub addend: i64,
 }
+
+/// The largest thread-local block loaded; a bigger one is left out.
+const MAX_TLS: u64 = 1 << 28;
 
 pub struct Binary<'a> {
     file: object::File<'a>,
@@ -112,18 +118,28 @@ impl<'a> Binary<'a> {
             return Err(LoadError::Arch(file.architecture()));
         }
 
-        // Start address of every symbol, per section, for symbols without a size.
+        // Start address of every symbol, per section, for symbols without a
+        // size. An assembler's local labels (`.loop`, `foo.done`) are inside
+        // functions, not the starts of new ones.
         let mut starts: Vec<(usize, u64)> = file
             .symbols()
+            .filter(|s| s.kind() == SymbolKind::Text || !s.is_local())
             .filter_map(|s| Some((s.section_index()?.0, s.address())))
             .collect();
         starts.sort_unstable();
         starts.dedup();
+        // and of every symbol, labels included, for the extent of a label
+        let mut all_starts: Vec<(usize, u64)> = file.symbols().filter_map(|s| Some((s.section_index()?.0, s.address()))).collect();
+        all_starts.sort_unstable();
+        all_starts.dedup();
 
         let mut funcs = Vec::new();
         // The static symbol table first; a stripped binary still has its dynamic exports.
         for sym in file.symbols().chain(file.dynamic_symbols()) {
-            if sym.kind() != SymbolKind::Text || !sym.is_definition() {
+            // A global symbol without a type in code is a function too: hand-written
+            // assembly often doesn't say (`global f` without `:function`).
+            let untyped = sym.kind() == SymbolKind::Unknown && !sym.is_local();
+            if !(sym.kind() == SymbolKind::Text || untyped) || !sym.is_definition() {
                 continue;
             }
             let Some(idx) = sym.section_index() else { continue };
@@ -132,6 +148,9 @@ impl<'a> Binary<'a> {
                 continue;
             }
             let size = if sym.size() > 0 { sym.size() } else { size_to_next_symbol(&starts, sym.address(), &sec) };
+            if size == 0 {
+                continue;
+            }
             let Ok(Some(bytes)) = sec.data_range(sym.address(), size) else { continue };
             let name = sym.name().unwrap_or("").to_string();
             let name = if name.is_empty() { format!("sub_{:x}", sym.address()) } else { name };
@@ -145,7 +164,7 @@ impl<'a> Binary<'a> {
             for sec in file.sections() {
                 let writable = match sec.kind() {
                     SectionKind::Data | SectionKind::UninitializedData => true,
-                    SectionKind::ReadOnlyData | SectionKind::ReadOnlyDataWithRel | SectionKind::ReadOnlyString => false,
+                    SectionKind::ReadOnlyData | SectionKind::ReadOnlyDataWithRel | SectionKind::ReadOnlyString | SectionKind::Text => false,
                     _ => continue,
                 };
                 if sec.address() == 0 || sec.size() == 0 {
@@ -159,19 +178,23 @@ impl<'a> Binary<'a> {
                     },
                 };
                 let name = sec.name().unwrap_or("").to_string();
-                sections.push((sec.index().0, DataSection { name, addr: sec.address(), size: sec.size(), bytes, writable }));
+                let code = sec.kind() == SectionKind::Text;
+                sections.push((sec.index().0, DataSection { name, addr: sec.address(), size: sec.size(), bytes, writable, code }));
             }
             sections.sort_by_key(|(_, s)| s.addr);
         }
 
         let mut data_syms = Vec::new();
         for sym in file.symbols().chain(file.dynamic_symbols()) {
-            if sym.kind() != SymbolKind::Data || !sym.is_definition() {
-                continue;
-            }
             let Some(idx) = sym.section_index() else { continue };
             let Some(section) = sections.iter().position(|(i, _)| *i == idx.0) else { continue };
             let s = &sections[section].1;
+            // In code, a local label without a type: what an assembler makes of
+            // `table:` (or `.tab:`), which may be data, up to the next symbol.
+            let label = s.code && sym.kind() == SymbolKind::Unknown && sym.is_local();
+            if !(sym.kind() == SymbolKind::Data && !s.code || label) || !sym.is_definition() {
+                continue;
+            }
             let (addr, end) = (sym.address(), s.addr + s.size);
             if addr < s.addr || addr >= end {
                 continue;
@@ -180,7 +203,10 @@ impl<'a> Binary<'a> {
             if name.is_empty() {
                 continue;
             }
-            let size = sym.size().min(end - addr);
+            let size = match label {
+                true => all_starts.get(all_starts.partition_point(|&a| a <= (idx.0, addr))).filter(|a| a.0 == idx.0).map_or(end, |a| a.1) - addr,
+                false => sym.size().min(end - addr),
+            };
             data_syms.push(DataSym { name: name.to_string(), demangled: None, addr, size, section });
         }
         data_syms.sort_by(|a, b| a.addr.cmp(&b.addr).then(b.size.cmp(&a.size)));
@@ -192,10 +218,11 @@ impl<'a> Binary<'a> {
 
         let mut data: Vec<DataSection> = sections.into_iter().map(|(_, s)| s).collect();
         // The thread-local block goes above everything else, so it stays last.
-        if let Some(t) = tls(&file) {
+        // (a corrupt header can claim any size; real blocks are kilobytes)
+        if let Some(t) = tls(&file).filter(|t| t.size <= MAX_TLS && t.image.len() as u64 <= t.size) {
             let mut block = vec![0; t.size as usize];
             block[..t.image.len()].copy_from_slice(t.image);
-            data.push(DataSection { name: TLS_SECTION.into(), addr: t.addr, size: t.size, bytes: Some(Cow::Owned(block)), writable: true });
+            data.push(DataSection { name: TLS_SECTION.into(), addr: t.addr, size: t.size, bytes: Some(Cow::Owned(block)), writable: true, code: false });
         }
         let pointers = if data.is_empty() { BTreeMap::new() } else { pointers(&file, &data) };
         let copied = copied(&file);
@@ -226,6 +253,46 @@ impl<'a> Binary<'a> {
 
     pub fn entry(&self) -> u64 {
         self.file.entry()
+    }
+
+    /// Why the binary looks packed (its code compressed or encrypted, unpacked
+    /// at run time), if it does: a decompiler then sees only the unpacking
+    /// stub. `data` is the whole file.
+    pub fn packed(&self, data: &[u8]) -> Option<String> {
+        let names: Vec<&str> = self.file.sections().filter_map(|s| s.name().ok()).collect();
+        let upx_sections = names.iter().any(|n| n.starts_with("UPX") || *n == ".upx");
+        // UPX's header, near the start or after the stub, with no section table left
+        let upx_magic = data.windows(4).take(1024).any(|w| w == b"UPX!") || data.windows(4).any(|w| w == b"UPX!") && names.is_empty();
+        if upx_sections || upx_magic {
+            return Some("it is packed with UPX, so only the unpacking stub can be decompiled; unpack it with `upx -d` first".into());
+        }
+        // Executable segments that are mostly random-looking bytes.
+        use object::{ObjectSegment, SegmentFlags};
+        let exec = |f: SegmentFlags| match f {
+            SegmentFlags::Elf { p_flags, .. } => p_flags.0 & object::elf::PF_X.0 != 0,
+            SegmentFlags::MachO { initprot, .. } => initprot.0 & object::macho::VM_PROT_EXECUTE.0 != 0,
+            SegmentFlags::Coff { characteristics } => characteristics.0 & object::pe::IMAGE_SCN_MEM_EXECUTE.0 != 0,
+            _ => false,
+        };
+        let mut code: Vec<&[u8]> = self.file.segments().filter(|g| exec(g.flags())).filter_map(|g| g.data().ok()).collect();
+        if code.is_empty() {
+            code = self.file.sections().filter(|s| s.kind() == SectionKind::Text).filter_map(|s| s.data().ok()).collect();
+        }
+        let n: usize = code.iter().map(|c| c.len()).sum();
+        if n < 4096 {
+            return None;
+        }
+        let mut counts = [0u64; 256];
+        for c in &code {
+            for &b in c.iter() {
+                counts[b as usize] += 1;
+            }
+        }
+        let bits: f64 = counts.iter().filter(|&&c| c > 0).map(|&c| c as f64 / n as f64).map(|p| -p * p.log2()).sum();
+        // Machine code is about 5.5 to 6.5 bits a byte; compressed data close to 8.
+        (bits > 7.4).then(|| format!(
+            "its code looks compressed or encrypted ({bits:.1} bits of entropy a byte), as a packer leaves it; unpack it first, or decompile a memory dump taken after it unpacks"
+        ))
     }
 
     /// The function at `addr`, by exact start address.
@@ -345,11 +412,11 @@ fn pointers(file: &object::File, data: &[DataSection]) -> BTreeMap<u64, u64> {
 /// symbol in the same section, or to the end of the section. `starts` is every
 /// (section index, symbol address), sorted.
 fn size_to_next_symbol(starts: &[(usize, u64)], addr: u64, sec: &object::Section) -> u64 {
-    let end = sec.address() + sec.size();
+    let end = sec.address().saturating_add(sec.size());
     let key = (sec.index().0, addr);
     let i = starts.partition_point(|&s| s <= key);
     let next = starts.get(i).filter(|s| s.0 == key.0).map_or(end, |s| s.1);
-    next.min(end) - addr
+    next.min(end).saturating_sub(addr)
 }
 
 /// Demangle a Rust (legacy or v0) or Itanium C++ symbol, without the Rust hash
@@ -399,8 +466,11 @@ pub fn tls<'a>(file: &object::File<'a>) -> Option<Tls<'a>> {
     let is_tls = |k: SectionKind| matches!(k, SectionKind::Tls | SectionKind::UninitializedTls);
     let secs: Vec<_> = file.sections().filter(|s| is_tls(s.kind()) && s.size() != 0).collect();
     let start = secs.iter().map(|s| s.address()).min()?;
-    let end = secs.iter().map(|s| s.address() + s.size()).max()?;
+    let end = secs.iter().map(|s| s.address().saturating_add(s.size())).max()?;
     let align = secs.iter().map(|s| s.align()).max().unwrap_or(1).max(16);
+    if align > 1 << 16 || end < start {
+        return None; // a corrupt header
+    }
     // The initialized part: one `.tdata` at the start (what linkers produce).
     let image = match secs.iter().filter(|s| s.kind() == SectionKind::Tls).collect::<Vec<_>>()[..] {
         [] => &[][..],
@@ -409,10 +479,10 @@ pub fn tls<'a>(file: &object::File<'a>) -> Option<Tls<'a>> {
     };
     // The block's size rounded up to its alignment is how far below the thread
     // pointer it starts (glibc's `l_tls_offset` for the executable).
-    let offset = (end - start).next_multiple_of(align);
-    let top = file.sections().map(|s| s.address() + s.size()).max()?;
-    let addr = top.checked_add(0x1000)?.next_multiple_of(align.max(0x1000));
-    Some(Tls { addr, size: offset + 8, image, thread_pointer: addr + offset })
+    let offset = (end - start).checked_next_multiple_of(align)?;
+    let top = file.sections().map(|s| s.address().saturating_add(s.size())).max()?;
+    let addr = top.checked_add(0x1000)?.checked_next_multiple_of(align.max(0x1000))?;
+    Some(Tls { addr, size: offset.checked_add(8)?, image, thread_pointer: addr.checked_add(offset)? })
 }
 
 #[cfg(test)]

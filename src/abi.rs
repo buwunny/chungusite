@@ -90,6 +90,11 @@ pub struct Sig {
     pub preserves: u16,
     /// xmm register halves (bit = 2 * xmm + high) it leaves as it found them.
     pub xpreserves: u32,
+    /// At one call to a variadic function of the program: how many of the
+    /// last integer, float and stack arguments the call doesn't set up,
+    /// passed as nothing rather than whatever the registers or the stack
+    /// held (`site_sig`).
+    pub unset: (u8, u8, u8),
 }
 
 impl Sig {
@@ -188,6 +193,58 @@ pub fn guess_args(f: &Function, site: Site) -> u8 {
     n as u8
 }
 
+/// The argument registers a call to unknown code (`guess_args`) passes on
+/// unchanged from the function's own entry, as a bit per register: a wrapper
+/// like `malloc(n) { return hooks.malloc(n); }` sets nothing up, so
+/// `guess_args` gives it none. Whether these are arguments is up to the
+/// function's callers (`Program::build`).
+pub fn passed_through(f: &Function, site: Site) -> u8 {
+    let (_, args) = site.parts(f);
+    let args = args.get(&f.value_pool);
+    if args.len() != CALL_ARGS {
+        return 0;
+    }
+    let mut out = 0;
+    for (k, &a) in args[..6].iter().enumerate() {
+        if from_entry(f, a, CALL_REGS[k].number() as u8, &mut Vec::new()) {
+            out |= 1 << k;
+        }
+    }
+    out
+}
+
+/// Is `a` the entry's value of `reg` on every path (through block parameters
+/// of the same register; a loop's way back adds nothing)?
+fn from_entry(f: &Function, a: ValueId, reg: u8, seen: &mut Vec<ValueId>) -> bool {
+    let InstKind::BlockParam(r) = f.insts[a].kind else { return false };
+    if r != reg {
+        return false;
+    }
+    if f.blocks[f.entry].params.get(&f.value_pool).contains(&a) {
+        return true;
+    }
+    if seen.contains(&a) {
+        return true;
+    }
+    if seen.len() >= 16 {
+        return false;
+    }
+    seen.push(a);
+    let Some((b, k)) = f.blocks.iter().find_map(|(b, blk)| {
+        blk.params.get(&f.value_pool).iter().position(|&p| p == a).map(|k| (b, k))
+    }) else { return false };
+    let (mut paths, mut all) = (0, true);
+    for (p, blk) in f.blocks.iter() {
+        if blk.term.successors(&f.value_pool).any(|s| s == b) {
+            incoming(f, p, b, k, |v| {
+                paths += 1;
+                all = all && from_entry(f, v, reg, seen);
+            });
+        }
+    }
+    paths > 0 && all
+}
+
 /// Did the function set `a` up for a call in `block`, in register `reg`:
 /// computed there, computed before (in a block that dominates it), or moved
 /// there from another register, on every path, rather than left in `reg` by
@@ -196,8 +253,10 @@ pub fn guess_args(f: &Function, site: Site) -> u8 {
 /// on to `fprintf` in r8.
 fn set_for(f: &Function, block: BlockId, a: ValueId, reg: Option<u8>) -> bool {
     match f.insts[a].kind {
-        InstKind::BlockParam(_) if reg.is_some() => set_before(f, a, reg, &mut Vec::new()),
-        InstKind::Param(_) | InstKind::BlockParam(_) => f.blocks[block].insts.get(&f.value_pool).contains(&a),
+        // paths joining, each with what it set up (a float computed on one
+        // path, reloaded from the stack after a call on the other)
+        InstKind::BlockParam(_) => set_before(f, a, reg, &mut Vec::new()),
+        InstKind::Param(_) => f.blocks[block].insts.get(&f.value_pool).contains(&a),
         _ => set_before(f, a, reg, &mut Vec::new()),
     }
 }
@@ -230,7 +289,9 @@ fn set_before(f: &Function, a: ValueId, reg: Option<u8>, seen: &mut Vec<ValueId>
                     });
                 }
             }
-            paths > 0 && all
+            // a block nothing jumps to (padding after a jump, lifted as code)
+            // brings nothing
+            all && (paths > 0 || b != f.entry)
         }
         _ => true,
     }
@@ -283,6 +344,10 @@ pub fn guess_fargs(f: &Function, site: Site) -> u8 {
         Site::Tail(b) => Some(b),
     };
     let Some(block) = block else { return 0 };
+    // a variadic call says in al how many xmm registers it passes
+    if let Some(n) = al_constant(f, args[7]).filter(|&n| n <= FLOAT_ARGS as u64) {
+        return n as u8;
+    }
     let mut n = 0;
     for (j, &a) in args[CALL_XMM..].iter().step_by(2).take(FLOAT_ARGS).enumerate() {
         if set_for(f, block, a, None) {
@@ -290,6 +355,38 @@ pub fn guess_fargs(f: &Function, site: Site) -> u8 {
         }
     }
     n as u8
+}
+
+/// The call site whose xmm0 a call to unknown code passes on in xmm0, if
+/// any: `exp(luaL_checknumber(L, 1))` passes a float argument, if that
+/// callee returns one (`Program::build` decides).
+pub fn passes_xmm0(f: &Function, sites: &[Site], site: Site) -> Option<usize> {
+    let (_, args) = site.parts(f);
+    let args = args.get(&f.value_pool);
+    let &a = args.get(CALL_XMM)?;
+    let InstKind::CallOut { call, reg } = f.insts[a].kind else { return None };
+    (reg == XMM0).then(|| sites.iter().position(|&s| s == Site::Call(call))).flatten()
+}
+
+/// The low byte of `v` (rax at a call), if the function set it to a constant:
+/// `mov eax, 1`, `xor eax, eax`, or `mov al, 2` over whatever rax held.
+fn al_constant(f: &Function, v: ValueId) -> Option<u64> {
+    let k = |v: ValueId| match f.insts[v].kind {
+        InstKind::Const(c) => Some(f.consts[c.index()] as u64 & 0xff),
+        InstKind::Cast { v: x, .. } => match f.insts[x].kind {
+            InstKind::Const(c) => Some(f.consts[c.index()] as u64 & 0xff),
+            _ => None,
+        },
+        _ => None,
+    };
+    match f.insts[v].kind {
+        InstKind::Bin { op: BinOp::Or, lhs, rhs } => {
+            let masked = |x: ValueId| matches!(f.insts[x].kind, InstKind::Bin { op: BinOp::And, rhs: m, .. }
+                if matches!(f.insts[m].kind, InstKind::Const(c) if f.consts[c.index()] as u64 & 0xff == 0));
+            if masked(lhs) { k(rhs) } else if masked(rhs) { k(lhs) } else { None }
+        }
+        _ => k(v),
+    }
 }
 
 /// What `infer` found besides the signature: what each call site reads after
@@ -306,6 +403,9 @@ pub const READ_XMM0: u8 = 2;
 pub const READ_RAX: u8 = 4;
 /// Not a read: the function has callers in the program (so `READ_RAX` means something).
 pub const CALLED: u8 = 8;
+/// Not a read either: some caller tail-calls the function, passing on rax or
+/// xmm0, whichever it returns.
+pub const TAIL_CALLED: u8 = 16;
 
 /// The call sites that never return: the last call of a block the lifter ended
 /// with `Unreachable` (a call to `abort` or a panic function, or one before a trap).
@@ -443,7 +543,7 @@ fn stale_regs(f: &Function, cfg: &Cfg, sites: &[Site], callee: &dyn Fn(usize) ->
 /// Where a value comes from, as far as register summaries care.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Src {
-    /// Not computed yet.
+    /// Not computed yet, or in a block nothing reaches.
     Top,
     /// Register `r`'s value on entry.
     Entry(u8),
@@ -455,8 +555,9 @@ enum Src {
 fn sources(f: &Function, cfg: &Cfg, sites: &[Site]) -> Vec<Src> {
     let mut s = vec![Src::Top; f.insts.len()];
     let site_of = |call: ValueId| sites.iter().position(|&x| x == Site::Call(call));
-    for (_, blk) in f.blocks.iter() {
-        for &id in blk.insts.get(&f.value_pool) {
+    // (values in blocks nothing reaches stay `Top`: no path brings them)
+    for &b in &cfg.rpo {
+        for &id in f.blocks[b].insts.get(&f.value_pool) {
             s[id.index()] = match f.insts[id].kind {
                 InstKind::Call { .. } => site_of(id).map_or(Src::Other, |k| Src::After(k, RAX)),
                 InstKind::CallOut { call, reg } => site_of(call).map_or(Src::Other, |k| Src::After(k, reg)),
@@ -501,7 +602,14 @@ fn sources(f: &Function, cfg: &Cfg, sites: &[Site]) -> Vec<Src> {
 
 /// Is `v`, the value of register `reg` at an exit, `reg`'s entry value, possibly
 /// through calls that preserve it?
-fn traces_to_entry(f: &Function, src: &[Src], sites: &[Site], callee: &dyn Fn(usize) -> Sig, reg: u8, mut v: ValueId) -> bool {
+fn traces_to_entry(f: &Function, src: &[Src], sites: &[Site], callee: &dyn Fn(usize) -> Sig, reg: u8, v: ValueId) -> bool {
+    traces(f, src, sites, callee, reg, v, &mut Vec::new())
+}
+
+/// `traces_to_entry`, through paths that join with different sources (the
+/// entry value on one, a call that keeps it on another; a loop's way back
+/// adds nothing).
+fn traces(f: &Function, src: &[Src], sites: &[Site], callee: &dyn Fn(usize) -> Sig, reg: u8, mut v: ValueId, seen: &mut Vec<ValueId>) -> bool {
     for _ in 0..64 {
         match src[v.index()] {
             Src::Entry(r) => return r == reg,
@@ -509,6 +617,31 @@ fn traces_to_entry(f: &Function, src: &[Src], sites: &[Site], callee: &dyn Fn(us
                 Some(b) => v = b,
                 None => return false,
             },
+            Src::Other if matches!(f.insts[v].kind, InstKind::BlockParam(r) if r == reg) => {
+                if seen.contains(&v) {
+                    return true;
+                }
+                if seen.len() >= 32 {
+                    return false;
+                }
+                seen.push(v);
+                let Some((b, k)) = f.blocks.iter().find_map(|(b, blk)| {
+                    blk.params.get(&f.value_pool).iter().position(|&p| p == v).map(|k| (b, k))
+                }) else { return false };
+                let (mut paths, mut all) = (0, true);
+                for (p, blk) in f.blocks.iter() {
+                    if all && blk.term.successors(&f.value_pool).any(|s| s == b) {
+                        incoming(f, p, b, k, |a| {
+                            if src[a.index()] == Src::Top {
+                                return; // from a block nothing reaches
+                            }
+                            paths += 1;
+                            all = all && traces(f, src, sites, callee, reg, a, seen);
+                        });
+                    }
+                }
+                return paths > 0 && all;
+            }
             _ => return false,
         }
     }
@@ -558,6 +691,8 @@ pub fn infer(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, prev: 
     let src = sources(f, &cfg, sites);
 
     // ---- preserved registers ----
+    // (a function that never returns keeps every register, vacuously: the
+    // `.cold` part of a function that traps is a tail call it makes)
     let mut preserves = 0u16;
     for reg in 0..16u8 {
         if CALLER_SAVED & (1 << reg) == 0 {
@@ -567,7 +702,7 @@ pub fn infer(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, prev: 
             Exit::Tail(k) if !callee(*k).keeps(reg) => false,
             e => exit_value(f, sites, callee, e, reg).is_some_and(|v| traces_to_entry(f, &src, sites, callee, reg, v)),
         });
-        if ok && !ex.is_empty() && !stale[reg as usize] {
+        if ok && !stale[reg as usize] {
             preserves |= 1 << reg;
         }
     }
@@ -582,7 +717,7 @@ pub fn infer(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, prev: 
             Exit::Return { regs: Some(l), .. } if l.len as usize == EXIT_XMM0 => (0..sites.len()).all(|t| callee(t).keeps(reg)),
             e => exit_value(f, sites, callee, e, reg).is_some_and(|v| traces_to_entry(f, &src, sites, callee, reg, v)),
         });
-        if ok && !ex.is_empty() && !stale[reg as usize] {
+        if ok && !stale[reg as usize] {
             xpreserves |= 1 << k;
         }
     }
@@ -604,11 +739,14 @@ pub fn infer(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, prev: 
     let rax = !ex.is_empty()
         && ex.iter().all(|e| defined_at(&undef, RAX, e))
         && (!stale[RAX as usize] || wanted & CALLED == 0 || wanted & READ_RAX != 0);
-    let fret = !ex.is_empty() && ex.iter().all(|e| defined_at(&undef, XMM0, e)) && (wanted & READ_XMM0 != 0 || {
-        // No caller says. Each exit votes: a float, an integer, or nothing (xmm0
-        // is a constant, like the 0.0 of an empty sum).
+    // Callers reading only xmm0 say it's a float, only rax an integer.
+    let (read_x, read_r, tail) = (wanted & READ_XMM0 != 0, wanted & READ_RAX != 0, wanted & TAIL_CALLED != 0);
+    let fret = !ex.is_empty() && ex.iter().all(|e| defined_at(&undef, XMM0, e)) && (read_x && !read_r || (read_x || !read_r || tail) && {
+        // Otherwise (both, a tail call, no callers) each exit votes: a float,
+        // an integer, or nothing (xmm0 is a constant, like the 0.0 of an empty sum).
         let fl = floats(f, &cfg, sites, callee, prev.fargs);
-        let (stored, used) = (stored_values(f), used_values(f));
+        let spill = spills(f);
+        let (stored, used) = (stored_values(f, &spill), used_values(f, &spill));
         let votes: Vec<Option<bool>> = ex
             .iter()
             .map(|e| match *e {
@@ -626,7 +764,15 @@ pub fn infer(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, prev: 
                     // else the one written last, the float on a tie (two loop
                     // carried values)
                     let rax_too = !undef[r.index()];
-                    Some(float && (!rax_too || match (used[x.index()], used[r.index()]) {
+                    // rax a value (widened) the function also stores, like
+                    // `*ok = flag` leaving the flag in eax: a byproduct
+                    let (mut s, mut kept) = (r, false);
+                    while let InstKind::Cast { kind: CastKind::ZExt | CastKind::SExt | CastKind::Trunc, v } = f.insts[s].kind {
+                        s = v;
+                        kept |= stored[s.index()];
+                    }
+                    let used_r = used[r.index()] || kept;
+                    Some(float && (!rax_too || match (used[x.index()], used_r) {
                         (false, true) => true,
                         (true, false) => false,
                         _ => f.origin[x.index()] >= f.origin[r.index()],
@@ -670,17 +816,19 @@ pub fn infer(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, prev: 
         let undef = undefined_values(f, &cfg, sites, callee, args < 3, prev.fargs);
         ex.iter().all(|e| defined_at(&undef, RDX, e))
     };
-    Inferred { sig: Sig { args, fargs, stack_args: 0, ret, fret, ret2, variadic: false, preserves, xpreserves }, reads }
+    Inferred { sig: Sig { args, fargs, stack_args: 0, ret, fret, ret2, variadic: f.variadic, preserves, xpreserves, unset: (0, 0, 0) }, reads }
 }
 
-/// Values that an instruction other than a call or an `Exit`, or a branch,
-/// uses: what the function computes with, rather than passes along.
-fn used_values(f: &Function) -> Vec<bool> {
+/// Values that an instruction other than a call, an `Exit` or a spill to the
+/// frame, or a branch, uses: what the function computes with, rather than
+/// passes along.
+fn used_values(f: &Function, spill: &[bool]) -> Vec<bool> {
     let mut used = vec![false; f.insts.len()];
     for (_, blk) in f.blocks.iter() {
         for &id in blk.insts.get(&f.value_pool) {
             match f.insts[id].kind {
                 InstKind::Call { .. } | InstKind::Exit { .. } => {}
+                _ if spill[id.index()] => {}
                 k => for_each_operand(k, f, |v| used[v.index()] = true),
             }
         }
@@ -693,13 +841,31 @@ fn used_values(f: &Function) -> Vec<bool> {
     used
 }
 
-/// Values stored to memory.
-fn stored_values(f: &Function) -> Vec<bool> {
+/// Stores to the function's own frame, below the return address: values
+/// spilled around a call rather than handed to anyone.
+fn spills(f: &Function) -> Vec<bool> {
+    let mut spill = vec![false; f.insts.len()];
+    let entry = f.blocks[f.entry].params.get(&f.value_pool);
+    let Some(k) = entry.iter().position(|&p| matches!(f.insts[p].kind, InstKind::BlockParam(RSP))) else { return spill };
+    let a = analyze(f);
+    for (_, blk) in f.blocks.iter() {
+        for &id in blk.insts.get(&f.value_pool) {
+            if let InstKind::Store { ptr, .. } = f.insts[id].kind {
+                let o = a.origin[ptr.index()];
+                spill[id.index()] = o.roots == 1u128 << k && matches!(o.off, Off::Known(off) if off < 0);
+            }
+        }
+    }
+    spill
+}
+
+/// Values stored to memory, other than spills.
+fn stored_values(f: &Function, spill: &[bool]) -> Vec<bool> {
     let mut stored = vec![false; f.insts.len()];
     for (_, blk) in f.blocks.iter() {
         for &id in blk.insts.get(&f.value_pool) {
             if let InstKind::Store { val, .. } = f.insts[id].kind {
-                stored[val.index()] = true;
+                stored[val.index()] |= !spill[id.index()];
             }
         }
     }
@@ -866,11 +1032,11 @@ fn live_values(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, ret:
             return;
         }
         let c = k.map(callee).unwrap_or_default();
-        for &a in &args[..(c.args as usize).min(args.len()).min(6)] {
+        for &a in &args[..(c.args.saturating_sub(c.unset.0) as usize).min(args.len()).min(6)] {
             mark(a, live, work);
         }
         if args.len() == CALL_ARGS {
-            for &a in args[CALL_XMM..].iter().step_by(2).take(c.fargs as usize) {
+            for &a in args[CALL_XMM..].iter().step_by(2).take(c.fargs.saturating_sub(c.unset.1) as usize) {
                 mark(a, live, work);
             }
         }
@@ -964,6 +1130,28 @@ pub fn stack_args(f: &Function) -> u8 {
         }
     }
     ((end - 8 + 7) / 8) as u8
+}
+
+/// Does the function store the address of its stack arguments (entry rsp + 8
+/// or above) somewhere: a `va_list`'s `overflow_arg_area`, through which
+/// `va_arg` reads however many arguments the caller passed?
+pub fn stores_stack_area(f: &Function) -> bool {
+    let entry = f.blocks[f.entry].params.get(&f.value_pool);
+    let Some(k) = entry.iter().position(|&p| matches!(f.insts[p].kind, InstKind::BlockParam(RSP))) else { return false };
+    let a = analyze(f);
+    f.blocks.iter().any(|(_, blk)| {
+        blk.insts.get(&f.value_pool).iter().any(|&id| match f.insts[id].kind {
+            // into the function's own frame, where its `va_list` lives
+            InstKind::Store { ptr, val, .. } => {
+                let (o, p) = (a.origin[val.index()], a.origin[ptr.index()]);
+                o.roots == 1u128 << k
+                    && matches!(o.off, Off::Known(off) if off >= 8)
+                    && p.roots == 1u128 << k
+                    && matches!(p.off, Off::Known(off) if off < 0)
+            }
+            _ => false,
+        })
+    })
 }
 
 pub(crate) fn bytes(ty: TyId) -> usize {
@@ -1125,9 +1313,23 @@ pub fn apply(f: &mut Function, sig: Sig, sites: &[Site], shape: &dyn Fn(usize) -
         }
         let at = s.ip(f);
         let mut new: Vec<ValueId> = old[..(c.args as usize).min(6)].to_vec();
-        let floats: Vec<ValueId> = old[CALL_XMM..].iter().step_by(2).take((c.fargs as usize).min(FLOAT_ARGS)).copied().collect();
+        let mut floats: Vec<ValueId> = old[CALL_XMM..].iter().step_by(2).take((c.fargs as usize).min(FLOAT_ARGS)).copied().collect();
+        // what a call to a variadic function doesn't set up, it doesn't pass
+        let set = new.len().saturating_sub(c.unset.0 as usize);
+        for a in &mut new[set..] {
+            *a = undef(f, &mut undefs);
+        }
+        let set = floats.len().saturating_sub(c.unset.1 as usize);
+        for a in &mut floats[set..] {
+            *a = undef(f, &mut undefs);
+        }
         let mut loads = Vec::new();
+        let set = c.stack_args.saturating_sub(c.unset.2) as i32;
         for j in 0..c.stack_args as i32 {
+            if j >= set {
+                new.push(undef(f, &mut undefs));
+                continue;
+            }
             // at a call, [rsp] is the first stack argument; at a jmp, [rsp] is our
             // own return address and the arguments follow it
             let disp = 8 * j + if matches!(s, Site::Tail(_)) { 8 } else { 0 };

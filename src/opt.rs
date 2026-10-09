@@ -24,6 +24,7 @@ pub fn clean(f: &mut Function) -> CleanStats {
     let mut repl: Vec<Option<ValueId>> = vec![None; f.insts.len()];
     // Removing parameters never changes the edges, so the predecessors stay valid.
     let preds = preds(f);
+    fold_known_zero(f);
     loop {
         let t = remove_trivial_params(f, &mut repl, &preds);
         let (dp, di) = remove_dead(f, &repl, &preds);
@@ -36,6 +37,78 @@ pub fn clean(f: &mut Function) -> CleanStats {
     }
     rewrite_uses(f, &repl);
     stats
+}
+
+/// Integer operations whose result is known to be zero from which bits their
+/// operands can have, made constants: `test ah, 4` after `fnstsw ax` (which
+/// writes zero there) no longer reads the rest of rax, so the call before it
+/// isn't taken to return a value in rax. The same goes for any partial register
+/// write whose merged-in bits are masked off again.
+fn fold_known_zero(f: &mut Function) {
+    let mut memo: HashMap<ValueId, u64> = HashMap::new();
+    let mut zero = Vec::new();
+    for (_, blk) in f.blocks.iter() {
+        for &id in blk.insts.get(&f.value_pool) {
+            let k = f.insts[id].kind;
+            let foldable = matches!(k, InstKind::Bin { op: BinOp::And | BinOp::Or | BinOp::LShr | BinOp::Shl, .. })
+                || matches!(k, InstKind::Cast { kind: CastKind::Trunc | CastKind::ZExt, .. });
+            // (only where that drops an operand that isn't a constant itself)
+            let mut vars = false;
+            for_each_operand(k, f, |v| vars |= !matches!(f.insts[v].kind, InstKind::Const(_)));
+            if foldable && vars && int_width(f.insts[id].ty).is_some() && known_zero(f, id, 8, &mut memo) == u64::MAX {
+                zero.push(id);
+            }
+        }
+    }
+    for id in zero {
+        let c = ConstId::new(f.consts.len());
+        f.consts.push(0);
+        f.insts[id].kind = InstKind::Const(c);
+    }
+}
+
+fn int_width(ty: TyId) -> Option<u32> {
+    match ty {
+        TyId::B1 => Some(8),
+        TyId::B2 => Some(16),
+        TyId::B4 => Some(32),
+        TyId::B8 => Some(64),
+        _ => None,
+    }
+}
+
+/// Bits of `v` (as a u64) known to be zero, looking `depth` instructions back.
+fn known_zero(f: &Function, v: ValueId, depth: u32, memo: &mut HashMap<ValueId, u64>) -> u64 {
+    let Some(w) = int_width(f.insts[v].ty) else { return 0 };
+    let above = if w == 64 { 0 } else { u64::MAX << w };
+    if depth == 0 {
+        return above;
+    }
+    if let Some(&z) = memo.get(&v) {
+        return z;
+    }
+    let mut kz = |x: ValueId| known_zero(f, x, depth - 1, memo);
+    let konst = |x: ValueId| match f.insts[x].kind {
+        InstKind::Const(c) => Some(f.consts[c.index()] as u64),
+        _ => None,
+    };
+    let z = match f.insts[v].kind {
+        InstKind::Const(c) => !(f.consts[c.index()] as u64),
+        InstKind::Cast { kind: CastKind::ZExt | CastKind::Trunc, v: x } => kz(x),
+        InstKind::Bin { op: BinOp::And, lhs, rhs } => kz(lhs) | kz(rhs),
+        InstKind::Bin { op: BinOp::Or, lhs, rhs } => kz(lhs) & kz(rhs),
+        InstKind::Bin { op: BinOp::LShr, lhs, rhs } => match konst(rhs) {
+            Some(s) if s < 64 => kz(lhs) >> s | !(u64::MAX >> s),
+            _ => 0,
+        },
+        InstKind::Bin { op: BinOp::Shl, lhs, rhs } => match konst(rhs) {
+            Some(s) if s < 64 => kz(lhs) << s | ((1u64 << s) - 1),
+            _ => 0,
+        },
+        _ => 0,
+    } | above;
+    memo.insert(v, z);
+    z
 }
 
 pub(crate) fn resolve(repl: &[Option<ValueId>], mut v: ValueId) -> ValueId {

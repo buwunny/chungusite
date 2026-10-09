@@ -136,6 +136,10 @@ pub struct Env<'a> {
     /// `global_end(base, at)`: the end of the `static` holding `base`, if
     /// another one starts at `at` (`Globals::end_expr`).
     pub global_end: &'a dyn Fn(u64, u64) -> Option<String>,
+    /// `global_before(addr)`: `addr` as an offset back from the `static` that
+    /// starts just after it (`Globals::before_expr`), for a base the code only
+    /// indexes from.
+    pub global_before: &'a dyn Fn(u64) -> Option<String>,
     /// Safe mode: the read-only `Bytes` static containing an address, which
     /// reads can index as a slice; `None` keeps reads through it raw.
     pub global_slice: &'a dyn Fn(u64) -> Option<String>,
@@ -189,6 +193,9 @@ struct Emitter<'a> {
     /// Rust expression for a constant address that points into the binary's data.
     global_of: &'a dyn Fn(u64) -> Option<String>,
     global_end: &'a dyn Fn(u64, u64) -> Option<String>,
+    global_before: &'a dyn Fn(u64) -> Option<String>,
+    /// Values used only as the base of an indexed address (`index_only`).
+    index_only: Vec<bool>,
     /// Where each value points (`sources.rs`), to count raw accesses by source.
     src: Vec<u8>,
     stats: EmitStats,
@@ -244,7 +251,7 @@ pub fn emit_function_with(
 ) -> EmitStats {
     let _ = name_of;
     let call = |_: Site| None;
-    let env = Env { sig: None, call: &call, demote: false, structure, global_of, global_end: &|_, _| None, global_slice: &|_| None, analysis: None, types: None, struct_args: false };
+    let env = Env { sig: None, call: &call, demote: false, structure, global_of, global_end: &|_, _| None, global_before: &|_| None, global_slice: &|_| None, analysis: None, types: None, struct_args: false };
     emit_function_in(f, name, mode, &env, out)
 }
 
@@ -332,6 +339,8 @@ pub fn emit_function_in(f: &Function, name: &str, mode: Mode, env: &Env, out: &m
         inline,
         global_of: env.global_of,
         global_end: env.global_end,
+        global_before: env.global_before,
+        index_only: index_only(f),
         src: crate::sources::sources(f),
         stats: EmitStats::default(),
         table,
@@ -780,6 +789,27 @@ fn inlined(f: &Function, cfg: &Cfg, hoisted: &[bool], skip: &[bool], safe: bool)
         }
     }
     inline
+}
+
+/// Values used, and only used, as the base of an address with a variable
+/// index (`ptr b + i*8`): the code reaches memory only at some offset from
+/// them, which says nothing about what `b` itself points into.
+fn index_only(f: &Function) -> Vec<bool> {
+    let n = f.insts.len();
+    let (mut uses, mut indexed) = (vec![0u32; n], vec![0u32; n]);
+    for (_, blk) in f.blocks.iter() {
+        for &id in blk.insts.get(&f.value_pool) {
+            let k = f.insts[id].kind;
+            for_each_operand(k, f, |v| uses[v.index()] += 1);
+            if let InstKind::PtrOffset { base, index: Some(i), .. } = k {
+                if i != base {
+                    indexed[base.index()] += 1;
+                }
+            }
+        }
+        term_uses(f, blk.term, |v| uses[v.index()] += 1);
+    }
+    (0..n).map(|k| uses[k] > 0 && uses[k] == indexed[k]).collect()
 }
 
 fn term_uses(f: &Function, t: Terminator, mut cb: impl FnMut(ValueId)) {
@@ -1620,7 +1650,7 @@ impl Emitter<'_> {
                 self.conv(&s, self.u64_ty, vt)
             }
             IntToPtr(v) => match f.insts[v].kind {
-                Const(c) => match (self.global_of)(f.consts[c.index()] as u64) {
+                Const(c) => match self.index_only[id.index()].then(|| (self.global_before)(f.consts[c.index()] as u64)).flatten().or_else(|| (self.global_of)(f.consts[c.index()] as u64)) {
                     Some(g) => self.conv(&g, self.u64_ty, vt),
                     None => self.val(v, vt),
                 },

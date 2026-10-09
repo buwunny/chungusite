@@ -11,9 +11,10 @@ use crate::ir::{BinOp, Function, InstKind, LaneOp, LaneUn, UnOp};
 /// The function the emitter calls for a two-operand lane op on `w`-byte lanes.
 pub fn name(op: LaneOp, w: u8) -> String {
     use LaneOp::*;
-    if let F80ToF64 | Fist = op {
+    if let F80ToF64 | Fist | FRem = op {
         return match op {
             F80ToF64 => "simd::x87::f64_from_f80".into(),
+            FRem => "simd::x87::fprem".into(),
             _ => format!("simd::x87::i{}_from_f64", 8 * w),
         };
     }
@@ -62,7 +63,7 @@ pub fn name(op: LaneOp, w: u8) -> String {
         FCmpGt => "cmpgt",
         FCmpGe => "cmpge",
         FCmpLtGt => "cmplg",
-        Cpuid | Xgetbv | F80ToF64 | Fist => unreachable!("handled above"),
+        Cpuid | Xgetbv | F80ToF64 | Fist | FRem => unreachable!("handled above"),
     };
     match float {
         true => format!("simd::f{}::{f}", 8 * w),
@@ -255,6 +256,8 @@ pub mod simd {
     /// x87 values, which the lifted code keeps as f64: conversions from and to
     /// the 80-bit format in memory, and `fist`'s rounding.
     pub mod x87 {
+        /// `fprem` run to completion: C's `fmod`.
+        pub fn fprem(x: u64, y: u64) -> u64 { (f64::from_bits(x) % f64::from_bits(y)).to_bits() }
         pub fn f64_from_f80(lo: u64, hi: u64) -> u64 {
             let sign = (hi >> 15 & 1) << 63;
             let e = hi & 0x7fff;

@@ -150,10 +150,32 @@ impl<'b, 'a> Globals<'b, 'a> {
             .then(|| format!("({} as u64).wrapping_sub({:#x})", self.addr_of(&item), item.start - at))
     }
 
+    /// `addr` as an offset back from the item that starts at most 16 bytes
+    /// after it, when `addr` is in the tail of another item (or in padding):
+    /// a loop over `a[1..]` may index from `&a[-1]`, which lands in whatever
+    /// precedes `a`. Only for a base the code indexes from, never accesses.
+    pub fn before_expr(&self, addr: u64) -> Option<String> {
+        let item = self.item_at(addr)?;
+        let end = item.start + item.len;
+        let padding = || {
+            let sec = &self.bin.data[item.section];
+            item.sym.is_none() && sec.bytes.as_deref().is_none_or(|b| b[(item.start - sec.addr) as usize..][..item.len as usize].iter().all(|&c| c == 0))
+        };
+        if end - addr > 16 || !(addr > item.start || padding()) {
+            return None;
+        }
+        let next = self.item_at(end).filter(|n| n.start == end && n.section == item.section)?;
+        Some(format!("({} as u64).wrapping_sub({:#x})", self.addr_of(&next), end - addr))
+    }
+
     /// The static holding `addr`, if safe code can read it as a slice: a
     /// read-only item emitted as `Bytes<N>` (no pointer slots in it).
     pub fn slice(&self, addr: u64) -> Option<String> {
         let item = self.item_at(addr)?;
+        // maybe an offset back from the next item instead (`before_expr`)
+        if self.before_expr(addr).is_some() {
+            return None;
+        }
         let sec = &self.bin.data[item.section];
         let words = !self.slots(&item).is_empty();
         (!sec.writable && !words).then(|| self.ident(&item))
@@ -231,7 +253,13 @@ impl<'b, 'a> Globals<'b, 'a> {
             for &id in blk.insts.get(&f.value_pool) {
                 let InstKind::IntToPtr(v) = f.insts[id].kind else { continue };
                 if let InstKind::Const(c) = f.insts[v].kind {
-                    out.extend(self.item_at(f.consts[c.index()] as u64));
+                    let addr = f.consts[c.index()] as u64;
+                    let Some(item) = self.item_at(addr) else { continue };
+                    // and the item after it, for `before_expr`
+                    if item.start + item.len - addr <= 16 {
+                        out.extend(self.item_at(item.start + item.len));
+                    }
+                    out.push(item);
                 }
             }
         }

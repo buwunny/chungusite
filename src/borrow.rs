@@ -825,7 +825,54 @@ fn is_index(roots: &[Root], o: &[Origin], result: ValueId, v: ValueId) -> bool {
 /// Each value's origin only grows (joined with what it was): `transfer` isn't
 /// monotone where a load needs a single root, and without the join a loop can
 /// shift an offset forever.
+///
+/// A merge (block parameter or `Select`) of a pointer to a root with a value
+/// that points to none of them, other than a constant such as null, may be a
+/// pointer the analysis doesn't track (loaded, or returned by a call): such a
+/// merge also gets `OTHER`, so it is never taken for that root alone. Which
+/// merges those are is known only once the origins settle, so then they are
+/// computed again.
 fn origins(f: &Function, cfg: &Cfg, roots: &[Root], starts: &HashMap<ValueId, u8>, callees: &Callees) -> Vec<Origin> {
+    let o = origins_with(f, cfg, roots, starts, callees, &[]);
+    let ptr = pointer_roots(roots);
+    let mut mixed = Vec::new();
+    for &b in &cfg.rpo {
+        let mut check = |id: ValueId, vals: &mut dyn FnMut(&mut dyn FnMut(ValueId))| {
+            let (mut pointer, mut untracked) = (false, false);
+            vals(&mut |a| {
+                pointer |= o[a.index()].roots & ptr != 0;
+                untracked |= o[a.index()].is_none() && !matches!(f.insts[a].kind, InstKind::Const(_) | InstKind::Undef);
+            });
+            if pointer && untracked {
+                mixed.push(id);
+            }
+        };
+        if b != f.entry {
+            for (k, &p) in f.blocks[b].params.get(&f.value_pool).iter().enumerate() {
+                check(p, &mut |cb| {
+                    for &pred in cfg.preds(b) {
+                        incoming(f, pred, b, k, &mut *cb);
+                    }
+                });
+            }
+        }
+        for &id in f.blocks[b].insts.get(&f.value_pool) {
+            if let InstKind::Select { t, f: e, .. } = f.insts[id].kind {
+                check(id, &mut |cb| {
+                    cb(t);
+                    cb(e);
+                });
+            }
+        }
+    }
+    if mixed.is_empty() {
+        return o;
+    }
+    origins_with(f, cfg, roots, starts, callees, &mixed)
+}
+
+fn origins_with(f: &Function, cfg: &Cfg, roots: &[Root], starts: &HashMap<ValueId, u8>, callees: &Callees, mixed: &[ValueId]) -> Vec<Origin> {
+    let other = |id: ValueId| if mixed.contains(&id) { Origin::root(OTHER) } else { Origin::NONE };
     let mut o = vec![Origin::NONE; f.insts.len()];
     let mut mem: Mem = HashMap::new();
     let mut changed = true;
@@ -838,7 +885,7 @@ fn origins(f: &Function, cfg: &Cfg, roots: &[Root], starts: &HashMap<ValueId, u8
                 for &pred in cfg.preds(b) {
                     incoming(f, pred, b, k, |a| new = new.join(o[a.index()]));
                 }
-                let new = o[p.index()].join(new);
+                let new = o[p.index()].join(new).join(other(p));
                 if new != o[p.index()] {
                     o[p.index()] = new;
                     changed = true;
@@ -864,7 +911,7 @@ fn origins(f: &Function, cfg: &Cfg, roots: &[Root], starts: &HashMap<ValueId, u8
                     }
                     _ => {}
                 }
-                let new = o[id.index()].join(transfer(f, id, &o, starts, roots, &mem, callees));
+                let new = o[id.index()].join(transfer(f, id, &o, starts, roots, &mem, callees)).join(other(id));
                 if new != o[id.index()] {
                     o[id.index()] = new;
                     changed = true;

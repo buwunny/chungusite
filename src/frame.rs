@@ -396,8 +396,10 @@ pub fn promote(f: &mut Function, stack_args: u8) {
         if let Some(t) = neg_taken {
             lo = lo.min(t);
         }
+        // an escaping stack-argument address (a va_list's overflow area)
+        // reaches every stack argument above it
         if let Some(t) = pos_taken {
-            hi = hi.max(t + 8);
+            hi = hi.max(t + 8).max(8 + 8 * stack_args as i64);
         }
         (lo, hi.min(8 + 8 * 64))
     };

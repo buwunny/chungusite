@@ -810,6 +810,26 @@ impl Lifter {
                 self.write(f, Register::RDI, d2)?;
                 self.write(f, Register::RCX, zero)?;
             }
+            // The CPU's answer, read through `simd::cpu`: feature checks pick
+            // a code path on the machine the output runs on.
+            Mnemonic::Cpuid | Mnemonic::Xgetbv => {
+                let cpuid = i.mnemonic() == Mnemonic::Cpuid;
+                let c = self.read(f, Register::ECX)?;
+                let a = if cpuid { self.read(f, Register::EAX)? } else { c };
+                use Register::*;
+                let (op, outs) = match cpuid {
+                    true => (LaneOp::Cpuid, &[(0, EAX), (1, EBX), (2, ECX), (3, EDX)][..]),
+                    false => (LaneOp::Xgetbv, &[(0, EAX), (3, EDX)][..]),
+                };
+                // All outputs read the inputs before any is written.
+                let mut vals = [a; 4];
+                for (v, &(k, _)) in vals.iter_mut().zip(outs) {
+                    *v = self.emit(f, InstKind::Bin { op: BinOp::Lane(op, k), lhs: a, rhs: c }, TyId::B4);
+                }
+                for (&(_, r), v) in outs.iter().zip(vals) {
+                    self.write(f, r, v)?;
+                }
+            }
             Mnemonic::Bswap => {
                 let r = i.op0_register();
                 let v = self.read(f, r)?;
@@ -1990,7 +2010,7 @@ fn handled(i: &Instruction) -> bool {
                 m,
                 Nop | Endbr64 | Mov | Lea | Add | Sub | And | Or | Xor | Cmp | Test | Inc | Dec | Neg | Not | Shl | Shr
                     | Sar | Mul | Imul | Movzx | Movsx | Movsxd | Div | Idiv | Cqo | Cdq | Cdqe | Cwde | Push | Pop
-                    | Leave | Movsb | Movsw | Movsd | Movsq | Stosb | Stosw | Stosd | Stosq | Bswap | Tzcnt | Lzcnt | Popcnt | Bsf | Bsr
+                    | Leave | Movsb | Movsw | Movsd | Movsq | Stosb | Stosw | Stosd | Stosq | Bswap | Cpuid | Xgetbv | Tzcnt | Lzcnt | Popcnt | Bsf | Bsr
                     | Shld | Shrd | Rol | Ror | Adc | Sbb | Bt | Bts | Btr | Btc | Xchg | Xadd | Cmpxchg | Pause
             ) || cmov_or_setcc(m).is_some()
                 || sse::handled(m)

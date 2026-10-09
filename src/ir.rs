@@ -482,6 +482,10 @@ pub enum LaneOp {
     FCmpEq, FCmpLt, FCmpLe, FCmpUnord, FCmpNeq, FCmpNlt, FCmpNle, FCmpOrd,
     /// Ordered `>`, `>=` and "less or greater", for the flags of `ucomis*`.
     FCmpGt, FCmpGe, FCmpLtGt,
+    /// Not lanes: register `w` (0 to 3 for eax, ebx, ecx, edx) of `cpuid` with
+    /// the left operand in eax and the right in ecx, and of `xgetbv` with the
+    /// left operand in ecx. The CPU's answer, so nothing folds them.
+    Cpuid, Xgetbv,
 }
 
 impl LaneOp {

@@ -11,6 +11,10 @@ use crate::ir::{BinOp, Function, InstKind, LaneOp, LaneUn, UnOp};
 /// The function the emitter calls for a two-operand lane op on `w`-byte lanes.
 pub fn name(op: LaneOp, w: u8) -> String {
     use LaneOp::*;
+    if let Cpuid | Xgetbv = op {
+        let reg = ["eax", "ebx", "ecx", "edx"][w as usize & 3];
+        return format!("simd::cpu::{}_{reg}", if op == Cpuid { "cpuid" } else { "xgetbv" });
+    }
     let float = matches!(
         op,
         FAdd | FSub | FMul | FDiv | FMin | FMax | FCmpEq | FCmpLt | FCmpLe | FCmpUnord | FCmpNeq | FCmpNlt | FCmpNle
@@ -52,6 +56,7 @@ pub fn name(op: LaneOp, w: u8) -> String {
         FCmpGt => "cmpgt",
         FCmpGe => "cmpge",
         FCmpLtGt => "cmplg",
+        Cpuid | Xgetbv => unreachable!("handled above"),
     };
     match float {
         true => format!("simd::f{}::{f}", 8 * w),
@@ -236,6 +241,25 @@ pub mod simd {
         pub fn i64_from_f32(x: u64) -> u64 { to_int((f32::from_bits(x as u32) as f64).round_ties_even(), 64) }
         pub fn i32_from_f64(x: u64) -> u64 { to_int(f64::from_bits(x).round_ties_even(), 32) }
         pub fn i64_from_f64(x: u64) -> u64 { to_int(f64::from_bits(x).round_ties_even(), 64) }
+    }
+
+    /// `cpuid` and `xgetbv`, one output register each.
+    #[allow(unused_unsafe)]
+    pub mod cpu {
+        fn cpuid(a: u64, c: u64) -> core::arch::x86_64::CpuidResult {
+            unsafe { core::arch::x86_64::__cpuid_count(a as u32, c as u32) }
+        }
+        pub fn cpuid_eax(a: u64, c: u64) -> u64 { cpuid(a, c).eax as u64 }
+        pub fn cpuid_ebx(a: u64, c: u64) -> u64 { cpuid(a, c).ebx as u64 }
+        pub fn cpuid_ecx(a: u64, c: u64) -> u64 { cpuid(a, c).ecx as u64 }
+        pub fn cpuid_edx(a: u64, c: u64) -> u64 { cpuid(a, c).edx as u64 }
+        fn xgetbv(c: u64) -> (u32, u32) {
+            let (a, d): (u32, u32);
+            unsafe { core::arch::asm!("xgetbv", in("ecx") c as u32, out("eax") a, out("edx") d, options(nomem, nostack, preserves_flags)) };
+            (a, d)
+        }
+        pub fn xgetbv_eax(c: u64, _: u64) -> u64 { xgetbv(c).0 as u64 }
+        pub fn xgetbv_edx(c: u64, _: u64) -> u64 { xgetbv(c).1 as u64 }
     }
 }
 "#;

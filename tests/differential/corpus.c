@@ -26,6 +26,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <emmintrin.h>
+#include <cpuid.h>
 
 #define NOINLINE __attribute__((noinline))
 
@@ -705,6 +706,22 @@ void simd_saturate(uint8_t *p) {
     r = _mm_xor_si128(r, _mm_adds_epi16(a, c));
     r = _mm_or_si128(r, _mm_and_si128(_mm_avg_epu8(a, c), _mm_max_epi16(b, c)));
     _mm_storeu_si128((__m128i *)(p + 48), _mm_andnot_si128(_mm_cmpgt_epi8(a, b), r));
+}
+
+// Feature checks ask the CPU: cpuid's leaf 0 and 1 (the vendor, family and
+// feature bits, the same on every core) and xgetbv's enabled state.
+// @diff cpu_info: u64(u64:0..2)
+uint64_t cpu_info(uint64_t leaf) {
+    unsigned a, b, c, d;
+    __cpuid_count((unsigned)leaf, 0, a, b, c, d);
+    if (leaf == 1) b &= 0xffff;  // the APIC id differs between cores
+    uint64_t r = ((uint64_t)b << 32 | d) ^ ((uint64_t)a << 17) ^ c;
+    if (leaf == 1 && (c >> 27 & 1)) {  // OSXSAVE
+        unsigned lo, hi;
+        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        r += (uint64_t)hi << 32 | lo;
+    }
+    return r;
 }
 
 // Narrowing with saturation: packsswb, packuswb, packssdw.

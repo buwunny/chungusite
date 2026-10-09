@@ -1,0 +1,10 @@
+# Tested with torch 2.14, transformers 5.19, tokenizers 0.23, onnx 1.23,
+# onnxscript 0.7, onnxruntime 1.29. corpus.py needs only the standard library.
+# For a GPU, install torch from https://pytorch.org first for your CUDA or ROCm.
+torch>=2.4
+transformers>=4.44
+tokenizers>=0.19
+onnx>=1.16
+onnxscript
+onnxruntime>=1.24
+numpy

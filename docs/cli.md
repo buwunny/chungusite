@@ -31,6 +31,7 @@ Functions are lifted, cleaned and emitted in parallel with `rayon`, one `Lifter`
 | `ir` | cleaned SSA IR, which is what the emitter sees |
 | `raw-ir` | IR straight from the lifter, before `opt::clean` |
 | `borrows` | safe mode's verdict for each argument (`&T`, `Option<&mut T>`, raw and why; "may keep the pointers in it" when the function may hold on to a pointer loaded from it) and for the frame (each of its objects: `frame from N`), globals and allocations |
+| `dataset` | training data for the type and name models: one JSON line per argument and return value of each function with a DWARF prototype (`file`, `func`, `addr`, `var`, `value`, `label`, `name`, and `text`, the row `--refine` would show the model). Needs debug info, so not with `--no-dwarf`. [tools/train](../tools/train/README.md) builds a corpus from it |
 
 A summary goes to stderr: how many functions lifted, how many memory accesses are safe (a bounds-checked slice access or a struct field) versus raw (and what the raw ones go through: the frame, a global, an argument, or another pointer), how many functions have no raw pointer, how many arguments got a type, and the failures grouped by cause, most common first. That table is the to-do list for the lifter. The exit code is 0 if every selected function lifted, 1 if some did not, and 2 for usage or file errors.
 

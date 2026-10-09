@@ -708,7 +708,9 @@ impl Program {
             f.sites = abi::apply(ir, sigs[i], &f.sites, &|k| shapes[k]);
             // one `return` per path; the calls it copies are new sites
             let (made, copied) = split_returns(ir);
-            if made > 0 {
+            // one entry per loop, so the loop's own edges skip the `match bb`
+            let entries = crate::dispatch::single_entry(ir);
+            if made + entries > 0 {
                 clean(ir);
             }
             merge_straight(ir);

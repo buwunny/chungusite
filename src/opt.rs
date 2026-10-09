@@ -22,6 +22,7 @@ pub struct CleanStats {
 pub fn clean(f: &mut Function) -> CleanStats {
     let mut stats = CleanStats::default();
     let mut repl: Vec<Option<ValueId>> = vec![None; f.insts.len()];
+    cut_unreachable(f);
     // Removing parameters never changes the edges, so the predecessors stay valid.
     let preds = preds(f);
     fold_known_zero(f);
@@ -37,6 +38,29 @@ pub fn clean(f: &mut Function) -> CleanStats {
     }
     rewrite_uses(f, &repl);
     stats
+}
+
+/// Make every block the entry can't reach end in `Unreachable`. Its edges
+/// would otherwise count as predecessors, so the values it passes would keep
+/// parameters alive that are trivial on every edge that can run: a register
+/// that a loop never changes then stays a loop-carried variable, copied on
+/// every iteration (on zlib's `inflate`, most of its run time).
+fn cut_unreachable(f: &mut Function) {
+    let mut seen = vec![false; f.blocks.len()];
+    let mut work = vec![f.entry];
+    seen[f.entry.index()] = true;
+    while let Some(b) = work.pop() {
+        for s in f.blocks[b].term.successors(&f.value_pool) {
+            if !std::mem::replace(&mut seen[s.index()], true) {
+                work.push(s);
+            }
+        }
+    }
+    for (bi, &reached) in seen.iter().enumerate() {
+        if !reached {
+            f.blocks[BlockId::new(bi)].term = Terminator::Unreachable;
+        }
+    }
 }
 
 /// Integer operations whose result is known to be zero from which bits their
@@ -576,7 +600,7 @@ fn copy_block(f: &mut Function, b: BlockId, sites: &mut Vec<(Site, Site)>, map: 
 }
 /// Point every edge from `p` into `from` at `to` instead (a block with the same
 /// parameters).
-fn redirect(f: &mut Function, p: BlockId, from: BlockId, to: BlockId) {
+pub(crate) fn redirect(f: &mut Function, p: BlockId, from: BlockId, to: BlockId) {
     match &mut f.blocks[p].term {
         Terminator::Jump { to: t, .. } => {
             if *t == from {

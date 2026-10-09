@@ -4,6 +4,7 @@ pub mod borrow;
 pub mod cfg;
 pub mod check;
 pub mod discover;
+pub mod dispatch;
 pub mod dump;
 pub mod dwarf;
 pub mod emit;

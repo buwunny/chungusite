@@ -1156,3 +1156,15 @@ int64_t chain_build(int64_t n) {
     for (struct lnk *s = head; s; s = s->next) t = t * 7 + s->v;
     return t;
 }
+
+// A call whose result is passed on one edge of a branch only (to the join after
+// it) must still run on the other path: SQLite's `sqlite3_exec` lost a call so.
+NOINLINE int64_t tick(int64_t *p, int64_t a) { *p += a; return *p; }
+NOINLINE int64_t untick(int64_t *p, int64_t b) { p[1] ^= b; return p[1] * 5; }
+// @diff call_on_one_edge: i64(buf:16, i64, i64)
+int64_t call_on_one_edge(int64_t *p, int64_t a, int64_t b) {
+    int64_t r = tick(p, a), x;
+    if (b & 1) x = r; else x = untick(p, b);
+    p[1] += x; // (a store, so the join isn't copied into each path)
+    return x * 3 + p[0];
+}

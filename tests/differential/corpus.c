@@ -25,6 +25,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <math.h>
 #include <emmintrin.h>
 #include <cpuid.h>
 #include <immintrin.h>
@@ -962,4 +964,145 @@ void fmt_either(char *b, uint64_t x, uint64_t y) {
 void fmt_many(char *b, uint64_t x, uint64_t y, uint64_t z) {
     snprintf(b, 96, "%lu %lu %lu %lu %lu %lu", (unsigned long)x, (unsigned long)y, (unsigned long)z,
              (unsigned long)(x ^ y), (unsigned long)(y + z), (unsigned long)(z * 3));
+}
+
+/* ---- shapes found in zlib, Lua and SQLite ---- */
+
+// gcc divides with `xor edx, edx; idiv` when it knows the dividend is
+// non-negative, instead of `cdq; idiv`.
+// @diff div_nonneg: i32(u32, i32:1..1000)
+int32_t div_nonneg(uint32_t a, int32_t b) { return (int32_t)(a & 0x7fffffff) / b + (int32_t)(a >> 1 & 0xffff) % b; }
+
+// More than a page of locals: gcc's -fstack-clash-protection (Ubuntu's
+// default) probes the frame a page at a time in a loop.
+// @diff big_frame: u64(buf:64, u64:0..70000)
+uint64_t big_frame(const uint8_t *b, uint64_t n) {
+    volatile uint8_t tmp[70000];
+    for (uint64_t i = 0; i < 70000; i += 997) tmp[i] = b[i % 64];
+    tmp[n] = b[n % 64] ^ 0x5a;
+    uint64_t s = 0;
+    for (uint64_t i = 0; i < 70000; i += 997) s = s * 31 + tmp[i];
+    return s + tmp[n];
+}
+
+// Cases that call a function that doesn't return go to the function's
+// `.cold` part, outside the function: the jump table points there too.
+// @diff switch_cold: u64(u64:0..9)
+uint64_t switch_cold(uint64_t x) {
+    switch (x) {
+    case 0: return 11;
+    case 1: return x * 7 + 3;
+    case 2: return 42;
+    case 3: return x << 4;
+    case 4: return 99;
+    case 5: return x ^ 0x55;
+    case 6: return 1234;
+    case 7: return x + 1000;
+    case 8: return 8888;
+    case 9: abort();
+    case 10: abort();
+    default: abort();
+    }
+}
+
+// Computed goto through a table of labels, the index bounded by a mask
+// rather than a compare (`jmp [r13 + rax*8]`, as in interpreters).
+// @diff goto_table: u64(u64, u64)
+uint64_t goto_table(uint64_t op, uint64_t x) {
+    static void *const labels[] = { &&l_add, &&l_mul, &&l_xor, &&l_shl };
+    uint64_t n = 4;
+next:
+    if (n-- == 0) return x;
+    goto *labels[op & 3];
+l_add: x += 0x1234; op = op / 4 + x; goto next;
+l_mul: x *= 3; op = op / 4 + 1; goto next;
+l_xor: x ^= op; op >>= 2; goto next;
+l_shl: x = (x << 3) | (x >> 61); op = op / 4 + 2; goto next;
+}
+
+// fmod of doubles: gcc inlines it as an x87 `fprem` loop.
+// @diff fmod_ints: i64(i64:-100000..100000, i64:1..1000)
+int64_t fmod_ints(int64_t a, int64_t b) { return (int64_t)(fmod((double)a + 0.25, (double)b) * 1000.0); }
+
+// A float argument to a variadic call, and a float result from a library
+// call passed straight on to another.
+// @diff fmt_float: void(buf:64, i64, i64:1..1000)
+void fmt_float(char *b, int64_t x, int64_t y) { snprintf(b, 64, "%.3f %g", (double)x / (double)y, sqrt(fabs((double)x))); }
+
+// strtod returns a double in xmm0.
+// @diff parse_float: i64(i64:-100000..100000)
+int64_t parse_float(int64_t x) {
+    char b[32];
+    snprintf(b, sizeof b, "%ld.5", (long)x);
+    return (int64_t)(strtod(b, NULL) * 4.0);
+}
+
+// A call through a pointer passing the caller's own arguments on unchanged
+// (`malloc(n) { return hooks.malloc(n); }`).
+// @diff hook_impl: u64(u64, u64, u64)
+NOINLINE uint64_t hook_impl(uint64_t a, uint64_t b, uint64_t c) { return a * 3 + (b ^ c); }
+uint64_t (*volatile hook)(uint64_t, uint64_t, uint64_t) = hook_impl;
+// @diff call_hook: u64(u64, u64, u64)
+uint64_t call_hook(uint64_t a, uint64_t b, uint64_t c) { return hook(a, b, c); }
+
+// A variadic function of the program: it saves its argument registers for
+// `va_arg`, xmm ones only if the caller says (al) it passed floats.
+NOINLINE int64_t vsum(int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    int64_t s = 0;
+    for (int i = 0; i < n; i++) s = s * 7 + va_arg(ap, int64_t);
+    va_end(ap);
+    return s;
+}
+NOINLINE double vfsum(int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    double s = 0;
+    for (int i = 0; i < n; i++) s = s * 2 + va_arg(ap, double);
+    va_end(ap);
+    return s;
+}
+// @diff call_vsum: i64(i64, i64, i64)
+int64_t call_vsum(int64_t a, int64_t b, int64_t c) { return vsum(3, a, b, c) + (int64_t)vfsum(2, (double)(a & 0xffff), (double)(b & 0xff)); }
+
+// A recursive function returning what its recursive call returns.
+NOINLINE const char *skip_run(const char *s, char c) {
+    if (*s != c) return s;
+    return skip_run(s + 1, c);
+}
+// @diff run_len: u64(str:32)
+uint64_t run_len(const char *s) { return (uint64_t)(skip_run(s, s[0]) - s); }
+
+// A float result checked on the way out: the error path spills it to the
+// frame around a call, and the caller's x87 `fmod` (`fnstsw ax`) writes ax
+// after the call without reading the rest of rax.
+volatile int64_t num_errors;
+NOINLINE double num_of(int64_t x, int *ok) { *ok = x % 5 != 0; return (double)x * 0.5; }
+NOINLINE void num_error(int64_t x) { num_errors += x; }
+NOINLINE double check_num(int64_t x) {
+    int ok;
+    double d = num_of(x, &ok);
+    if (!ok) num_error(x);
+    return d;
+}
+// @diff fmod_checked: i64(i64:-100000..100000, i64:1..1000)
+int64_t fmod_checked(int64_t a, int64_t b) { return (int64_t)(fmod(check_num(a), check_num(b)) * 1000.0); }
+
+// An interpreter loop: the label table stays in a callee-saved register
+// across calls, and one path returns from the middle of the function.
+NOINLINE uint64_t op_step(uint64_t x) { return x * 31 + 7; }
+// @diff goto_calls: u64(u64, u64)
+uint64_t goto_calls(uint64_t code, uint64_t x) {
+    static void *const ops[] = { &&o_call, &&o_add, &&o_ret, &&o_rot };
+    for (int i = 0; i < 64; i++) {
+        uint64_t op = code & 3;
+        code = code >> 2 | code << 62;
+        goto *ops[op];
+    o_call: x = op_step(x); continue;
+    o_add: x += code; continue;
+    o_ret: if (x & 1) return x ^ code; continue;
+    o_rot: x = op_step(x >> 3); continue;
+    }
+    return x;
 }

@@ -63,7 +63,7 @@ fn stripped_binaries_have_the_same_functions() {
         for (tag, flags) in variants {
             let full = dir.join(format!("{cc}-{tag}"));
             let stripped = dir.join(format!("{cc}-{tag}-stripped"));
-            let out = Command::new(cc).args(flags).arg("-o").arg(&full).arg(&corpus).arg(&main_c).output().unwrap();
+            let out = Command::new(cc).args(flags).arg("-o").arg(&full).arg(&corpus).arg(&main_c).arg("-lm").output().unwrap();
             assert!(out.status.success(), "{cc} {flags:?}: {}", String::from_utf8_lossy(&out.stderr));
             let out = Command::new("strip").arg("-o").arg(&stripped).arg(&full).output().unwrap();
             assert!(out.status.success(), "strip: {}", String::from_utf8_lossy(&out.stderr));

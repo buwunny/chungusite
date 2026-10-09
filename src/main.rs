@@ -258,6 +258,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     let global_of = |addr: u64| globals.as_ref().and_then(|g| g.expr(addr));
     let global_slice = |addr: u64| globals.as_ref().and_then(|g| g.slice(addr));
     let global_end = |base: u64, at: u64| globals.as_ref().and_then(|g| g.end_expr(base, at));
+    let global_before = |addr: u64| globals.as_ref().and_then(|g| g.before_expr(addr));
     // Function pointers in data, other than GOT slots (calls through those are
     // direct calls; `program.rs` sees which ones are loaded for other uses).
     let mut address_taken: Vec<u64> = bin.map_or(Vec::new(), |b| {
@@ -270,7 +271,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     if let Some(k) = main_at {
         address_taken.push(funcs[k].addr);
     }
-    let opts = Options { global_of: &global_of, global_end: &global_end, global_slice: &global_slice, fast: &[], address_taken: &address_taken };
+    let opts = Options { global_of: &global_of, global_end: &global_end, global_before: &global_before, global_slice: &global_slice, fast: &[], address_taken: &address_taken };
     let mut emitted = if rust { program.emit_all_with(mode, &opts) } else { Vec::new() };
     let analyses = if cli.emit == Emit::Borrows { program.analyses(&opts) } else { Vec::new() };
 

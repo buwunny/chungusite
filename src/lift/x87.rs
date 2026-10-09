@@ -28,7 +28,7 @@ pub(super) fn handled(m: Mnemonic) -> bool {
         m,
         Fld | Fild | Fld1 | Fldz | Fst | Fstp | Fist | Fistp | Fisttp | Fxch | Fadd | Faddp | Fiadd | Fsub | Fsubp
             | Fisub | Fsubr | Fsubrp | Fisubr | Fmul | Fmulp | Fimul | Fdiv | Fdivp | Fidiv | Fdivr | Fdivrp | Fidivr
-            | Fchs | Fabs | Fcomi | Fcomip | Fucomi | Fucomip | Fnstcw | Fldcw
+            | Fchs | Fabs | Fcomi | Fcomip | Fucomi | Fucomip | Fnstcw | Fldcw | Fprem | Fnstsw
     )
 }
 
@@ -257,6 +257,21 @@ impl Lifter {
                 if matches!(m, Fcomip | Fucomip) {
                     self.fpop()?;
                 }
+            }
+            // The partial remainder, computed whole: C's `fmod`. Compilers loop
+            // `fprem; fnstsw ax; test ah, 4; jnz` until C2 says it is complete,
+            // which with `fnstsw` reading 0 it is the first time.
+            Fprem => {
+                let (a, b) = (self.st(f, 0)?, self.st(f, 1)?);
+                let v = self.fop(f, LaneOp::FRem, a, b);
+                self.set_st(0, v)?;
+            }
+            // The status word: only C2 of `fprem` is modelled (clear, reduction
+            // complete). Comparisons that set C0 and C3 for `fnstsw` (`fcom`,
+            // `fucom`) aren't lifted, so nothing reads those bits here.
+            Fnstsw if i.op0_kind() == OpKind::Register && i.op0_register() == Register::AX => {
+                let z = self.konst(f, 0, TyId::B2);
+                self.write(f, Register::AX, z)?;
             }
             Fnstcw => {
                 let cw = self.read_full(f, FPUCW);

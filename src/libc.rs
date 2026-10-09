@@ -3,8 +3,8 @@
 //! (`abi::guess_args`), which misses arguments the caller passes through unchanged
 //! (`free(p)` at the start of a function that took `p`).
 //!
-//! Only the integer/pointer shape matters here: how many argument registers, and
-//! whether rax holds a result.
+//! Mostly the integer/pointer shape: how many argument registers, and whether
+//! rax holds a result; and for the math functions, the doubles in xmm registers.
 use crate::abi::Sig;
 
 /// (name, register arguments, returns a value, variadic)
@@ -107,9 +107,33 @@ const TABLE: &[(&str, u8, bool, bool)] = &[
 ];
 
 /// The signature of a C library function, if the table knows it.
+/// Functions taking or returning `double`s: (name, integer arguments, double
+/// arguments, returns a double). Integer arguments come first in the C
+/// prototype too, except that `ldexp`/`frexp`/`modf` take theirs after, which
+/// the registers don't care about. `float` versions are left out: a float in
+/// an xmm register isn't the same bits as the double the output would pass.
+const FLOATS: &[(&str, u8, u8, bool)] = &[
+    ("sin", 0, 1, true), ("cos", 0, 1, true), ("tan", 0, 1, true), ("asin", 0, 1, true),
+    ("acos", 0, 1, true), ("atan", 0, 1, true), ("atan2", 0, 2, true), ("sinh", 0, 1, true),
+    ("cosh", 0, 1, true), ("tanh", 0, 1, true), ("exp", 0, 1, true), ("exp2", 0, 1, true),
+    ("expm1", 0, 1, true), ("log", 0, 1, true), ("log2", 0, 1, true), ("log10", 0, 1, true),
+    ("log1p", 0, 1, true), ("pow", 0, 2, true), ("sqrt", 0, 1, true), ("cbrt", 0, 1, true),
+    ("hypot", 0, 2, true), ("fmod", 0, 2, true), ("remainder", 0, 2, true), ("floor", 0, 1, true),
+    ("ceil", 0, 1, true), ("round", 0, 1, true), ("trunc", 0, 1, true), ("rint", 0, 1, true),
+    ("nearbyint", 0, 1, true), ("fabs", 0, 1, true), ("copysign", 0, 2, true), ("fmin", 0, 2, true),
+    ("fmax", 0, 2, true), ("fdim", 0, 2, true), ("fma", 0, 3, true), ("erf", 0, 1, true),
+    ("erfc", 0, 1, true), ("tgamma", 0, 1, true), ("lgamma", 0, 1, true), ("nextafter", 0, 2, true),
+    ("ldexp", 1, 1, true), ("scalbn", 1, 1, true), ("frexp", 1, 1, true), ("modf", 1, 1, true),
+    ("lround", 0, 1, false), ("llround", 0, 1, false), ("lrint", 0, 1, false), ("llrint", 0, 1, false),
+    ("strtod", 2, 0, true), ("atof", 1, 0, true), ("__strtod_internal", 3, 0, true),
+];
+
 pub fn lookup(name: &str) -> Option<Sig> {
     // versioned names from some symbol tables: memcpy@GLIBC_2.14
     let name = name.split('@').next().unwrap_or(name);
+    if let Some(&(_, args, fargs, fret)) = FLOATS.iter().find(|e| e.0 == name) {
+        return Some(Sig { args, fargs, ret: true, fret, ..Default::default() });
+    }
     TABLE
         .iter()
         .find(|e| e.0 == name)

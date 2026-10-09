@@ -269,6 +269,8 @@ pub struct Function {
     /// Calls that never return, each with the block that starts right after it
     /// (where the call would have fallen through), for `abi::infer`.
     pub noreturn_falls: Vec<(ValueId, BlockId)>,
+    /// Saves its argument registers for `va_arg` (`Lifter::spill_skip`).
+    pub variadic: bool,
 }
 
 impl Function {
@@ -287,6 +289,7 @@ impl Function {
             consts: Vec::with_capacity(insts / 4),
             origin: Vec::with_capacity(insts),
             noreturn_falls: Vec::new(),
+            variadic: false,
         }
     }
 
@@ -300,6 +303,7 @@ impl Function {
         self.consts.clear();
         self.origin.clear();
         self.noreturn_falls.clear();
+        self.variadic = false;
     }
 }
 
@@ -489,15 +493,17 @@ pub enum LaneOp {
     /// Not lanes either: x87. An 80-bit float (the left operand the significand,
     /// the right the sign and exponent) to an f64 bit pattern; and an f64 to a
     /// signed `w`-byte integer, rounded as the x87 control word in the right
-    /// operand says (`fist`), out of range giving the minimum.
-    F80ToF64, Fist,
+    /// operand says (`fist`), out of range giving the minimum. `FRem` is
+    /// `fprem`'s remainder, C's `fmod`: the left operand minus the right times
+    /// their quotient rounded toward zero.
+    F80ToF64, Fist, FRem,
 }
 
 impl LaneOp {
     /// Arithmetic on float lanes (compares give masks, not floats).
     pub fn makes_float(self) -> bool {
         use LaneOp::*;
-        matches!(self, FAdd | FSub | FMul | FDiv | FMin | FMax | F80ToF64)
+        matches!(self, FAdd | FSub | FMul | FDiv | FMin | FMax | F80ToF64 | FRem)
     }
 }
 

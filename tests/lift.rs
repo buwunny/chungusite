@@ -73,27 +73,29 @@ fn call_passes_registers_and_leaves_placeholders_for_the_rest() {
         a.ret().unwrap();
     });
     // The call lists rdi (= rsi), rsi, rdx, rcx, r8, r9, rsp, rax, r10, r11, then
-    // the xmm halves (undef: the function never touches an xmm register); every
-    // caller-saved register afterwards is a `callout` that `abi::apply` resolves
-    // once the callee's signature is known.
-    let xmm = ["v11"; 32].join(", ");
+    // the xmm halves: the function never touches an xmm register, but a call
+    // may take floats it was passed, so they are the entry's (v11..v42); every
+    // caller-saved register afterwards, xmm halves too, is a `callout` that
+    // `abi::apply` resolves once the callee's signature is known.
+    let params: Vec<String> = (11..43).map(|k| format!("v{k}")).collect();
+    let xmm = params.join(", ");
+    let outs: String = (0..32).map(|k| format!("  v{} = callout v43 r{}\n", 52 + k, 192 + k)).collect();
     let expected = format!("\
-bb0(v8, v4, v3, v7, v0, v5, v6, v9, v10):
+bb0(v8, v4, v3, v7, v0, v5, v6, v9, v10, {xmm}):
   v1 = const 0x2000
   v2 = inttoptr v1
-  v11 = undef
-  v12 = call v2(v0, v0, v3, v4, v5, v6, v7, v8, v9, v10, {xmm})
-  v13 = callout v12 r1
-  v14 = callout v12 r2
-  v15 = callout v12 r6
-  v16 = callout v12 r7
-  v17 = callout v12 r8
-  v18 = callout v12 r9
-  v19 = callout v12 r10
-  v20 = callout v12 r11
-  v21 = Add v12, v14
-  v22 = Add v21, v13
-  ret v22
+  v43 = call v2(v0, v0, v3, v4, v5, v6, v7, v8, v9, v10, {xmm})
+  v44 = callout v43 r1
+  v45 = callout v43 r2
+  v46 = callout v43 r6
+  v47 = callout v43 r7
+  v48 = callout v43 r8
+  v49 = callout v43 r9
+  v50 = callout v43 r10
+  v51 = callout v43 r11
+{outs}  v84 = Add v43, v45
+  v85 = Add v84, v44
+  ret v85
 ");
     assert_eq!(out, expected);
 }

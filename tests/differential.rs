@@ -195,7 +195,8 @@ fn decompile(file: &[u8], cases: &[Case], dwarf: bool) -> (Vec<Decompiled>, [Str
     let global_of = |addr: u64| globals.expr(addr);
     let global_end = |base: u64, at: u64| globals.end_expr(base, at);
     let program = Program::build_with(inputs, Some(file), false, BuildOptions { dwarf, model: None });
-    let opts = Options { global_of: &global_of, global_end: &global_end, ..Options::default() };
+    let global_before = |addr: u64| globals.before_expr(addr);
+    let opts = Options { global_of: &global_of, global_end: &global_end, global_before: &global_before, ..Options::default() };
     let [fast, safe] = [Mode::Fast, Mode::Safe].map(|m| program.emit_all_with(m, &opts));
     let decompiled = cases
         .iter()
@@ -675,7 +676,7 @@ fn check_variant(v: &Variant, cases: &[Case], corpus: &Path, root: &Path) -> Vec
     // relocations applied, and .rodata (lookup and jump tables) at real addresses.
     // The runner links the object itself, which is the same code.
     let linked = dir.join("corpus.elf");
-    let out = Command::new(&v.cc).arg("-nostartfiles").arg("-o").arg(&linked).arg(&obj).output().unwrap();
+    let out = Command::new(&v.cc).arg("-nostartfiles").arg("-o").arg(&linked).arg(&obj).arg("-lm").output().unwrap();
     assert!(out.status.success(), "{} failed to link corpus.o:\n{}", v.cc, String::from_utf8_lossy(&out.stderr));
     let (decompiled, prelude) = decompile(&std::fs::read(&linked).unwrap(), cases, v.dwarf);
     let lifted: Vec<&Decompiled> = decompiled.iter().filter(|d| d.result.is_ok()).collect();

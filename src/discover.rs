@@ -105,8 +105,12 @@ pub fn functions(file: &object::File, known: &[(u64, u64)], pointers: &BTreeMap<
     // Grow to a fixpoint: walk every function, add what it calls or points to,
     // then look for code in what is still uncovered.
     let mut walked: BTreeMap<u64, Walk> = BTreeMap::new();
+    // Labels of computed `goto`s first taken for functions.
+    let mut labels: BTreeSet<u64> = BTreeSet::new();
+    let seeds = starts.clone();
     loop {
         let mut new = Vec::new();
+        let mut later = Vec::new();
         let list: Vec<u64> = starts.iter().copied().collect();
         for (k, &a) in list.iter().enumerate() {
             let c = &code[in_code(a).expect("starts are in code")];
@@ -124,10 +128,36 @@ pub fn functions(file: &object::File, known: &[(u64, u64)], pointers: &BTreeMap<
                 }
             };
             for &t in &w.refs {
-                if !starts.contains(&t) && in_code(t).is_some() && !interior(t) && !(t > a && t < w.end) {
-                    new.push(t);
+                if !starts.contains(&t) && !labels.contains(&t) && in_code(t).is_some() && !interior(t) && !(t > a && t < w.end) {
+                    // Only jumped to: wait until everything called, pointed to
+                    // or found between functions is walked, so a jump out of a computed `goto`'s label
+                    // back into its function doesn't split it first.
+                    let jumped = w.jumps.iter().filter(|&&j| j == t).count();
+                    if jumped == w.refs.iter().filter(|&&r| r == t).count() {
+                        later.push(t);
+                    } else {
+                        new.push(t);
+                    }
                 }
             }
+        }
+        // A function's computed `goto` table holds labels, not functions, when
+        // nothing known to start a function lies between it and them and the
+        // code at one of them jumps back into it. Start over without them.
+        let mut more = Vec::new();
+        for (&a, w) in starts.iter().map(|a| (a, &walked[a])) {
+            let (Some(&first), Some(&last)) = (w.labels.iter().min(), w.labels.iter().max()) else { continue };
+            let fresh = w.labels.iter().any(|l| !labels.contains(l));
+            let clear = exact.range(a + 1..=last).next().is_none() && in_code(first) == in_code(a) && in_code(last) == in_code(a);
+            let back = w.labels.iter().any(|l| starts.contains(l) && walked.get(l).is_some_and(|lw| lw.jumps.iter().any(|&t| t >= a && t < *l)));
+            if fresh && clear && back {
+                more.extend(w.labels.iter().copied());
+            }
+        }
+        if !more.is_empty() {
+            labels.extend(more);
+            starts = seeds.iter().copied().filter(|a| !labels.contains(a)).collect();
+            continue;
         }
         if new.is_empty() {
             // Functions found not to return end their callers' paths: walk
@@ -147,7 +177,7 @@ pub fn functions(file: &object::File, known: &[(u64, u64)], pointers: &BTreeMap<
                 for &(s, e) in covered[..i].iter().filter(|r| r.1 > c.addr).chain(std::iter::once(&(end, end))) {
                     if s > at {
                         if let Some(p) = code_after_padding(&c.bytes[(at - c.addr) as usize..(s - c.addr) as usize], at) {
-                            if !interior(p) {
+                            if !interior(p) && !labels.contains(&p) {
                                 new.push(p);
                             }
                         }
@@ -155,6 +185,9 @@ pub fn functions(file: &object::File, known: &[(u64, u64)], pointers: &BTreeMap<
                     at = at.max(e);
                 }
             }
+        }
+        if new.is_empty() {
+            new = later;
         }
         if new.is_empty() {
             break;
@@ -207,6 +240,10 @@ struct Walk {
     returns: bool,
     /// The memory operands of `call [rip+slot]` and `jmp [rip+slot]` (GOT slots).
     slots: Vec<u64>,
+    /// Entries of the tables a computed `goto` jumps through (`label_table`).
+    labels: Vec<u64>,
+    /// Targets of jumps that leave `[start, limit)`.
+    jumps: Vec<u64>,
 }
 
 impl Walk {
@@ -233,6 +270,8 @@ fn walk(img: &Image, bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk 
     let mut leas = Vec::new();
     let mut returns = false;
     let mut slots = Vec::new();
+    let mut labels = Vec::new();
+    let mut jumps = Vec::new();
     let mut insn = Instruction::default();
     while let Some(at) = todo.pop() {
         let mut ip = at;
@@ -310,7 +349,19 @@ fn walk(img: &Image, bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk 
                     }
                 }
                 FlowControl::IndirectBranch => {
-                    let cases = jump_table(&insn, img, &leas, start, limit, cases);
+                    let mut cases = jump_table(&insn, img, &leas, start, limit, cases);
+                    // A computed `goto` (`&&label` in GNU C): a jump through a
+                    // register loaded from a table of code addresses after the
+                    // function's start. Those inside the range are walked; the
+                    // caller decides whether the rest are labels or functions.
+                    let through_reg = insn.op0_kind() == OpKind::Register
+                        || insn.op0_kind() == OpKind::Memory && !matches!(insn.memory_base(), Register::None | Register::RIP);
+                    if cases.is_empty() && through_reg {
+                        if let Some(t) = label_table(img, &leas, start) {
+                            cases = t.iter().copied().filter(|&l| l < limit).collect();
+                            labels.extend(t);
+                        }
+                    }
                     slots.extend(slot);
                     // Without a table, a tail call through a register or the GOT.
                     returns |= cases.is_empty() && !slot.is_some_and(|s| img.slot_noreturn(s));
@@ -326,6 +377,7 @@ fn walk(img: &Image, bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk 
                         todo.push(t);
                     } else {
                         refs.push(t); // tail call
+                        jumps.push(t);
                         returns |= !img.noreturn.contains(&t);
                     }
                     if insn.flow_control() == FlowControl::UnconditionalBranch {
@@ -360,7 +412,7 @@ fn walk(img: &Image, bytes: &[u8], start: u64, limit: u64, exact: bool) -> Walk 
     if exact {
         end = limit;
     }
-    Walk { limit, end, refs, rdi_code_ref: rdi, returns, slots }
+    Walk { limit, end, refs, rdi_code_ref: rdi, returns, slots, labels, jumps }
 }
 
 /// Where a call never returns, for the lifter: the PLT stubs and GOT slots of
@@ -441,6 +493,17 @@ fn jump_table(insn: &Instruction, img: &Image, leas: &[u64], start: u64, limit: 
         }
     }
     out
+}
+
+/// The table of code addresses a computed `goto` jumps through: the last base
+/// the function `lea`s that holds at least two 8-byte addresses after `start`
+/// (filled in by the loader in a PIE), read until an entry isn't one.
+fn label_table(img: &Image, leas: &[u64], start: u64) -> Option<Vec<u64>> {
+    let entry = |a: u64| img.slots.get(&a).copied().or_else(|| img.read(a, 8).map(|b| u64::from_le_bytes(b.try_into().unwrap())));
+    leas.iter().rev().find_map(|&table| {
+        let t: Vec<u64> = (0..1024).map(|k| entry(table + 8 * k)).map_while(|e| e.filter(|&e| e > start && img.read(e, 1).is_some())).collect();
+        (t.len() >= 2).then_some(t)
+    })
 }
 
 /// What `walk` needs from the rest of the binary.
@@ -560,6 +623,11 @@ pub fn got_names(file: &object::File) -> HashMap<u64, String> {
     for (at, r) in file.dynamic_relocations().into_iter().flatten() {
         let RelocationTarget::Symbol(i) = r.target() else { continue };
         let Some(sym) = dynsyms.as_ref().and_then(|t| t.symbol_by_index(i).ok()) else { continue };
+        // a weak symbol nothing defines (`__gmon_start__`) leaves its slot
+        // null; the code tests it before calling through it
+        if sym.is_weak() && sym.is_undefined() {
+            continue;
+        }
         if let Ok(n) = sym.name() {
             if !n.is_empty() {
                 got.insert(at, n.to_string());

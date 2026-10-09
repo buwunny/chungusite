@@ -450,7 +450,7 @@ fn a_type_models_proposals_pass_the_gate_or_change_nothing() {
     });
     // `int` fits the argument; a `char` result says less than the code shows.
     let m = Fixed { arg: "int", ret: "char" };
-    let (p, _) = program_with(&[f], BuildOptions { dwarf: true, model: Some(&m) });
+    let (p, _) = program_with(&[f], BuildOptions { dwarf: true, model: Some(&m), dataset: false });
     assert_eq!((p.type_stats.accepted, p.type_stats.rejected), (1, 1));
     let src = emitted(&p, Mode::Fast);
     assert!(src[0].contains("fn f(rdi: i32) -> u32 {"), "{}", src[0]);

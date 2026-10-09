@@ -112,6 +112,10 @@ enum Emit {
     RawIr,
     /// What safe mode's borrow inference concludes for each argument.
     Borrows,
+    /// Training data for a type and name model, from the debug info: one JSON
+    /// line per argument or return value of each function with a prototype
+    /// (tools/train/README.md).
+    Dataset,
 }
 
 /// `--check` rounds: each one recompiles after sending the failures to fast mode.
@@ -233,8 +237,43 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     let model = model.as_ref().map(|m| m as &dyn chungusite::types::TypeModel);
     #[cfg(not(feature = "ml"))]
     let model = None;
-    let build = BuildOptions { dwarf: !cli.no_dwarf, model };
+    let dataset = cli.emit == Emit::Dataset;
+    if dataset && cli.no_dwarf {
+        return Err("--emit dataset reads its labels from the debug info: it can't be combined with --no-dwarf".into());
+    }
+    let build = BuildOptions { dwarf: !cli.no_dwarf, model, dataset };
     let mut program = Program::build_with(inputs, file, cli.emit == Emit::RawIr, build);
+    if dataset {
+        let mut out = String::new();
+        let mut funcs_with = HashSet::new();
+        for e in program.examples.iter().filter(|e| program.funcs[e.func].selected) {
+            let f = &program.funcs[e.func];
+            let Ok(ir) = &f.ir else { continue };
+            let var = match e.var {
+                chungusite::types::Var::Arg { j, .. } => format!("arg{j}"),
+                chungusite::types::Var::Ret { .. } => "ret".to_string(),
+            };
+            let name = e.name.as_deref().map_or("null".to_string(), json_str);
+            let _ = writeln!(
+                out,
+                "{{\"file\": {}, \"func\": {}, \"addr\": {}, \"var\": \"{var}\", \"value\": \"v{}\", \"label\": {}, \"name\": {name}, \"text\": {}}}",
+                json_str(&source),
+                json_str(&f.name),
+                f.addr,
+                e.value.index(),
+                json_str(&e.label),
+                json_str(&chungusite::refine::to_var_text(ir, e.value)),
+            );
+            funcs_with.insert(e.func);
+        }
+        match &cli.output {
+            Some(p) => std::fs::write(p, &out).map_err(|e| format!("{}: {e}", p.display()))?,
+            None => print!("{out}"),
+        }
+        let rows = out.lines().count();
+        eprintln!("chungusite: {rows} examples from {} functions with a prototype (of {} selected)", funcs_with.len(), funcs.len());
+        return Ok(ExitCode::SUCCESS);
+    }
     // Parameters named from debug info can't shadow a static (E0530): the data
     // symbols get these identifiers below (`Globals::new`).
     if let Some(b) = bin {
@@ -425,6 +464,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 total.state_machines += s.state_machines;
                 let _ = ir;
             }
+            (Ok(_), Emit::Dataset) => unreachable!("written before emitting"),
         }
         if cli.cargo.is_some() && out.len() > start {
             pieces.push(Piece { name: fb.pretty().to_string(), addr: fb.addr, src: out[start..].to_string() });
@@ -630,4 +670,23 @@ fn failure_kind(e: &str) -> String {
         Some(rest) => format!("unsupported {}", rest.split(' ').next().unwrap_or(rest)),
         None => e.split(" at ").next().unwrap_or(e).replace(|c: char| c.is_ascii_digit(), "").to_string(),
     }
+}
+
+/// `s` as a JSON string literal.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }

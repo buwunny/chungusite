@@ -461,7 +461,20 @@ impl Program {
                 e.fargs = e.fargs.max(g.1);
             }
         }
-        let stack_args: Vec<u8> = funcs.par_iter().map(|f| f.ir.as_ref().map_or(0, abi::stack_args)).collect();
+        let mut stack_args: Vec<u8> = funcs.par_iter().map(|f| f.ir.as_ref().map_or(0, abi::stack_args)).collect();
+        // A variadic function of the program reads its stack arguments through
+        // a `va_list` (the address of the first one), not one by one: it takes
+        // as many as any call passes.
+        let va: Vec<bool> = funcs.par_iter().map(|f| f.ir.as_ref().is_ok_and(|ir| ir.variadic || abi::stores_stack_area(ir))).collect();
+        for f in &funcs {
+            for (t, g) in f.targets.iter().zip(&f.guesses) {
+                if let Target::Func(j) = t {
+                    if va[*j] {
+                        stack_args[*j] = stack_args[*j].max(g.2);
+                    }
+                }
+            }
+        }
 
         // 3. Signatures, to a fixpoint (Jacobi rounds: every function from the
         //    previous round's callee signatures). A function returns rdx too
@@ -531,7 +544,7 @@ impl Program {
                                     _ => site_sig(&f.targets[k], f.guesses[k], &sigs, &guessed),
                                 };
                                 let r = abi::infer(f.ir.as_ref().unwrap(), &f.sites, &callee, sigs[i], wanted_by[i], set_args[i]);
-                                (i, Sig { stack_args: stack_args[i], ..r.sig }, r.reads)
+                                (i, Sig { stack_args: stack_args[i], variadic: r.sig.variadic || va[i], ..r.sig }, r.reads)
                             })
                             .collect();
                         let kept: Vec<(u16, u32, bool)> = own
@@ -1396,7 +1409,7 @@ fn site_sig(t: &Target, (args, fargs, stack, fret): (u8, u8, u8, bool), sigs: &[
     match (s.variadic, t) {
         // one of the program's own: it takes (and reads its register save area
         // from) every register, but only those this call sets up mean anything
-        (true, Target::Func(_)) => Sig { unset: (s.args.saturating_sub(args), s.fargs.saturating_sub(fargs)), ..s },
+        (true, Target::Func(_)) => Sig { unset: (s.args.saturating_sub(args), s.fargs.saturating_sub(fargs), s.stack_args.saturating_sub(stack)), ..s },
         (true, _) => Sig { args: s.args.max(args), fargs: s.fargs.max(fargs), stack_args: s.stack_args.max(stack), ..s },
         (false, _) => s,
     }

@@ -1121,3 +1121,8 @@ NOINLINE int64_t walk_b(uint64_t x, int64_t n) {
 }
 // @diff walk_ab: i64(u64, i64:0..40)
 int64_t walk_ab(uint64_t x, int64_t n) { return walk_a(x, n) * 2 + 1; }
+
+// A variadic function of the program called with more arguments than fit
+// in registers: `va_arg` reads the rest from the caller's stack.
+// @diff call_vsum_many: i64(i64, i64, i64)
+int64_t call_vsum_many(int64_t a, int64_t b, int64_t c) { return vsum(8, a, b, c, a ^ b, b - c, c * 3, a + 7, b | 1); }

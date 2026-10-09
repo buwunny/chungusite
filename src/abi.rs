@@ -91,9 +91,10 @@ pub struct Sig {
     /// xmm register halves (bit = 2 * xmm + high) it leaves as it found them.
     pub xpreserves: u32,
     /// At one call to a variadic function of the program: how many of the
-    /// last integer and float arguments the call doesn't set up, passed as
-    /// nothing rather than whatever the registers held (`site_sig`).
-    pub unset: (u8, u8),
+    /// last integer, float and stack arguments the call doesn't set up,
+    /// passed as nothing rather than whatever the registers or the stack
+    /// held (`site_sig`).
+    pub unset: (u8, u8, u8),
 }
 
 impl Sig {
@@ -811,7 +812,7 @@ pub fn infer(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, prev: 
         let undef = undefined_values(f, &cfg, sites, callee, args < 3, prev.fargs);
         ex.iter().all(|e| defined_at(&undef, RDX, e))
     };
-    Inferred { sig: Sig { args, fargs, stack_args: 0, ret, fret, ret2, variadic: f.variadic, preserves, xpreserves, unset: (0, 0) }, reads }
+    Inferred { sig: Sig { args, fargs, stack_args: 0, ret, fret, ret2, variadic: f.variadic, preserves, xpreserves, unset: (0, 0, 0) }, reads }
 }
 
 /// Values that an instruction other than a call, an `Exit` or a spill to the
@@ -1127,6 +1128,28 @@ pub fn stack_args(f: &Function) -> u8 {
     ((end - 8 + 7) / 8) as u8
 }
 
+/// Does the function store the address of its stack arguments (entry rsp + 8
+/// or above) somewhere: a `va_list`'s `overflow_arg_area`, through which
+/// `va_arg` reads however many arguments the caller passed?
+pub fn stores_stack_area(f: &Function) -> bool {
+    let entry = f.blocks[f.entry].params.get(&f.value_pool);
+    let Some(k) = entry.iter().position(|&p| matches!(f.insts[p].kind, InstKind::BlockParam(RSP))) else { return false };
+    let a = analyze(f);
+    f.blocks.iter().any(|(_, blk)| {
+        blk.insts.get(&f.value_pool).iter().any(|&id| match f.insts[id].kind {
+            // into the function's own frame, where its `va_list` lives
+            InstKind::Store { ptr, val, .. } => {
+                let (o, p) = (a.origin[val.index()], a.origin[ptr.index()]);
+                o.roots == 1u128 << k
+                    && matches!(o.off, Off::Known(off) if off >= 8)
+                    && p.roots == 1u128 << k
+                    && matches!(p.off, Off::Known(off) if off < 0)
+            }
+            _ => false,
+        })
+    })
+}
+
 pub(crate) fn bytes(ty: TyId) -> usize {
     match ty {
         TyId::B1 | TyId::BOOL => 1,
@@ -1297,7 +1320,12 @@ pub fn apply(f: &mut Function, sig: Sig, sites: &[Site], shape: &dyn Fn(usize) -
             *a = undef(f, &mut undefs);
         }
         let mut loads = Vec::new();
+        let set = c.stack_args.saturating_sub(c.unset.2) as i32;
         for j in 0..c.stack_args as i32 {
+            if j >= set {
+                new.push(undef(f, &mut undefs));
+                continue;
+            }
             // at a call, [rsp] is the first stack argument; at a jmp, [rsp] is our
             // own return address and the arguments follow it
             let disp = 8 * j + if matches!(s, Site::Tail(_)) { 8 } else { 0 };

@@ -956,3 +956,10 @@ void fmt_either(char *b, uint64_t x, uint64_t y) {
     else { f = "%lu <="; v = y % (x | 1); }
     snprintf(b, 64, f, (unsigned long)v);
 }
+
+// Variadic arguments past the sixth go on the stack.
+// @diff fmt_many: void(buf:96, u64, u64, u64)
+void fmt_many(char *b, uint64_t x, uint64_t y, uint64_t z) {
+    snprintf(b, 96, "%lu %lu %lu %lu %lu %lu", (unsigned long)x, (unsigned long)y, (unsigned long)z,
+             (unsigned long)(x ^ y), (unsigned long)(y + z), (unsigned long)(z * 3));
+}

@@ -378,8 +378,10 @@ pub fn promote(f: &mut Function, stack_args: u8) {
     }
 
     // The frame: everything still in memory, plus address-taken objects.
+    // (a lost frame still holds the stack arguments, which the code reads
+    // through rbp or rsp like anything else)
     let (lo, hi) = if o.lost {
-        (-(FALLBACK_FRAME as i64) + 64, 8)
+        (-(FALLBACK_FRAME as i64) + 64, 8 + 8 * stack_args as i64)
     } else {
         let mut lo = 0i64;
         let mut hi = 8i64;
@@ -407,17 +409,21 @@ pub fn promote(f: &mut Function, stack_args: u8) {
     let mut head = vec![base, new_sp];
     // Stack arguments still read from memory are copied in from parameters.
     let mut new_params = Vec::new();
-    if !o.lost && hi > 8 {
+    if hi > 8 {
         for word in 0..((hi - 8 + 7) / 8).min(stack_args as i64) {
             let reg = STACK_ARG_BASE + word as u8;
-            let exists = f.blocks[entry].params.get(&f.value_pool).iter().any(|&p| matches!(f.insts[p].kind, InstKind::BlockParam(r) if r == reg));
-            let in_memory = slots.iter().enumerate().any(|(i, s)| !ok_slot[i] && s.off >= 8 && (s.off - 8) / 8 == word)
+            let exists = f.blocks[entry].params.get(&f.value_pool).iter().copied().find(|&p| matches!(f.insts[p].kind, InstKind::BlockParam(r) if r == reg));
+            let in_memory = o.lost
+                || slots.iter().enumerate().any(|(i, s)| !ok_slot[i] && s.off >= 8 && (s.off - 8) / 8 == word)
                 || pos_taken.is_some_and(|t| 8 + 8 * word + 8 > t);
-            if exists || !in_memory {
+            if !in_memory || (exists.is_some() && !o.lost) {
                 continue;
             }
-            let p = new_inst(f, InstKind::BlockParam(reg), TyId::B8, at);
-            new_params.push(p);
+            let p = exists.unwrap_or_else(|| {
+                let p = new_inst(f, InstKind::BlockParam(reg), TyId::B8, at);
+                new_params.push(p);
+                p
+            });
             let ptr = new_inst(f, InstKind::PtrOffset { base: new_sp, index: None, scale: 1, disp: 8 + 8 * word as i32 }, TyId::PTR, at);
             let st = new_inst(f, InstKind::Store { ptr, val: p, align: 1 }, TyId::UNIT, at);
             head.extend([ptr, st]);

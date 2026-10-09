@@ -322,7 +322,7 @@ pub fn emit_function_in(f: &Function, name: &str, mode: Mode, env: &Env, out: &m
 
     let hoisted = hoisted(f, &cfg);
     let skip = callee_only(f, &cfg, env.call);
-    let inline = inlined(f, &cfg, &hoisted, &skip, mode == Mode::Safe);
+    let inline = inlined(f, &cfg, &hoisted, &skip, mode == Mode::Safe, env.call);
     let mut e = Emitter {
         f,
         sig: env.sig,
@@ -741,7 +741,21 @@ fn movable(k: InstKind) -> bool {
 /// expression ends up, which is the use of the user when that is inlined too.
 /// In safe mode a load stays out of a store, which may borrow the same slice
 /// mutably.
-fn inlined(f: &Function, cfg: &Cfg, hoisted: &[bool], skip: &[bool], safe: bool) -> Vec<bool> {
+///
+/// A call's result goes into its use too (`return f(x);`, `if f(x) != 0`) when
+/// nothing but pure values comes between them, so the call still runs exactly
+/// once and in the same place relative to every other memory access: not into
+/// an `if`-expression (`Select`) that would run it on one arm only, nor into a
+/// `match` scrutinee repeated on each arm. In safe mode only into a `return` or
+/// an `if` condition, where no other borrow of the same slice can be live.
+fn inlined(
+    f: &Function,
+    cfg: &Cfg,
+    hoisted: &[bool],
+    skip: &[bool],
+    safe: bool,
+    call: &dyn Fn(Site) -> Option<CallInfo>,
+) -> Vec<bool> {
     let n = f.insts.len();
     let mut uses = vec![0u32; n];
     for &b in &cfg.rpo {
@@ -754,6 +768,11 @@ fn inlined(f: &Function, cfg: &Cfg, hoisted: &[bool], skip: &[bool], safe: bool)
     let mut inline = vec![false; n];
     let mut user = vec![u32::MAX; n];
     let mut pos = vec![0u32; n];
+    // inside the arm of an `if`-expression, once written into its use
+    let mut in_select = vec![false; n];
+    // part of the condition of the block's `Branch`, once written into its use
+    // (an edge argument is assigned on that edge only)
+    let mut in_cond = vec![false; n];
     for &b in &cfg.rpo {
         let blk = &f.blocks[b];
         let insts = blk.insts.get(&f.value_pool);
@@ -772,7 +791,8 @@ fn inlined(f: &Function, cfg: &Cfg, hoisted: &[bool], skip: &[bool], safe: bool)
         for (i, &id) in insts.iter().enumerate().rev() {
             let k = f.insts[id].kind;
             let v = id.index();
-            if uses[v] != 1 || hoisted[v] || skip[v] || !(pure(k) || movable(k)) {
+            let is_call = matches!(k, InstKind::Call { .. }) && plain_call(call(Site::Call(id)), safe);
+            if uses[v] != 1 || hoisted[v] || skip[v] || !(pure(k) || movable(k) || is_call) {
                 continue;
             }
             let mut p = user[v];
@@ -780,15 +800,58 @@ fn inlined(f: &Function, cfg: &Cfg, hoisted: &[bool], skip: &[bool], safe: bool)
             if matches!(k, InstKind::Select { .. }) && p < end && matches!(f.insts[insts[p as usize]].kind, InstKind::Select { .. }) {
                 continue;
             }
+            let first = p;
             if p < end && inline[insts[p as usize].index()] {
                 p = pos[insts[p as usize].index()];
             }
             pos[v] = p;
+            if first < end {
+                let u = insts[first as usize].index();
+                in_select[v] = matches!(f.insts[insts[first as usize]].kind, InstKind::Select { .. }) || inline[u] && in_select[u];
+                in_cond[v] = inline[u] && in_cond[u];
+            } else {
+                in_cond[v] = matches!(blk.term, Terminator::Branch { c, .. } if c == id);
+            }
             let into_store = p < end && matches!(f.insts[insts[p as usize]].kind, InstKind::Store { .. });
-            inline[v] = !movable(k) || barriers[p as usize] == barriers[i + 1] && !(safe && into_store);
+            inline[v] = if is_call {
+                let inert = |j: usize| {
+                    let w = insts[j];
+                    skip[w.index()] || pure(f.insts[w].kind) || matches!(f.insts[w].kind, InstKind::Const(_) | InstKind::Undef | InstKind::BlockParam(_))
+                };
+                let into = if p < end {
+                    let d = insts[p as usize];
+                    !safe && !skip[d.index()] && matches!(f.insts[d].kind, InstKind::Store { .. } | InstKind::Call { .. } | InstKind::Load { .. })
+                } else {
+                    match blk.term {
+                        Terminator::Return(_) => true,
+                        Terminator::Branch { .. } => in_cond[v],
+                        Terminator::Jump { .. } | Terminator::TailCall { .. } => !safe,
+                        _ => false,
+                    }
+                };
+                into && !in_select[v] && (i + 1..p as usize).all(inert)
+            } else {
+                !movable(k) || barriers[p as usize] == barriers[i + 1] && !(safe && into_store)
+            };
         }
     }
     inline
+}
+
+/// Is a call emitted as a plain expression of its one result (not a pair, not
+/// an allocation, free or `memcpy` safe mode rewrites), so it can be written into
+/// its use?
+fn plain_call(info: Option<CallInfo>, safe: bool) -> bool {
+    match info {
+        Some(c @ CallInfo { path: Some(_), .. }) => {
+            c.ret
+                && !c.ret2
+                && !c.free
+                && c.builtin.is_none()
+                && !(safe && (c.alloc.is_some() || c.args.iter().any(|a| matches!(a, Pass::Borrow { .. }))))
+        }
+        _ => true,
+    }
 }
 
 /// Values used, and only used, as the base of an address with a variable

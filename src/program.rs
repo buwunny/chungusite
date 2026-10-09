@@ -18,7 +18,7 @@ use crate::borrow::{analyze_with, Analysis, Callee, Class, Ctx, Pass};
 use crate::emit::{emit_function_in, CallInfo, EmitStats, Env, Mode};
 use crate::ir::*;
 use crate::lift::Lifter;
-use crate::opt::{clean, split_returns};
+use crate::opt::{clean, merge_straight, split_returns};
 use crate::types::{FnTypes, TypeModel, TypeStats};
 use crate::verify::verify;
 use object::{Object, ObjectKind, ObjectSection, ObjectSymbol, RelocationTarget, SectionKind};
@@ -687,6 +687,7 @@ impl Program {
             if made > 0 {
                 clean(ir);
             }
+            merge_straight(ir);
             for (old, new) in copied {
                 let k = f.sites.iter().position(|&s| s == old).expect("a call site");
                 f.sites.push(new);

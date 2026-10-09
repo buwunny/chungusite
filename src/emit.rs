@@ -60,6 +60,8 @@ pub struct EmitStats {
     pub raw_by: [usize; 4],
     /// Instructions or terminators the emitter can't express yet (`todo!()`).
     pub todo: usize,
+    /// Instructions kept as inline assembly (`asm!`).
+    pub asm: usize,
     /// Raw twins emitted after this function (`program.rs`), and their raw
     /// loads, stores and copies (not counted in `raw` or `raw_by`).
     pub twins: usize,
@@ -785,7 +787,7 @@ fn inlined(
         let mut barriers = vec![0u32; insts.len() + 1];
         for (i, &id) in insts.iter().enumerate() {
             let k = f.insts[id].kind;
-            let barrier = !skip[id.index()] && !pure(k) && !movable(k) && !matches!(k, InstKind::Const(_) | InstKind::Undef | InstKind::CallOut { .. } | InstKind::BlockParam(_));
+            let barrier = !skip[id.index()] && !pure(k) && !movable(k) && !matches!(k, InstKind::Const(_) | InstKind::Undef | InstKind::CallOut { .. } | InstKind::AsmOut { .. } | InstKind::BlockParam(_));
             barriers[i + 1] = barriers[i] + barrier as u32;
         }
         for (i, &id) in insts.iter().enumerate().rev() {
@@ -1720,6 +1722,8 @@ impl Emitter<'_> {
                 _ => self.val(v, vt),
             },
             PtrToInt(v) => self.val(v, vt),
+            Opaque { asm, args } => return Stmt::Effect(self.asm(id, asm, args)),
+            AsmOut { asm, k } => self.conv(&format!("{}_asm[{k}]", n(asm)), self.u64_ty, vt),
             Load { ptr, .. } => self.load(id, ptr),
             Store { ptr, val, .. } => return Stmt::Effect(self.store(ptr, val)),
             MemCopy { dst, src, len } => {
@@ -1758,6 +1762,52 @@ impl Emitter<'_> {
             }
         };
         Stmt::Value(e)
+    }
+
+    /// An instruction kept as inline assembly: an `asm!` on a copy of each
+    /// register it uses, then `let vN_asm = [..]` with what it wrote (`AsmOut`
+    /// reads it). An xmm register is a `__m128i` made of its two halves.
+    fn asm(&mut self, id: ValueId, a: u32, args: ListRef) -> String {
+        let f = self.f;
+        let a = &f.asm[a as usize];
+        let args = args.get(&f.value_pool);
+        let (mut lets, mut operands, mut post, mut outs) = (String::new(), Vec::new(), String::new(), Vec::new());
+        for (k, op) in a.ops.iter().enumerate() {
+            let spec = if op.named { format!("\"{}\"", op.reg) } else { op.reg.to_string() };
+            let x = format!("asm{k}");
+            let input = match (op.xmm, op.input) {
+                (true, Some(j)) => format!(
+                    "core::mem::transmute::<[u64; 2], core::arch::x86_64::__m128i>([{}, {}])",
+                    self.as_u64(args[j as usize]),
+                    self.as_u64(args[j as usize + 1])
+                ),
+                (true, None) => "core::mem::transmute::<[u64; 2], core::arch::x86_64::__m128i>([0; 2])".to_string(),
+                (false, Some(j)) => self.as_u64(args[j as usize]),
+                (false, None) => "0_u64".to_string(),
+            };
+            if op.output.is_none() {
+                operands.push(format!("in({spec}) {input}"));
+                continue;
+            }
+            let _ = write!(lets, "let mut {x} = {input}; ");
+            operands.push(format!("inout({spec}) {x}"));
+            if op.xmm {
+                let _ = write!(post, "let {x} = core::mem::transmute::<core::arch::x86_64::__m128i, [u64; 2]>({x}); ");
+                outs.extend([format!("{x}[0]"), format!("{x}[1]")]);
+            } else {
+                outs.push(x);
+            }
+        }
+        if !a.stack {
+            operands.push("options(nostack)".to_string());
+        }
+        self.stats.raw += 1;
+        self.stats.asm += 1;
+        let call = format!("core::arch::asm!({:?}, {})", a.text, operands.join(", "));
+        if outs.is_empty() {
+            return format!("unsafe {{ {lets}{call}; }}");
+        }
+        format!("let {}_asm: [u64; {}] = unsafe {{ {lets}{call}; {post}[{}] }}", self.name(id), outs.len(), outs.join(", "))
     }
 
     /// Does the call `call` return rax:rdx?

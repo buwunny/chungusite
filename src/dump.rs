@@ -36,12 +36,14 @@ fn write_fn(s: &mut String, f: &Function) -> fmt::Result {
                 InstKind::Call { callee, args } => format!("call {}({})", v(callee), list(f, args)),
                 InstKind::CallOut { call, reg } => format!("callout {} r{reg}", v(call)),
                 InstKind::Exit { regs } => format!("exit {}", list(f, regs)),
+                InstKind::Opaque { asm, args } => format!("asm {:?}({})", f.asm[asm as usize].text, list(f, args)),
+                InstKind::AsmOut { asm, k } => format!("asmout {} {k}", v(asm)),
                 InstKind::Load { ptr, .. } => format!("load {}", v(ptr)),
                 InstKind::Store { ptr, val, .. } => format!("store {} <- {}", v(ptr), v(val)),
                 other => format!("{other:?}"),
             };
             match k {
-                InstKind::Store { .. } | InstKind::Exit { .. } => writeln!(s, "  {body}")?,
+                InstKind::Store { .. } | InstKind::Exit { .. } | InstKind::Opaque { .. } => writeln!(s, "  {body}")?,
                 _ => writeln!(s, "  {} = {body}", v(id))?,
             }
         }

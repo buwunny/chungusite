@@ -12,7 +12,7 @@
 - calls: `CALL` (direct, register or memory) becomes `InstKind::Call` with the System V argument registers; an indirect `JMP` that isn't a jump table (`jmp [rip+x]` through the GOT, `jmp rax`, `jmp [rax+8]` through a vtable) is a tail call through that pointer;
 - `JMP`, `RET`, `NOP`/`ENDBR64`, and `UD2`/`INT3`/`HLT`, which end the block as `Unreachable`.
 
-Anything else returns `LiftError::Unsupported` so the caller can decide what to do. It never guesses. Pass 1 already checks each mnemonic (`handled`), so a function with an instruction the lifter has no case for fails before any IR is built; pass 2 still rejects unsupported operand forms.
+Anything else returns `LiftError::Unsupported` so the caller can decide what to do. It never guesses. Pass 1 already checks each mnemonic (`handled`), so a function with an instruction the lifter has no case for fails before any IR is built; pass 2 still rejects unsupported operand forms. With `Lifter::asm` set (the CLI sets it unless `--no-asm`), such an instruction is kept as inline assembly instead, when it can be (below).
 
 ## Code that hides from a linear sweep
 
@@ -158,7 +158,26 @@ xmm registers carry float arguments and results ([calls.md](calls.md)): one read
 - **Thread-locals** of an executable sit just below the thread pointer, which `fs:0` holds (x86-64 TLS variant II), so code reads them as `fs:[-k]`, or loads `fs:0` and indexes down from it. `load::tls` gives the thread-local block (`.tdata`, then `.tbss`) an address range of its own above every section (`.tbss` has none: it overlaps the sections after it), and `Lifter::thread_pointer` is its end. `fs:[k]` becomes the constant address `thread_pointer + k`, and `fs:0` that address itself, so globals turn them into the static `THREAD_LOCALS` like any other data ([cli.md](cli.md#globals)). Thread-locals reached through a register (`mov rax, [rip+x]; mov eax, fs:[rax]`, the initial-exec model in shared objects), `__tls_get_addr` and `gs:` stay unsupported.
 - **Calls that don't return** (`abort`, `exit`, `__stack_chk_fail`, `__cxa_throw`, ...; `discover::noreturn`) end their block, so a caller doesn't merge their undefined `rax` into its return value. `lift_full` takes a callback that `program.rs` answers from the relocation or PLT entry at the call.
 
+## Instructions kept as inline assembly
+
+With `Lifter::asm`, an instruction the lifter has no case for, or has but not in the form found, doesn't fail its function ([`src/lift/asm.rs`](../src/lift/asm.rs)). It becomes an `InstKind::Opaque`, which runs the instruction as it is in an `asm!`, with one argument for each register it reads, and an `AsmOut` for each register it writes. Pass 1 accepts such an instruction if it fits; an unsupported form only shows in pass 2, which fails, and `lift_full` lifts the function again with that instruction kept as it is (`forced`).
+
+An instruction fits if all it touches is general registers, xmm registers, the status flags, and memory through its one memory operand:
+
+- **Registers** keep their names in the template and are bound to them (`inout("rax") ..`), so implicit operands (`rdtsc`'s `edx:eax`, `div`'s `rdx:rax`, `blendvps`'s `xmm0`) are right. rbx and rbp can't be bound by name (LLVM keeps them), so as operands they become `{k}` with the width modifier (`{0:e}`, `{0:h}` in `reg_abcd`), and an instruction that uses them implicitly doesn't fit. A register is an input if the instruction reads it or writes 8 or 16 bits of it (the rest is kept), and an output if it writes it; an xmm register is a `__m128i` made of its two halves. rsp may only be a memory operand's base, and nothing that moves it (`push`, `enter`) fits.
+- **Memory** is `[{k}]`, with the address computed outside the `asm!` the way the lifter computes any other (`ea`): a stack slot is in the frame and a static is the static. iced's `used_memory` must show no other access (string instructions, `maskmovdqu`, `movdir64b` don't fit). Frame promotion and safe mode treat the address like any other operand that escapes.
+- **Flags** an instruction reads are built from the pending lazy flags, one condition per flag (CF from `b`, ZF from `e`, ...), and loaded with `push {k}; popfq` first. Flags it writes are read back with `pushfq; pop {k}` and become `Flags::Raw`, from which a later `Jcc`, `SETcc` or another kept instruction takes its bits. If it writes some flags but not all, the others are loaded first as well, where the lazy flags give them, so rflags read back is right for them too; `Flags::Raw::valid` says which bits are known. AF and, after a compare, PF aren't known.
+
+The template is iced's Intel syntax with hex immediates, and a memory size only where the operands don't give it (LLVM rejects `rstorssp qword ptr [rcx]` but needs `crc32 rax, qword ptr [rcx]`). `rcl rax, 1` after a `cmp` reads:
+
+```rust
+let v19_asm: [u64; 2] = unsafe { let mut asm0 = ((rdi < rsi) as u64).wrapping_shl(0) | ...; let mut asm1 = rdx;
+    core::arch::asm!("push {0}\npopfq\nrcl rax, 1\npushfq\npop {0}", inout(reg) asm0, inout("rax") asm1); [asm0, asm1] };
+```
+
 ## Not handled yet
+
+These are kept as inline assembly when the lifter may (above), except for those on `ymm` registers:
 
 - AVX2 instructions that cross the 128-bit halves (`VPERMQ`, `VINSERTI128`, ...) or shift by an `xmm` count, AVX floats on `ymm` registers, and SSSE3 and later (`PSHUFB`, `PTEST`, ...).
 - `DIV` with a real 128-bit dividend.

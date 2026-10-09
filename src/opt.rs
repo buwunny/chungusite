@@ -375,10 +375,10 @@ pub fn map_operands(k: &mut InstKind, pool: &mut [ValueId], r: impl Fn(&mut Valu
     use InstKind::*;
     match k {
         Const(_) | Undef | Param(_) | BlockParam(_) | FuncRef(_) | ImportRef(_) | AddrOfLocal(_)
-        | AddrOfGlobal(_) | Opaque { .. } | Copy(_) | Move(_) | Borrow { .. } => {}
+        | AddrOfGlobal(_) | Copy(_) | Move(_) | Borrow { .. } => {}
         Bin { lhs, rhs, .. } | Cmp { lhs, rhs, .. } => { r(lhs); r(rhs) }
-        Un { v, .. } | Cast { v, .. } | IntToPtr(v) | PtrToInt(v) | CallOut { call: v, .. } => r(v),
-        Exit { regs } => map_list(pool, *regs, r),
+        Un { v, .. } | Cast { v, .. } | IntToPtr(v) | PtrToInt(v) | CallOut { call: v, .. } | AsmOut { asm: v, .. } => r(v),
+        Exit { regs } | Opaque { args: regs, .. } => map_list(pool, *regs, r),
         Select { c, t, f } => { r(c); r(t); r(f) }
         Call { callee, args } => { r(callee); map_list(pool, *args, r) }
         PtrOffset { base, index, .. } => { r(base); if let Some(i) = index { r(i) } }

@@ -952,7 +952,6 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callee
     let mut out = Vec::new();
     let mut unprovable = Vec::new();
     let mut bad_calls = Vec::new();
-    let mut opaque = false;
     let users = std::cell::OnceCell::new();
     let users = || users.get_or_init(|| Users::new(f, cfg));
     for &b in &cfg.rpo {
@@ -1036,7 +1035,6 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callee
                 Cmp { .. } => {}
                 // registers after a call, and at a return: bookkeeping, not uses
                 CallOut { .. } | Exit { .. } => {}
-                Opaque { .. } => opaque = true,
                 // what is only compared doesn't let the pointer out
                 Bin { .. } | Un { .. } | Cast { .. } if only_compared(f, users(), id) => {}
                 // rax:rdx returned: rax is the return value, the sret pointer of a
@@ -1078,12 +1076,6 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callee
                 }
             }
             _ => {}
-        }
-    }
-    // Unliftable code may do anything with any root.
-    if opaque {
-        for root in 0..roots.len() as u8 {
-            out.push(Fact { root, off: Off::Unknown, lo: i64::MIN, kind: FactKind::Escape, at: None, point: 0, site: None });
         }
     }
     (out, unprovable, bad_calls)

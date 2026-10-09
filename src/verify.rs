@@ -45,7 +45,9 @@ pub fn verify(f: &Function) -> Result<(), VerifyError> {
             if v.index() >= n {
                 return Err(VerifyError::DanglingValue { user, block: b, value: v });
             }
-            if f.insts[v].ty == TyId::UNIT {
+            // an `AsmOut` names its `Opaque`, which defines no value itself
+            let asm_out = user.is_some_and(|u| matches!(f.insts[u].kind, InstKind::AsmOut { .. }));
+            if f.insts[v].ty == TyId::UNIT && !asm_out {
                 return Err(VerifyError::UsesNonValue { user, block: b, value: v });
             }
             Ok(())
@@ -146,10 +148,10 @@ pub fn for_each_operand(k: InstKind, f: &Function, mut cb: impl FnMut(ValueId)) 
     use InstKind::*;
     match k {
         Const(_) | Undef | Param(_) | BlockParam(_) | FuncRef(_) | ImportRef(_) | AddrOfLocal(_)
-        | AddrOfGlobal(_) | Opaque { .. } => {}
+        | AddrOfGlobal(_) => {}
         Bin { lhs, rhs, .. } | Cmp { lhs, rhs, .. } => { cb(lhs); cb(rhs) }
-        Un { v, .. } | Cast { v, .. } | IntToPtr(v) | PtrToInt(v) | CallOut { call: v, .. } => cb(v),
-        Exit { regs } => regs.get(&f.value_pool).iter().copied().for_each(&mut cb),
+        Un { v, .. } | Cast { v, .. } | IntToPtr(v) | PtrToInt(v) | CallOut { call: v, .. } | AsmOut { asm: v, .. } => cb(v),
+        Exit { regs } | Opaque { args: regs, .. } => regs.get(&f.value_pool).iter().copied().for_each(&mut cb),
         Select { c, t, f: e } => { cb(c); cb(t); cb(e) }
         Call { callee, args } => { cb(callee); args.get(&f.value_pool).iter().copied().for_each(&mut cb) }
         PtrOffset { base, index, .. } => { cb(base); if let Some(i) = index { cb(i) } }

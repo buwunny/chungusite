@@ -505,3 +505,48 @@ fn conditional_branch_out_of_the_function_is_a_tail_call() {
     assert!(lines[..tail].iter().any(|l| l.contains("const 0x5000")), "{out}");
     assert!(out.contains("ret"), "{out}");
 }
+
+#[test]
+fn unknown_instructions_become_inline_assembly() {
+    let lift = |code: &[u8]| {
+        let mut f = Function::with_capacity(16, 2);
+        let mut l = Lifter::new();
+        l.asm = true;
+        l.lift(code, 0, &mut f).map(|()| f)
+    };
+    // rdtsc ; ret: an asm! that writes rax and rdx, and no argument
+    let f = lift(&[0x0F, 0x31, 0xC3]).unwrap();
+    assert_eq!(f.asm.len(), 1);
+    assert_eq!(f.asm[0].text, "rdtsc");
+    let named: Vec<_> = f.asm[0].ops.iter().map(|o| (o.reg, o.input.is_some(), o.output.is_some())).collect();
+    assert_eq!(named, [("rax", false, true), ("rdx", false, true)]);
+    // mov rax, rsi ; mov rcx, rdx ; mov rdx, rdi ; div rcx ; ret: a 128-bit
+    // dividend, which the lifter's own `div` doesn't do, kept as it is
+    let f = lift(&[0x48, 0x89, 0xF0, 0x48, 0x89, 0xD1, 0x48, 0x89, 0xFA, 0x48, 0xF7, 0xF1, 0xC3]).unwrap();
+    assert_eq!(f.asm.len(), 1);
+    assert!(f.asm[0].text.starts_with("div rcx\n"), "{}", f.asm[0].text);
+    // enter moves rsp: still unsupported
+    let err = lift(&[0xC8, 0x10, 0x00, 0x00, 0xC3]).unwrap_err();
+    assert!(matches!(err, LiftError::Unsupported { ip: 0, .. }), "{err:?}");
+    // without `asm`, as before
+    let mut f = Function::with_capacity(8, 2);
+    assert!(matches!(Lifter::new().lift(&[0x0F, 0x31, 0xC3], 0, &mut f), Err(LiftError::Unsupported { ip: 0, .. })));
+}
+
+#[test]
+fn flags_from_inline_assembly() {
+    // cmp rdi, rsi ; rcl rax, 1 ; jb L ; ret ; L: ret: rcl reads CF from the
+    // cmp, and the jb reads the CF rcl leaves, from rflags
+    let code = [0x48, 0x39, 0xF7, 0x48, 0xD1, 0xD0, 0x72, 0x01, 0xC3, 0xC3];
+    let mut f = Function::with_capacity(32, 4);
+    let mut l = Lifter::new();
+    l.asm = true;
+    l.lift(&code, 0, &mut f).unwrap();
+    assert_eq!(f.asm[0].text, "push {0}\npopfq\nrcl rax, 1\npushfq\npop {0}");
+    let ir = dump(&f);
+    assert!(ir.contains("And v") && ir.contains("const 0x1\n"), "{ir}");
+    // jb right after the entry reads flags nothing set
+    let code = [0xF9, 0x72, 0x01, 0xC3, 0xC3]; // stc ; jb L ; ret ; L: ret
+    l.lift(&code, 0, &mut f).unwrap();
+    assert_eq!(f.asm[0].text, "stc\npushfq\npop {0}");
+}

@@ -1131,3 +1131,13 @@ int64_t call_vsum_many(int64_t a, int64_t b, int64_t c) { return vsum(8, a, b, c
 NOINLINE uint64_t big_mix(uint64_t x) { return x * 0x9E3779B97F4A7C15ull; }
 // @diff mix_or_zero: u64(u64, i64:-3..3)
 uint64_t mix_or_zero(uint64_t x, int64_t i) { if (i == -2) return 0; return big_mix(x + i); }
+
+// gcc keeps values in rcx and r8 across a call to a recursive static function
+// that doesn't touch them (-fipa-ra); its padding falls into a loop.
+struct tnode { int tag; int a; struct tnode *l, *r; struct tnode **kids; int nk; };
+__attribute__((visibility("hidden"))) NOINLINE void tmark(struct tnode *p, int v, int w) {
+    while (p) { p->a |= w; p->tag = v; if (p->tag == 7 && p->kids) for (int i = 0; i < p->nk; i++) tmark(p->kids[i], v, w); tmark(p->l, v, w); p = p->r; }
+}
+NOINLINE struct tnode *tmk(struct tnode *n, int i) { n->l = 0; n->r = 0; n->kids = 0; n->nk = 0; n->a = i; return n; }
+// @diff keep_across: i64(i64)
+int64_t keep_across(int64_t x) { struct tnode n; struct tnode *p = tmk(&n, (int)x); tmark(p, (int)x & 3, 1); return (int64_t)(p == &n) + p->a; }

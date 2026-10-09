@@ -543,7 +543,7 @@ fn stale_regs(f: &Function, cfg: &Cfg, sites: &[Site], callee: &dyn Fn(usize) ->
 /// Where a value comes from, as far as register summaries care.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Src {
-    /// Not computed yet.
+    /// Not computed yet, or in a block nothing reaches.
     Top,
     /// Register `r`'s value on entry.
     Entry(u8),
@@ -555,8 +555,9 @@ enum Src {
 fn sources(f: &Function, cfg: &Cfg, sites: &[Site]) -> Vec<Src> {
     let mut s = vec![Src::Top; f.insts.len()];
     let site_of = |call: ValueId| sites.iter().position(|&x| x == Site::Call(call));
-    for (_, blk) in f.blocks.iter() {
-        for &id in blk.insts.get(&f.value_pool) {
+    // (values in blocks nothing reaches stay `Top`: no path brings them)
+    for &b in &cfg.rpo {
+        for &id in f.blocks[b].insts.get(&f.value_pool) {
             s[id.index()] = match f.insts[id].kind {
                 InstKind::Call { .. } => site_of(id).map_or(Src::Other, |k| Src::After(k, RAX)),
                 InstKind::CallOut { call, reg } => site_of(call).map_or(Src::Other, |k| Src::After(k, reg)),
@@ -631,6 +632,9 @@ fn traces(f: &Function, src: &[Src], sites: &[Site], callee: &dyn Fn(usize) -> S
                 for (p, blk) in f.blocks.iter() {
                     if all && blk.term.successors(&f.value_pool).any(|s| s == b) {
                         incoming(f, p, b, k, |a| {
+                            if src[a.index()] == Src::Top {
+                                return; // from a block nothing reaches
+                            }
                             paths += 1;
                             all = all && traces(f, src, sites, callee, reg, a, seen);
                         });

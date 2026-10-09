@@ -393,7 +393,7 @@ fn struct_arg(
                 InstKind::MemFill { dst, .. } if through(dst) => return false,
                 InstKind::Call { args, .. } => {
                     let pass = call(Site::Call(id)).map(|c| c.args).unwrap_or_default();
-                    let lent = args.get(&f.value_pool).iter().zip(&pass).any(|(&v, x)| matches!(x, Pass::Borrow { .. }) && through(v));
+                    let lent = args.get(&f.value_pool).iter().zip(&pass).any(|(&v, x)| matches!(x, Pass::Borrow { .. } | Pass::Raw { .. }) && through(v));
                     if lent {
                         return false;
                     }
@@ -416,7 +416,7 @@ fn struct_arg(
     for &b in &cfg.rpo {
         if let Terminator::TailCall { args, .. } = f.blocks[b].term {
             let pass = call(Site::Tail(b)).map(|c| c.args).unwrap_or_default();
-            if args.get(&f.value_pool).iter().zip(&pass).any(|(&v, x)| matches!(x, Pass::Borrow { .. }) && through(v)) {
+            if args.get(&f.value_pool).iter().zip(&pass).any(|(&v, x)| matches!(x, Pass::Borrow { .. } | Pass::Raw { .. }) && through(v)) {
                 return false;
             }
         }
@@ -1833,7 +1833,8 @@ impl Emitter<'_> {
         let a = typed.join(", ");
         let rty = info.as_ref().and_then(|c| c.ret_ty).unwrap_or(self.u64_ty);
         match info {
-            Some(CallInfo { path: Some(p), ret, ret2, foreign: false, raw: false, args: pass, .. }) if pass.iter().any(|x| matches!(x, Pass::Borrow { .. })) => {
+            Some(CallInfo { path: Some(p), ret, ret2, foreign: false, raw: false, args: pass, arg_tys, .. }) if pass.iter().any(|x| matches!(x, Pass::Borrow { .. })) => {
+                let typed = self.raw_lends(args, &pass, &arg_tys, typed, false);
                 let (lets, a) = self.call_args(args, &pass, typed);
                 (format!("unsafe {{ {lets}{p}({}) }}", a.join(", ")), ret, ret2, rty)
             }
@@ -1841,7 +1842,7 @@ impl Emitter<'_> {
                 if foreign || raw {
                     self.stats.raw += 1;
                 }
-                let a = self.raw_lends(args, &pass, &arg_tys, typed).join(", ");
+                let a = self.raw_lends(args, &pass, &arg_tys, typed, true).join(", ");
                 if ret2 && foreign {
                     // an extern returns `ffi::Pair`, which is FFI-safe; a tuple isn't
                     return (format!("unsafe {{ let pair_ = {p}({a}); (pair_.0, pair_.1) }}"), ret, ret2, rty);
@@ -2381,12 +2382,14 @@ impl Emitter<'_> {
     /// borrows or accesses whose root is safe is a pointer made from the root's
     /// slice at the call (`borrow::FactKind::RawLend`), not the address kept
     /// from earlier.
-    fn raw_lends(&self, args: &[ValueId], pass: &[Pass], tys: &[Option<TyId>], mut out: Vec<String>) -> Vec<String> {
+    /// Only `Pass::Raw` arguments unless `all` (beside slices lent at the call).
+    fn raw_lends(&self, args: &[ValueId], pass: &[Pass], tys: &[Option<TyId>], mut out: Vec<String>, all: bool) -> Vec<String> {
         let Some(a) = self.borrow else { return out };
         for (k, &v) in args.iter().enumerate() {
             let mutbl = match pass.get(k) {
-                Some(&Pass::Borrow { mutbl, .. }) => mutbl,
-                Some(&Pass::Access { write }) => write,
+                Some(&Pass::Borrow { mutbl, .. }) if all => mutbl,
+                Some(&Pass::Access { write }) if all => write,
+                Some(&Pass::Raw { mutbl, .. }) => mutbl,
                 _ => continue,
             };
             let Some(place) = a.safe_root(v).and_then(|r| self.places.get(r as usize)).and_then(|p| p.as_ref()) else { continue };

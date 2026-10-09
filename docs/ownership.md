@@ -75,9 +75,9 @@ One pass over the reachable blocks turns uses of derived values into facts about
 | IR | Fact |
 |---|---|
 | `load ptr` | `Read(root(ptr), off)` |
-| `store ptr <- val` | `Write(root(ptr), off)`; for each root of `val`, `Stash(root(ptr))` if `ptr` is in the frame or an allocation, otherwise `Escape` |
-| `memcpy dst, src` | `Write(dst)`, `Read(src)`; the pointers stashed in `src` are copied (`CopyTo`) or leave (`Spill`) |
-| an access through a pointer into several roots | `Escape` for each (it can't be bounds-checked against one) |
+| `store ptr <- val` | `Write(root(ptr), off)`; for each root of `val`, `Stash(root(ptr))` if `ptr` is in the frame or an allocation, `StoreInto(j)` if `ptr` is argument `j`'s object and `val` is another argument or its contents (the summary's `stores`, stage 5), otherwise `Escape` |
+| `memcpy dst, src` | `Write(dst)`, `Read(src)`; the pointers stashed in `src` are copied (`CopyTo`), copied into an argument's object (`Flow`, settled once the function's summary says where that argument goes) or leave (`Spill`) |
+| an access through a pointer into several roots | `Unbounded` for each: it can't be bounds-checked against one, so each is raw, but nothing keeps a pointer to it |
 | `call f(args)`, tail call | per argument, what `f`'s summary says (stage 5); `Escape` for every argument of an unknown callee |
 | `ret v` | `Return(root(v))` |
 | `cmp.eq/ne p, 0` at offset 0 | `NullCheck(root(p))` |
@@ -92,6 +92,7 @@ One pass over the reachable blocks turns uses of derived values into facts about
 Then a fixpoint decides which roots are **safe**: they start safe, and a root becomes raw (never the other way) when
 
 - something lets a pointer to it escape: an `Escape` fact, or a `Stash` into a container whose contents escape (a container that is raw itself, spilled, or lent to a callee that may keep what it holds), or a call that can't lend it (below);
+- it is accessed in a way that can't be bounds-checked (`Unbounded`): it is raw, but, unlike an escape, the callers of an argument that is only that still lend it for the call (`Pass::Raw`);
 - it is accessed before its start (a negative constant offset), except a global, whose offset is from the address the code used;
 - and per kind of root: an argument must be dereferenced, not demoted and not freed; the frame must not be returned or freed, and not be the 64 KiB fallback frame for stack use the frame pass can't follow; a global must be in a read-only static that is emitted as `Bytes` (no pointer slots), and only read; an allocation must not be returned, not be made inside a loop (one variable holds it), be freed only at offset 0, and not be used after it may have been freed (stage 6).
 
@@ -154,12 +155,17 @@ On chungusite's own debug build (29,724 functions), splitting took bounds-checke
 | `Ignore` | the callee uses it as an integer and doesn't keep it | none |
 | `Borrow { mutbl, nullable, keeps }` | the callee takes a slice; `keeps` if it may keep a pointer loaded from it | `Borrow`: the caller lends its root |
 | `Access { write }` | read or written during the call only (`memcpy`, `memset`) | `Read` / `Write` |
+| `Raw { mutbl, keeps }` | dereferenced only during the call, but not as one slice (picked from several objects, or an integer some caller passes) | `RawLend`: the caller passes a pointer made from its slice at the call |
 | `Free` | freed (`free`, `operator delete`, `__rust_dealloc`) | `Free`: a move |
 | `Escape` | anything else | `Escape` |
 
-plus whether the result is a new allocation, which arguments it (and rdx) points into, and which arguments' contents it may be. A decompiled function's summary comes from its own analysis (a `&T`/`&mut T` argument is a `Borrow`, an integer that doesn't escape is `Ignore`); C library functions come from `libc::summary`. Summaries start optimistic (`Ignore` everywhere) and are recomputed for the callers of every function whose summary changed, until none does. They only get worse, so this terminates; after 64 rounds whatever still changes takes integers.
+plus whether the result is a new allocation, which arguments it (and rdx) points into, which arguments' contents it may be, and which pointers it stores into other arguments (`Callee::stores`, below). A decompiled function's summary comes from its own analysis (a `&T`/`&mut T` argument is a `Borrow`, an integer that doesn't escape is `Ignore`); C library functions come from `libc::summary`. Summaries start optimistic (`Ignore` everywhere) and are recomputed for the callers of every function whose summary changed, until none does. They only get worse, so this terminates; after 16 rounds a summary only grows (each argument's pass is joined with the one before), so callees whose summaries feed back on each other settle, and an argument whose own analysis lends a slice that the joined summary no longer does takes an integer, so callers and callee agree; after 64 rounds whatever still changes takes integers.
 
 **Lending objects that hold pointers.** Debug builds pass most things by reference to a struct on the stack: `fmt::Arguments` holds pointers to the values being formatted, an iterator holds a pointer to its slice. A local whose address is stored in another local that is then lent would escape, unless the callee's summary says what it does with the pointers it loads from the argument. That is what the contents root is for: in the callee, everything loaded through argument `k` points into `Contents(k)`, and the summary's `keeps` is set when that root escapes, is spilled, stored through, freed or lent on to a callee that keeps. When the callee keeps nothing, the caller's container doesn't leak what it holds, and the objects stored in it (and in what they hold, transitively) count as read, written and lent at the call. When the callee returns those pointers (`ret_contents`), the result points wherever they do.
+
+**Pointers a callee moves between arguments.** A callee that stores one argument (or a pointer loaded from it) into another argument's object, as a constructor filling an iterator or `fmt::Arguments` does, doesn't keep it: it leaves it in the caller's object. The summary records each such store as a `Store { from, into, off, deref }`, and at the call the caller treats it as its own store into whatever argument `into` points to at `off`: a `Stash` into a container (escaping only if that container does), or an `Escape` if it isn't one. `memcpy` and its relatives do the same with the pointers inside what they copy: the points-to entries of the source range are copied to the destination, slot by slot, so a pointer copied out of a local is still known to point into it. Only stores at a known offset are recorded; the rest still keep.
+
+**Calls that never return.** A call followed by `unreachable` (`panic`, `abort`, `handle_alloc_error`) can't return to the caller, so nothing it keeps outlives the frame: an argument pointing into the frame doesn't escape there. One pointing into an argument's object still may (a panic handler can keep it), so that is only a raw access, not a reason to keep the object.
 
 Two limits, the same as for raw twins: the objects reached through a lent container aren't checked against other loans (they are accessed through the addresses stored when the container was filled), and a pointer stored in a lent container keeps the provenance of that address. An indirect call keeps everything.
 
@@ -179,7 +185,9 @@ unsafe { let __s = &mut heap23[v23.wrapping_sub(heap23_base) as usize..];
 
 **Raw twins.** A call that can't lend a slice (the pointer has no origin, comes from several objects, from one that isn't safe, from a nullable argument, or conflicts with another loan) calls the callee's *raw twin*: `f_raw`, the same function emitted in fast mode, taking integers. So one caller that can't lend a slice doesn't take the slice away from all the others. Twins are also made for functions that data points to (vtables, callbacks: whoever calls through the pointer passes integers, so the static holds `f_raw`), and for the slice-taking callees of every twin and every function emitted in fast mode, since fast-mode code passes integers. A twin is emitted right after its function.
 
-The twin still only accesses its arguments during the call (its summary says so), so the caller's objects don't escape through it: an argument the twin borrows whose root is safe in the caller is a `RawLend` fact, a read (and write) of the object that the loan rules leave alone, and the emitter passes a pointer made from the object's slice at the call, `(frame.0.as_mut_ptr() as u64).wrapping_add(off)`, instead of the address kept from earlier. Only the arguments that made the call raw lose their slices.
+The twin still only accesses its arguments during the call (its summary says so), so the caller's objects don't escape through it: an argument the twin borrows whose root is safe in the caller is a `RawLend` fact, a read (and write) of the object that the loan rules leave alone, and the emitter passes a pointer made from the object's slice at the call, `(frame.0.as_mut_ptr() as u64).wrapping_add(off)`, instead of the address kept from earlier. Only the arguments that made the call raw lose their slices. An argument the twin keeps (`Escape` in its summary) is kept by the twin as much as by the function: it escapes, as at any call. (Before this, such arguments were left alone at a twin call, which let a local escape through it while staying safe in the caller.)
+
+A callee whose argument is raw in its own body but only dereferenced during the call (it picks between two objects, or some caller passes an integer) is `Pass::Raw`: callers pass a pointer made from their slice at the call, as to a twin, and the object stays safe.
 
 **Moves: `malloc` and `free` as `Box`.** An allocation that is safe (stage 3) and passes the move check (stage 6) is a `Box<[u8]>`:
 
@@ -268,6 +276,24 @@ On a debug build of chungusite itself (34,811 functions), the contents roots, `k
 | raw twins | 23,459 | 25,101 |
 
 Most of what is left in the frame is lent to callees that do keep (`fmt::Arguments` handed down to `write_fmt`, `Vec::push` storing a pointer), to indirect calls, or a frame object holding pointers to itself. Analysis takes about 30 s instead of 21 s.
+
+### Pointers lent to callees that store them
+
+On a debug build of chungusite itself (37,224 functions), with `--check`. Main had two holes that left locals safe when they weren't (a raw twin's caller ignored what the twin keeps, and `memcpy` dropped the pointers in what it copied); "main, sound" is main with only those two fixed:
+
+| | main | main, sound | after |
+|---|---:|---:|---:|
+| raw accesses through the frame | 83,898 | 147,947 | 137,005 |
+| raw accesses through globals | | 1,944 | 1,943 |
+| raw accesses through arguments | | 19,306 | 18,223 |
+| raw accesses through other pointers | | 18,032 | 17,901 |
+| memory accesses bounds-checked | | 233,566 | 245,723 |
+| functions with no raw pointer at all | | 25,036 | 22,981 |
+| safe `fn`s | | 11,013 | 11,088 |
+| raw twins | | 25,364 | 25,805 |
+| functions `--check` sends back to fast mode | | 0 | 0 |
+
+The stores and copies callees make into other arguments, and calls that never return, account for most of the gain (calls that never return about 13,000 of it). Fewer functions have no raw pointer at all; that drop isn't broken down yet. What is left in the frame is mostly lent to indirect calls (hashbrown's hasher, `dyn` methods) or to callees that store it where the caller can't follow.
 
 ## Costs
 

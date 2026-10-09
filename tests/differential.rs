@@ -183,8 +183,10 @@ fn decompile(file: &[u8], cases: &[Case], dwarf: bool) -> (Vec<Decompiled>, [Str
         .funcs
         .iter()
         .map(|fb| {
-            let selected = cases.iter().any(|c| c.name == fb.name);
-            Input { name: fb.name.clone(), ident: fb.name.clone(), addr: fb.addr, bytes: fb.bytes, selected }
+            // A case's `.cold` part is a function of its own that the case jumps to.
+            let name = fb.name.strip_suffix(".cold").unwrap_or(&fb.name);
+            let selected = cases.iter().any(|c| c.name == name);
+            Input { name: fb.name.clone(), ident: fb.name.replace(".", "_"), addr: fb.addr, bytes: fb.bytes, selected }
         })
         .collect();
     let used: HashSet<String> = bin.funcs.iter().map(|f| f.name.clone()).collect();
@@ -214,6 +216,14 @@ fn decompile(file: &[u8], cases: &[Case], dwarf: bool) -> (Vec<Decompiled>, [Str
         })
         .collect();
     let mut prelude = program.prelude();
+    let mut parts = [String::new(), String::new()];
+    for (i, f) in program.funcs.iter().enumerate() {
+        if f.selected && !cases.iter().any(|c| c.name == f.name) {
+            for (part, out) in parts.iter_mut().zip([&fast, &safe]) {
+                part.push_str(&out[i].as_ref().expect("a selected function that lifts").0);
+            }
+        }
+    }
     // The statics the emitted functions use, and the ones those point to.
     let mut statics = BTreeSet::new();
     for f in program.funcs.iter().filter(|f| f.selected) {
@@ -236,7 +246,8 @@ fn decompile(file: &[u8], cases: &[Case], dwarf: bool) -> (Vec<Decompiled>, [Str
             todo = more.drain(..).filter(|i| statics.insert(*i)).collect();
         }
     }
-    (decompiled, [prelude.clone(), prelude])
+    let [fast_parts, safe_parts] = parts;
+    (decompiled, [prelude.clone() + &fast_parts, prelude + &safe_parts])
 }
 
 // ---------------------------------------------------------------------------

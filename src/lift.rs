@@ -196,6 +196,12 @@ pub struct Lifter {
     switch_index: Option<ValueId>,
     /// Each block that ends in a `Switch`, and its table (index into `tables`).
     switches: Vec<(BlockId, usize)>,
+    /// The address of each conditional branch out of the function (into
+    /// another function's `.cold` part), in order. Each gets a block after the
+    /// leaders' that tail-calls the target.
+    stubs: Vec<u64>,
+    /// The stubs pass 2 has lifted so far.
+    nstub: usize,
     /// Record the caller-saved registers at each return in an `Exit` instruction,
     /// for whole-program register summaries (`program.rs` sets this).
     pub track_exits: bool,
@@ -231,6 +237,8 @@ impl Lifter {
             xmm: false,
             switch_index: None,
             switches: Vec::with_capacity(4),
+            stubs: Vec::with_capacity(4),
+            nstub: 0,
             track_exits: false,
             thread_pointer: None,
             cur: 0,
@@ -270,7 +278,8 @@ impl Lifter {
         self.tails.clear();
         self.exits.clear();
         self.switches.clear();
-        for _ in 0..self.leaders.len() {
+        self.nstub = 0;
+        for _ in 0..self.leaders.len() + self.stubs.len() {
             self.state.push(EMPTY_STATE);
             f.blocks.push(Block { insts: ListRef::EMPTY, params: ListRef::EMPTY, term: Terminator::Unreachable });
         }
@@ -343,6 +352,7 @@ impl Lifter {
         self.nrecent = 0;
         self.rip_lea = [0; 16];
         self.starts.clear();
+        self.stubs.clear();
         self.xmm = false;
         let mut dec = Decoder::with_ip(64, code, ip, DecoderOptions::NONE);
         while dec.can_decode() {
@@ -361,7 +371,11 @@ impl Lifter {
             match self.insn.flow_control() {
                 FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch => {
                     let t = self.insn.near_branch_target();
-                    if in_range(t) { self.leaders.push(t); }
+                    if in_range(t) {
+                        self.leaders.push(t);
+                    } else if self.insn.flow_control() == FlowControl::ConditionalBranch {
+                        self.stubs.push(self.ip);
+                    }
                     if in_range(next) { self.leaders.push(next); }
                 }
                 FlowControl::IndirectBranch => {
@@ -597,6 +611,24 @@ impl Lifter {
         f.blocks[BlockId::new(idx)].insts.start = f.value_pool.len() as u32;
     }
 
+    /// The terminator of the current block for a jump to `target`, outside
+    /// the function.
+    fn tail_call(&mut self, f: &mut Function, target: u64) -> Terminator {
+        let a = self.konst(f, target, TyId::B8);
+        let callee = self.emit(f, InstKind::IntToPtr(a), TyId::PTR);
+        let regs = self.call_regs(f);
+        self.tails.push((BlockId::new(self.cur), regs));
+        Terminator::TailCall { callee, args: ListRef::EMPTY }
+    }
+
+    /// The address block `b` starts at; a stub's is its branch's.
+    fn block_ip(&self, b: usize) -> u64 {
+        match self.leaders.get(b) {
+            Some(&a) => a,
+            None => self.stubs[b - self.leaders.len()],
+        }
+    }
+
     fn end_block(&mut self, f: &mut Function, term: Terminator) {
         let len = f.value_pool.len() as u32;
         let b = &mut f.blocks[BlockId::new(self.cur)];
@@ -633,22 +665,25 @@ impl Lifter {
             }
             FlowControl::ConditionalBranch if i.condition_code() != ConditionCode::None => {
                 let c = self.condition(f, i.condition_code())?;
-                let t = self.target(i.near_branch_target())?;
                 let e = self.target(i.next_ip())?;
+                let Some(t) = self.block_at(i.near_branch_target()) else {
+                    // Out of the function: a block of its own tail-calls the target.
+                    let stub = self.leaders.len() + self.nstub;
+                    self.nstub += 1;
+                    self.end_block(f, Terminator::Branch { c, t: BlockId::new(stub), f: e, args: ListRef::EMPTY });
+                    self.begin_block(stub, f);
+                    let term = self.tail_call(f, i.near_branch_target());
+                    self.end_block(f, term);
+                    return Ok(true);
+                };
                 self.end_block(f, Terminator::Branch { c, t, f: e, args: ListRef::EMPTY });
                 Ok(true)
             }
             FlowControl::UnconditionalBranch if i.op0_kind() == OpKind::NearBranch64 => {
                 let term = match self.block_at(i.near_branch_target()) {
                     Some(to) => Terminator::Jump { to, args: ListRef::EMPTY },
-                    None => {
-                        // Jump out of this function: a tail call.
-                        let a = self.konst(f, i.near_branch_target(), TyId::B8);
-                        let callee = self.emit(f, InstKind::IntToPtr(a), TyId::PTR);
-                        let regs = self.call_regs(f);
-                        self.tails.push((BlockId::new(self.cur), regs));
-                        Terminator::TailCall { callee, args: ListRef::EMPTY }
-                    }
+                    // Jump out of this function: a tail call.
+                    None => self.tail_call(f, i.near_branch_target()),
                 };
                 self.end_block(f, term);
                 Ok(true)
@@ -1738,7 +1773,7 @@ impl Lifter {
     fn live_in(&mut self, f: &mut Function, b: usize, n: usize) -> ValueId {
         let reg = if n < NGPR { n as u8 } else { XMM_PARAM + (n - NGPR) as u8 };
         let id = f.insts.push(Inst { kind: InstKind::BlockParam(reg), ty: TyId::B8 });
-        f.origin.push(self.leaders[b]);
+        f.origin.push(self.block_ip(b));
         self.state[b].params[n] = Some(id);
         self.state[b].out[n] = Some(id);
         id
@@ -1756,7 +1791,7 @@ impl Lifter {
             st.flags_read = read;
         }
         let id = f.insts.push(Inst { kind: InstKind::BlockParam(FLAG_PARAM), ty: TyId::BOOL });
-        f.origin.push(self.leaders[b]);
+        f.origin.push(self.block_ip(b));
         self.state[b].cparams[cc as usize] = Some(id);
         id
     }

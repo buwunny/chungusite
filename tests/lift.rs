@@ -35,7 +35,7 @@ bb3(v17):
 #[test]
 fn reports_unsupported_instead_of_guessing() {
     let mut a = CodeAssembler::new(64).unwrap();
-    a.cpuid().unwrap(); // no data-flow model of it at all
+    a.rdtsc().unwrap(); // no data-flow model of it at all
     a.ret().unwrap();
     let code = a.assemble(0).unwrap();
     let mut f = Function::with_capacity(8, 2);
@@ -473,4 +473,33 @@ fn string_cmpsd_and_movsd_are_not_the_sse_ones() {
         let err = Lifter::new().lift(&code, 0, &mut f).unwrap_err();
         assert!(matches!(err, LiftError::Unsupported { ip: 0, .. }), "{err:?}");
     }
+}
+
+#[test]
+fn cpuid_and_xgetbv_ask_the_cpu() {
+    let out = ir(|a| {
+        a.cpuid().unwrap();
+        a.add(eax, ebx).unwrap();
+        a.add(ecx, edx).unwrap();
+        a.xgetbv().unwrap();
+        a.ret().unwrap();
+    });
+    for op in ["Lane(Cpuid, 0)", "Lane(Cpuid, 1)", "Lane(Cpuid, 2)", "Lane(Cpuid, 3)", "Lane(Xgetbv, 0)", "Lane(Xgetbv, 3)"] {
+        assert!(out.contains(op), "{op} missing:\n{out}");
+    }
+}
+
+#[test]
+fn conditional_branch_out_of_the_function_is_a_tail_call() {
+    // test rdi, rdi ; jne <f.cold at 0x5000> ; mov eax, 1 ; ret
+    let out = ir(|a| {
+        a.test(rdi, rdi).unwrap();
+        a.jne(0x5000).unwrap();
+        a.mov(eax, 1).unwrap();
+        a.ret().unwrap();
+    });
+    let tail = out.lines().position(|l| l.contains("tailcall")).unwrap_or_else(|| panic!("no tail call:\n{out}"));
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[..tail].iter().any(|l| l.contains("const 0x5000")), "{out}");
+    assert!(out.contains("ret"), "{out}");
 }

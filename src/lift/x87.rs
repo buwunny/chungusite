@@ -303,7 +303,7 @@ impl Lifter {
                     }
                     self.fdepth_in[b.index()] = Some(depth.clamp(0, 8) as u8);
                 }
-                if at >= end || dec.set_position((at - ip) as usize).is_err() {
+                if !(ip..end).contains(&at) || dec.set_position((at - ip) as usize).is_err() {
                     break;
                 }
                 dec.set_ip(at);
@@ -311,7 +311,8 @@ impl Lifter {
                 if insn.is_invalid() {
                     break;
                 }
-                depth += depth_change(insn.mnemonic());
+                // (random bytes can push or pop any number of times)
+                depth = (depth + depth_change(insn.mnemonic())).clamp(-1, 9);
                 at = insn.next_ip();
                 match insn.flow_control() {
                     FlowControl::Call | FlowControl::IndirectCall => depth = 0,

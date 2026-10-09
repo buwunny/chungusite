@@ -609,3 +609,31 @@ fn many_globals_do_not_crowd_out_the_frame() {
     assert!(a.roots.iter().any(|r| matches!(r, Root::Frame(_))), "{:?}", a.roots);
     assert_eq!(raw_frame(&p, 1), []);
 }
+
+// ---- readability (roadmap step 4) ----
+
+#[test]
+fn each_path_returns_on_its_own() {
+    // f(p) = if p == 0 { 0 } else if *p != 5 { *p } else { 7 }: three paths into
+    // one `ret`, two of them from inside the `else`
+    let (p, _) = program(&[("f", &|a| {
+        let mut zero = a.create_label();
+        let mut done = a.create_label();
+        a.test(rdi, rdi).unwrap();
+        a.je(zero).unwrap();
+        a.mov(rax, qword_ptr(rdi)).unwrap();
+        a.cmp(rax, 5).unwrap();
+        a.jne(done).unwrap();
+        a.mov(eax, 7).unwrap();
+        a.jmp(done).unwrap();
+        a.set_label(&mut zero).unwrap();
+        a.xor(eax, eax).unwrap();
+        a.set_label(&mut done).unwrap();
+        a.ret().unwrap();
+    })]);
+    let src = emitted(&p, Mode::Fast);
+    assert!(!src[0].contains("'b"), "{}", src[0]);
+    assert_eq!(src[0].matches("return ").count(), 3, "{}", src[0]);
+    // the loaded value is declared where it is loaded, not up front
+    assert!(!src[0].contains("let mut v"), "{}", src[0]);
+}

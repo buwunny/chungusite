@@ -1001,3 +1001,192 @@ impl Printer {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Declarations
+
+/// Which of `vars` (names of variables declared up front, `let mut vN = 0;`)
+/// can be declared where they are assigned instead: assigned by exactly one
+/// statement (`vN = e;`), and used only after it in the same list of
+/// statements, or nested inside what follows it there. That statement becomes
+/// `let vN: T = e;` (with `types[k]` for `vars[k]`), and the caller drops the
+/// up-front declarations of the ones this returns `true` for.
+pub fn declare_in_place(nodes: &mut [Node], vars: &[&str], types: &[String]) -> Vec<bool> {
+    let index: std::collections::HashMap<&str, usize> = vars.iter().enumerate().map(|(k, &v)| (v, k)).collect();
+    let mut seen = vec![Seen::default(); vars.len()];
+    let mut path = Vec::new();
+    scan(nodes, &index, &mut path, &mut seen);
+    let ok: Vec<bool> = seen
+        .iter()
+        .map(|s| match &s.assign {
+            Some(a) if s.assigns == 1 => {
+                let (scope, at) = a.split_at(a.len() - 1);
+                s.uses.iter().all(|u| u.len() > scope.len() && u.starts_with(scope) && u[scope.len()] > at[0])
+            }
+            _ => false,
+        })
+        .collect();
+    for (k, s) in seen.iter().enumerate() {
+        if ok[k] {
+            let line = at_path(nodes, s.assign.as_ref().unwrap());
+            if let Node::Line(l) = line {
+                *l = format!("let {}: {} = {}", vars[k], types[k], &l[vars[k].len() + 3..]);
+            }
+        }
+    }
+    ok
+}
+
+#[derive(Clone, Default)]
+struct Seen {
+    /// Statements that assign it (`vN = e;` lines count, anything else makes it
+    /// ineligible by counting twice).
+    assigns: usize,
+    /// Where the `vN = e;` line is: indices into nested statement lists, each
+    /// list's index followed by which of the node's lists (or its condition) it is.
+    assign: Option<Vec<u32>>,
+    uses: Vec<Vec<u32>>,
+}
+
+/// Which list of a node a path goes into, after the node's index.
+const COND: u32 = u32::MAX;
+
+fn scan(nodes: &[Node], index: &std::collections::HashMap<&str, usize>, path: &mut Vec<u32>, seen: &mut [Seen]) {
+    for (i, n) in nodes.iter().enumerate() {
+        path.push(i as u32);
+        let text = |s: &str, line: bool, sub: Option<u32>, path: &mut Vec<u32>, seen: &mut [Seen]| {
+            for (at, name) in idents(s) {
+                let Some(&k) = index.get(name) else { continue };
+                let rest = &s[at + name.len()..];
+                let assigning = rest.starts_with(" = ") || (!line && at < s.find(" = ").unwrap_or(0));
+                if let Some(x) = sub {
+                    path.push(x);
+                }
+                if assigning && line && at == 0 {
+                    seen[k].assigns += 1;
+                    seen[k].assign = Some(path.clone());
+                } else if assigning {
+                    seen[k].assigns += 2;
+                } else {
+                    seen[k].uses.push(path.clone());
+                }
+                if sub.is_some() {
+                    path.pop();
+                }
+            }
+        };
+        match n {
+            Node::Line(s) => text(s, true, None, path, seen),
+            // edge copies assign on the left
+            Node::Copy(s) => text(s, false, None, path, seen),
+            Node::Exit(s) => text(s, false, None, path, seen),
+            Node::Break(_) | Node::Continue(_) => {}
+            Node::If { c, then, els } => {
+                text(c, true, Some(COND), path, seen);
+                for (x, l) in [then, els].into_iter().enumerate() {
+                    path.push(x as u32);
+                    scan(l, index, path, seen);
+                    path.pop();
+                }
+            }
+            Node::While { c, body, .. } => {
+                text(c, true, Some(COND), path, seen);
+                path.push(0);
+                scan(body, index, path, seen);
+                path.pop();
+            }
+            Node::Loop { body, .. } | Node::Block { body, .. } => {
+                path.push(0);
+                scan(body, index, path, seen);
+                path.pop();
+            }
+            Node::Dispatch { arms } => {
+                for (x, (_, l)) in arms.iter().enumerate() {
+                    path.push(x as u32);
+                    scan(l, index, path, seen);
+                    path.pop();
+                }
+            }
+        }
+        path.pop();
+    }
+}
+
+/// The node at a path from `scan`.
+fn at_path<'a>(nodes: &'a mut [Node], path: &[u32]) -> &'a mut Node {
+    let n = &mut nodes[path[0] as usize];
+    if path.len() == 1 {
+        return n;
+    }
+    let list: &mut [Node] = match n {
+        Node::If { then, els, .. } => if path[1] == 0 { then } else { els },
+        Node::While { body, .. } | Node::Loop { body, .. } | Node::Block { body, .. } => body,
+        Node::Dispatch { arms } => &mut arms[path[1] as usize].1,
+        _ => unreachable!("a path into a statement"),
+    };
+    at_path(list, &path[2..])
+}
+
+/// The identifiers in `s` (outside string literals) with their offsets.
+fn idents(s: &str) -> impl Iterator<Item = (usize, &str)> {
+    let b = s.as_bytes();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut i = 0;
+    let mut quoted = false;
+    std::iter::from_fn(move || {
+        while i < b.len() {
+            let c = b[i];
+            if quoted {
+                if c == b'\\' {
+                    i += 1;
+                } else if c == b'"' {
+                    quoted = false;
+                }
+                i += 1;
+                continue;
+            }
+            if c == b'"' {
+                quoted = true;
+                i += 1;
+                continue;
+            }
+            if word(c) && (i == 0 || !word(b[i - 1])) {
+                let start = i;
+                while i < b.len() && word(b[i]) {
+                    i += 1;
+                }
+                return Some((start, &s[start..i]));
+            }
+            i += 1;
+        }
+        None
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(s: &str) -> Node {
+        Node::Line(s.to_string())
+    }
+
+    #[test]
+    fn a_variable_is_declared_where_it_is_assigned_only_if_its_uses_follow() {
+        // v1: assigned, then used after it in the same list and in a nested `if`.
+        // v2: assigned inside a loop, used after the loop. v3: assigned on two
+        // edges. v4: used in a loop condition before its assignment in the body.
+        let mut nodes = vec![
+            line("v1 = f(); // 0x1"),
+            Node::If { c: "v1 != 0".into(), then: vec![Node::Exit("return v1;".into())], els: vec![] },
+            Node::Loop { head: 1, body: vec![line("v2 = g(v1);"), Node::Break(Label::Loop(1))] },
+            Node::Copy("v3 = v2;".into()),
+            Node::If { c: "v2 == 0".into(), then: vec![Node::Copy("v3 = 1_u64;".into())], els: vec![] },
+            Node::While { head: 2, c: "v4 != 0".into(), body: vec![line("v4 = h(v3);")] },
+        ];
+        let ok = declare_in_place(&mut nodes, &["v1", "v2", "v3", "v4"], &vec!["u64".to_string(); 4]);
+        assert_eq!(ok, [true, false, false, false]);
+        assert!(matches!(&nodes[0], Node::Line(l) if l == "let v1: u64 = f(); // 0x1"));
+        assert!(matches!(&nodes[2], Node::Loop { body, .. } if matches!(&body[0], Node::Line(l) if l == "v2 = g(v1);")));
+    }
+}

@@ -20,10 +20,12 @@ fn branch_into_middle_of_instruction_is_an_error() {
 }
 
 #[test]
-fn conditional_branch_out_of_range_is_an_error() {
-    // test rdi, rdi ; je +0x7f (past the end)
+fn conditional_branch_out_of_range_is_a_tail_call() {
+    // test rdi, rdi ; je +0x7f (past the end, another function's .cold part) ; ret
     let code = [0x48, 0x85, 0xFF, 0x74, 0x7F, 0xC3];
-    assert_eq!(lift(&code).0, Err(LiftError::BranchOutOfRange { ip: 0x1003, target: 0x1084 }));
+    let (r, f) = lift(&code);
+    r.unwrap();
+    assert!(f.blocks.iter().any(|(_, b)| matches!(b.term, Terminator::TailCall { .. })));
 }
 
 #[test]

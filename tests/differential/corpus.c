@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <emmintrin.h>
 #include <cpuid.h>
+#include <immintrin.h>
 
 #define NOINLINE __attribute__((noinline))
 
@@ -706,6 +707,29 @@ void simd_saturate(uint8_t *p) {
     r = _mm_xor_si128(r, _mm_adds_epi16(a, c));
     r = _mm_or_si128(r, _mm_and_si128(_mm_avg_epu8(a, c), _mm_max_epi16(b, c)));
     _mm_storeu_si128((__m128i *)(p + 48), _mm_andnot_si128(_mm_cmpgt_epi8(a, b), r));
+}
+
+// AVX2: 32-byte registers, each instruction working on both 16-byte halves.
+// @diff avx2_lanes: u32(buf:128)
+__attribute__((target("avx2"))) uint32_t avx2_lanes(uint8_t *p) {
+    __m256i a = _mm256_loadu_si256((const __m256i *)p);
+    __m256i b = _mm256_loadu_si256((const __m256i *)(p + 32));
+    __m256i c = _mm256_loadu_si256((const __m256i *)(p + 64));
+    __m256i r = _mm256_xor_si256(_mm256_add_epi8(a, b), _mm256_sub_epi32(c, a));
+    r = _mm256_or_si256(r, _mm256_andnot_si256(b, _mm256_cmpgt_epi8(c, b)));
+    _mm256_storeu_si256((__m256i *)(p + 96), _mm256_and_si256(r, _mm256_max_epu8(a, c)));
+    return (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, c));
+}
+
+// The first byte equal to `c` in 64 bytes, as memchr finds it; 64 if none.
+// @diff avx2_find: u64(buf:64, u8:0..4)
+__attribute__((target("avx2"))) uint64_t avx2_find(const uint8_t *p, uint8_t c) {
+    __m256i n = _mm256_set1_epi8((char)c);
+    for (uint64_t k = 0; k < 64; k += 32) {
+        uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(p + k)), n));
+        if (m) return k + __builtin_ctz(m);
+    }
+    return 64;
 }
 
 // Feature checks ask the CPU: cpuid's leaf 0 and 1 (the vendor, family and

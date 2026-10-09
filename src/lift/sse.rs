@@ -5,7 +5,9 @@
 //! inserts are built from shifts and masks on the halves, and scalar float ops
 //! (`addsd`, `addss`) change only the low lane. A VEX (AVX) encoding of the same
 //! instruction on xmm registers is lifted the same way, with its separate first
-//! source; ymm registers are unsupported.
+//! source. The upper halves of the ymm registers are another 16 pairs, tracked
+//! only in functions that use a ymm register; an AVX2 instruction that works
+//! on each 128-bit half alone is lifted once per half.
 use super::*;
 use iced_x86::EncodingKind;
 
@@ -26,7 +28,7 @@ pub(super) fn handled(m: Mnemonic) -> bool {
                 | Pmovmskb | Vpmovmskb | Movmskps | Movmskpd | Pshufd | Pshuflw | Pshufhw | Shufps | Shufpd | Pinsrw
                 | Pextrw | Cmpsd | Cmpss | Cmppd | Cmpps | Ucomisd | Comisd | Ucomiss | Comiss | Cvtsi2sd | Cvtsi2ss
                 | Cvttsd2si | Cvtsd2si | Cvttss2si | Cvtss2si | Cvtss2sd | Cvtsd2ss | Sqrtsd | Sqrtss | Sqrtpd | Sqrtps
-                | Packsswb | Packuswb | Packssdw | Packusdw
+                | Packsswb | Packuswb | Packssdw | Packusdw | Vpbroadcastb | Vpbroadcastw | Vpbroadcastd | Vpbroadcastq
         )
 }
 
@@ -104,8 +106,122 @@ fn float_op(m: Mnemonic) -> Option<(LaneOp, u8, bool)> {
 type Pair = (ValueId, ValueId);
 
 impl Lifter {
-    /// Lift an SSE instruction (`handled`).
+    /// Lift an SSE instruction (`handled`). A ymm instruction that works on
+    /// each 128-bit half alone is lifted twice, once per half.
     pub(super) fn sse(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
+        use Mnemonic::*;
+        let m = i.mnemonic();
+        let ymm = (0..i.op_count()).any(|k| i.op_kind(k) == OpKind::Register && i.op_register(k).is_ymm());
+        if let Vpbroadcastb | Vpbroadcastw | Vpbroadcastd | Vpbroadcastq = m {
+            return self.broadcast(f, i);
+        }
+        if ymm {
+            if matches!(m, Vpmovmskb) && i.op1_register().is_ymm() {
+                // 16 mask bits from each half
+                let mut parts = [ValueId::from_u32(0); 2];
+                for (upper, part) in [false, true].into_iter().zip(&mut parts) {
+                    self.upper = upper;
+                    let n = self.xmm_of(i.op1_register())?;
+                    let (lo, hi) = self.xmm_get(f, n)?;
+                    let lo = self.emit(f, InstKind::Un { op: UnOp::Lane(LaneUn::MoveMask, 1), v: lo }, TyId::B8);
+                    let hi = self.emit(f, InstKind::Un { op: UnOp::Lane(LaneUn::MoveMask, 1), v: hi }, TyId::B8);
+                    let k = self.konst(f, 8, TyId::B1);
+                    let hi = self.bin(f, BinOp::Shl, hi, k);
+                    *part = self.bin(f, BinOp::Or, lo, hi);
+                }
+                self.upper = false;
+                let k = self.konst(f, 16, TyId::B1);
+                let hi = self.bin(f, BinOp::Shl, parts[1], k);
+                let v = self.bin(f, BinOp::Or, parts[0], hi);
+                let r = i.op0_register();
+                let v = if r.size() == 8 { v } else { self.emit(f, InstKind::Cast { kind: CastKind::Trunc, v }, TyId::B4) };
+                return self.write(f, r, v);
+            }
+            let in_lane = matches!(
+                m,
+                Vmovups | Vmovaps | Vmovdqu | Vmovdqa | Vmovupd | Vmovapd | Vpand | Vandps | Vandpd | Vpor | Vorps | Vorpd
+                    | Vpxor | Vxorps | Vxorpd | Vpandn | Vpcmpeqb | Vpcmpeqw | Vpcmpeqd
+            ) || lane_int(m).is_some();
+            if !in_lane || !(0..i.op_count()).all(|k| i.op_kind(k) != OpKind::Register || i.op_register(k).is_ymm()) {
+                return Err(self.unsupported());
+            }
+            self.sse_half(f, i)?;
+            self.upper = true;
+            let r = self.sse_half(f, i);
+            self.upper = false;
+            return r;
+        }
+        self.sse_half(f, i)?;
+        if self.ymm {
+            if m == Vzeroupper {
+                self.clear_upper(f, true);
+            } else if i.encoding() == EncodingKind::VEX && i.op0_kind() == OpKind::Register && i.op0_register().is_xmm() {
+                // a VEX instruction zeroes the rest of the ymm register it writes
+                let n = self.xmm_of(i.op0_register())?;
+                let z = self.konst(f, 0, TyId::B8);
+                self.upper = true;
+                self.xmm_set(n, (z, z));
+                self.upper = false;
+            }
+        }
+        Ok(())
+    }
+
+    /// vpbroadcastb/w/d/q: the low lane of an xmm register or memory in every
+    /// lane of the destination.
+    fn broadcast(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
+        let w: u32 = match i.mnemonic() {
+            Mnemonic::Vpbroadcastb => 1,
+            Mnemonic::Vpbroadcastw => 2,
+            Mnemonic::Vpbroadcastd => 4,
+            _ => 8,
+        };
+        let elem = match i.op1_kind() {
+            OpKind::Register => {
+                let n = self.xmm_of(i.op1_register())?;
+                self.xmm_get(f, n)?.0
+            }
+            OpKind::Memory => {
+                let p = self.ea(f, i)?;
+                let v = self.emit(f, InstKind::Load { ptr: p, align: 1, volatile: false }, TyId::unknown(w as usize));
+                if w == 8 { v } else { self.emit(f, InstKind::Cast { kind: CastKind::ZExt, v }, TyId::B8) }
+            }
+            _ => return Err(self.unsupported()),
+        };
+        let v = match w {
+            8 => elem,
+            _ => {
+                let mask = self.konst(f, (1u64 << (8 * w)) - 1, TyId::B8);
+                let low = self.bin(f, BinOp::And, elem, mask);
+                let ones = self.konst(f, u64::MAX / ((1u64 << (8 * w)) - 1), TyId::B8);
+                self.bin(f, BinOp::Mul, low, ones)
+            }
+        };
+        let d = self.xmm_of(i.op0_register())?;
+        self.xmm_set(d, (v, v));
+        if self.ymm {
+            let hi = match i.op0_register().is_ymm() {
+                true => v,
+                false => self.konst(f, 0, TyId::B8),
+            };
+            self.upper = true;
+            self.xmm_set(d, (hi, hi));
+            self.upper = false;
+        }
+        Ok(())
+    }
+
+    /// The upper halves of all ymm registers, set to zero or undefined.
+    pub(super) fn clear_upper(&mut self, f: &mut Function, zero: bool) {
+        let v = match zero {
+            true => self.konst(f, 0, TyId::B8),
+            false => self.emit(f, InstKind::Undef, TyId::B8),
+        };
+        self.state[self.cur].out[UPPER..NREG].fill(Some(v));
+    }
+
+    /// One 128-bit half of an SSE instruction (`sse`).
+    fn sse_half(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
         use Mnemonic::*;
         let m = i.mnemonic();
         // `movsd` and `cmpsd` are also string instructions (without a rep prefix
@@ -418,7 +534,7 @@ impl Lifter {
             Some(v) => v,
             _ => l.emit(f, InstKind::Undef, TyId::B8),
         };
-        (half(self, f, NGPR + 2 * n), half(self, f, NGPR + 2 * n + 1))
+        (half(self, f, self.slot(n)), half(self, f, self.slot(n) + 1))
     }
 
     /// Is this a VEX (AVX) encoding, with its first source separate from the destination?
@@ -544,9 +660,9 @@ impl Lifter {
                 self.xmm_get(f, n)
             }
             OpKind::Memory => {
-                let p = self.ea(f, i)?;
+                let p = self.ea_half(f, i)?;
                 match i.memory_size().size() {
-                    16 => {
+                    16 | 32 => {
                         let lo = self.emit(f, InstKind::Load { ptr: p, align: 1, volatile: false }, TyId::B8);
                         let p8 = self.emit(f, InstKind::PtrOffset { base: p, index: None, scale: 1, disp: 8 }, TyId::PTR);
                         let hi = self.emit(f, InstKind::Load { ptr: p8, align: 1, volatile: false }, TyId::B8);
@@ -566,6 +682,16 @@ impl Lifter {
             }
             _ => Err(self.unsupported()),
         }
+    }
+
+    /// The memory operand's address, 16 bytes on for the upper half of a ymm
+    /// instruction.
+    fn ea_half(&mut self, f: &mut Function, i: &Instruction) -> Result<ValueId, LiftError> {
+        let p = self.ea(f, i)?;
+        Ok(match self.upper {
+            true => self.emit(f, InstKind::PtrOffset { base: p, index: None, scale: 1, disp: 16 }, TyId::PTR),
+            false => p,
+        })
     }
 
     /// movss: a load zeroes the rest of the register, a register move only
@@ -629,7 +755,7 @@ impl Lifter {
             }
             (OpKind::Memory, OpKind::Register) => {
                 let (lo, hi) = { let n = self.xmm_of(i.op1_register())?; self.xmm_get(f, n) }?;
-                let p = self.ea(f, i)?;
+                let p = self.ea_half(f, i)?;
                 let p8 = self.emit(f, InstKind::PtrOffset { base: p, index: None, scale: 1, disp: 8 }, TyId::PTR);
                 self.emit(f, InstKind::Store { ptr: p, val: lo, align: 1 }, TyId::UNIT);
                 self.emit(f, InstKind::Store { ptr: p8, val: hi, align: 1 }, TyId::UNIT);
@@ -696,13 +822,20 @@ impl Lifter {
     }
 
     pub(super) fn xmm_of(&self, r: Register) -> Result<usize, LiftError> {
-        let n = (r as usize).wrapping_sub(Register::XMM0 as usize);
+        let base = if r.is_ymm() { Register::YMM0 } else { Register::XMM0 };
+        let n = (r as usize).wrapping_sub(base as usize);
         if n < 16 { Ok(n) } else { Err(self.unsupported()) }
+    }
+
+    /// Where xmm register `n`'s low half is in the register file, or the upper
+    /// half of ymm `n`'s while lifting that.
+    fn slot(&self, n: usize) -> usize {
+        if self.upper { UPPER + 2 * n } else { NGPR + 2 * n }
     }
 
     /// The value of xmm register `n`: a live-in pair if this block hasn't set it.
     pub(super) fn xmm_get(&mut self, f: &mut Function, n: usize) -> Result<(ValueId, ValueId), LiftError> {
-        let (lo, hi) = (NGPR + 2 * n, NGPR + 2 * n + 1);
+        let (lo, hi) = (self.slot(n), self.slot(n) + 1);
         let lo = match self.state[self.cur].out[lo] {
             Some(v) => v,
             None => self.live_in(f, self.cur, lo),
@@ -715,9 +848,10 @@ impl Lifter {
     }
 
     pub(super) fn xmm_set(&mut self, n: usize, (lo, hi): (ValueId, ValueId)) {
+        let k = self.slot(n);
         let st = &mut self.state[self.cur];
-        st.out[NGPR + 2 * n] = Some(lo);
-        st.out[NGPR + 2 * n + 1] = Some(hi);
+        st.out[k] = Some(lo);
+        st.out[k + 1] = Some(hi);
     }
 
 }

@@ -24,12 +24,19 @@ use iced_x86::{ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction,
 mod sse;
 
 const NGPR: usize = 16;
-/// The register file: the 16 GPRs, then xmm0-15 as (low, high) qword pairs.
-const NREG: usize = NGPR + 32;
+/// The register file: the 16 GPRs, then xmm0-15 as (low, high) qword pairs,
+/// then the upper halves of ymm0-15 the same way.
+const NREG: usize = NGPR + 64;
+/// Where the upper halves of the ymm registers start in the register file.
+const UPPER: usize = NGPR + 32;
 type RegFile = [Option<ValueId>; NREG];
 /// `BlockParam` register number of xmm register half `k` (2 * xmm + high).
 /// Float argument `j` is the low half of xmm `j`, `XMM_PARAM + 2 * j`.
 pub const XMM_PARAM: u8 = 0xc0;
+/// `BlockParam` register number of the upper half `k` of the ymm registers
+/// (2 * ymm + high). Never a parameter of the entry block: nothing passes or
+/// preserves them.
+const YMM_PARAM: u8 = 0xa0;
 /// Register number (in `CallOut`, `BlockParam`) of xmm0's low half: the first
 /// float argument, and where a float result is returned.
 pub const XMM0: u8 = XMM_PARAM;
@@ -192,6 +199,13 @@ pub struct Lifter {
     /// out from the callees' signatures. Most functions are like that, and
     /// threading 32 xmm halves through them doubles the lifting time.
     xmm: bool,
+    /// Does the function use a ymm register? Then the upper halves are
+    /// tracked too: undefined at the entry and after a call, zeroed by a VEX
+    /// instruction that writes the xmm part.
+    ymm: bool,
+    /// Lifting the upper half of a ymm instruction: xmm register `n` means
+    /// the upper half of ymm `n`, and memory 16 bytes further on.
+    upper: bool,
     /// Pass 2: the case index, read where the current block loads from its table.
     switch_index: Option<ValueId>,
     /// Each block that ends in a `Switch`, and its table (index into `tables`).
@@ -235,6 +249,8 @@ impl Lifter {
             rip_lea: [0; 16],
             starts: Vec::with_capacity(256),
             xmm: false,
+            ymm: false,
+            upper: false,
             switch_index: None,
             switches: Vec::with_capacity(4),
             stubs: Vec::with_capacity(4),
@@ -288,7 +304,11 @@ impl Lifter {
         let mut next_leader = 1;
         let mut open = true;
         self.fall = None;
+        self.upper = false;
         self.begin_block(0, f);
+        if self.ymm {
+            self.clear_upper(f, false);
+        }
         while dec.can_decode() {
             dec.decode_out(&mut self.insn);
             self.ip = self.insn.ip();
@@ -354,6 +374,7 @@ impl Lifter {
         self.starts.clear();
         self.stubs.clear();
         self.xmm = false;
+        self.ymm = false;
         let mut dec = Decoder::with_ip(64, code, ip, DecoderOptions::NONE);
         while dec.can_decode() {
             dec.decode_out(&mut self.insn);
@@ -368,6 +389,7 @@ impl Lifter {
             }
             let i = &self.insn;
             self.xmm |= (0..i.op_count()).any(|k| i.op_kind(k) == OpKind::Register && i.op_register(k).is_vector_register());
+            self.ymm |= (0..i.op_count()).any(|k| i.op_kind(k) == OpKind::Register && i.op_register(k).is_ymm());
             match self.insn.flow_control() {
                 FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch => {
                     let t = self.insn.near_branch_target();
@@ -1399,6 +1421,9 @@ impl Lifter {
             let v = self.emit(f, InstKind::CallOut { call, reg: XMM_PARAM + k as u8 }, TyId::B8);
             self.state[self.cur].out[NGPR + k] = Some(v);
         }
+        if self.ymm {
+            self.clear_upper(f, false);
+        }
         self.flags = Flags::Unknown;
         Ok(())
     }
@@ -1771,7 +1796,11 @@ impl Lifter {
     /// Create a block parameter for GPR `n` in block `b`. Not part of the block's
     /// instruction list; `finalize` lists it in `Block::params`.
     fn live_in(&mut self, f: &mut Function, b: usize, n: usize) -> ValueId {
-        let reg = if n < NGPR { n as u8 } else { XMM_PARAM + (n - NGPR) as u8 };
+        let reg = match n {
+            _ if n < NGPR => n as u8,
+            _ if n < UPPER => XMM_PARAM + (n - NGPR) as u8,
+            _ => YMM_PARAM + (n - UPPER) as u8,
+        };
         let id = f.insts.push(Inst { kind: InstKind::BlockParam(reg), ty: TyId::B8 });
         f.origin.push(self.block_ip(b));
         self.state[b].params[n] = Some(id);

@@ -27,10 +27,13 @@
 //! The raw result is correct but noisy, so `tidy` then removes what isn't needed:
 //! a `break`/`continue` that control would reach anyway by falling off the end,
 //! labeled blocks nothing breaks out of, and `if c { A } else { B }` where `A`
-//! always leaves (`if c { A } B`); and turns a loop that starts with
-//! `if c { break; }` into `while !c`. Labels are printed only where a plain
+//! always leaves (`if c { A } B`); turns a loop that starts with
+//! `if c { break; }` into `while !c`; and moves an arm that only assigns a join's
+//! variables in front of the `if` (`x = b; if c { A; x = a; }`), so the `if` has
+//! no `else` where the source most likely had none. Labels are printed only where a plain
 //! `break`/`continue` would not mean the same thing.
 use crate::cfg::Cfg;
+use crate::emit::mentions;
 use crate::expr::{self, not};
 use crate::ir::*;
 use std::fmt::Write;
@@ -47,6 +50,9 @@ pub enum Label {
 pub enum Node {
     /// A statement; control continues after it.
     Line(String),
+    /// Assignment of a block's parameters on an edge into it (`v3 = v1;`,
+    /// `(v3, v4) = (v1, 0_u64);`); control continues after it.
+    Copy(String),
     /// A statement that never continues (`return`, `panic!`, `todo!`).
     Exit(String),
     If { c: String, then: Vec<Node>, els: Vec<Node> },
@@ -602,7 +608,7 @@ fn uses(nodes: &[Node], l: Label) -> bool {
         Node::If { then, els, .. } => uses(then, l) || uses(els, l),
         Node::Loop { body, .. } | Node::While { body, .. } | Node::Block { body, .. } => uses(body, l),
         Node::Dispatch { arms } => arms.iter().any(|(_, a)| uses(a, l)),
-        Node::Line(_) | Node::Exit(_) => false,
+        Node::Line(_) | Node::Copy(_) | Node::Exit(_) => false,
     })
 }
 
@@ -614,7 +620,7 @@ fn diverges(nodes: &[Node]) -> bool {
         Some(Node::Block { label, body }) => diverges(body) && !uses(body, Label::Block(*label)),
         Some(Node::Loop { head, body }) => !uses_break(body, Label::Loop(*head)),
         Some(Node::Dispatch { arms }) => arms.iter().all(|(_, a)| diverges(a)),
-        Some(Node::Line(_) | Node::While { .. }) | None => false,
+        Some(Node::Line(_) | Node::Copy(_) | Node::While { .. }) | None => false,
     }
 }
 
@@ -773,6 +779,15 @@ fn level(nodes: Vec<Node>) -> Vec<Node> {
                         out.push(Node::If { c: not(&c), then: els, els: Vec::new() });
                         todo.extend(then.into_iter().rev());
                     }
+                    // `if c { A; x = a; } else { x = b; }` is `x = b; if c { A; x = a; }`
+                    _ if hoistable(&c, &els, &then, &todo) => {
+                        out.extend(els);
+                        out.push(Node::If { c, then, els: Vec::new() });
+                    }
+                    _ if hoistable(&c, &then, &els, &todo) => {
+                        out.extend(then);
+                        out.push(Node::If { c: not(&c), then: els, els: Vec::new() });
+                    }
                     _ => out.push(Node::If { c, then, els }),
                 }
             }
@@ -780,6 +795,78 @@ fn level(nodes: Vec<Node>) -> Vec<Node> {
         }
     }
     out
+}
+
+/// Can the arm `copies` of `if c { other } else { copies }` run before the `if`
+/// instead? It must be nothing but edge copies of values that are cheap and
+/// harmless to compute on the other path too (no call, no memory access, nothing
+/// that can fault), and nothing that runs after them on that path may read the
+/// variables they set: not the condition, not `other` (which may only overwrite
+/// them, as its own edge copies into the same join do), not the code after the
+/// `if` (`rest`). The other arm then needs no `else`, as in the source.
+fn hoistable(c: &str, copies: &[Node], other: &[Node], rest: &[Node]) -> bool {
+    let mut vars = Vec::new();
+    for n in copies {
+        let Node::Copy(line) = n else { return false };
+        let Some((lhs, rhs)) = line.split_once(" = ") else { return false };
+        if may_fault(rhs) || calls(rhs) {
+            return false;
+        }
+        vars.extend(lhs.trim_matches(|ch| ch == '(' || ch == ')').split(", ").map(str::to_owned));
+    }
+    // `other` must leave by falling off its end, through its own copies to the
+    // same variables: then both paths reach the join with what they did before.
+    // (A copy that would assign a variable itself is left out, so a variable
+    // `other` doesn't copy may still be read at the join with its old value.)
+    let Some(Node::Copy(last)) = other.last() else { return false };
+    let Some((lhs, _)) = last.split_once(" = ") else { return false };
+    let set: Vec<&str> = lhs.trim_matches(|ch| ch == '(' || ch == ')').split(", ").collect();
+    !copies.is_empty()
+        && !jumps(other)
+        && vars.iter().all(|v| set.contains(&v.as_str()) && !mentions(c, v) && !reads(other, v) && !reads(rest, v))
+}
+
+/// Does anything in `nodes` leave by `break` or `continue`?
+fn jumps(nodes: &[Node]) -> bool {
+    nodes.iter().any(|n| match n {
+        Node::Break(_) | Node::Continue(_) => true,
+        Node::If { then, els, .. } => jumps(then) || jumps(els),
+        Node::Loop { body, .. } | Node::While { body, .. } | Node::Block { body, .. } => jumps(body),
+        Node::Dispatch { .. } => true,
+        Node::Line(_) | Node::Copy(_) | Node::Exit(_) => false,
+    })
+}
+
+/// Does `e` call a function (anything but a method like `.wrapping_add(..)` or a
+/// macro like `addr_of!(..)`)?
+fn calls(e: &str) -> bool {
+    let b = e.as_bytes();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    (0..b.len()).any(|i| {
+        if b[i] != b'(' || i == 0 || !word(b[i - 1]) {
+            return false;
+        }
+        let mut j = i;
+        while j > 0 && word(b[j - 1]) {
+            j -= 1;
+        }
+        j == 0 || b[j - 1] != b'.'
+    })
+}
+
+/// Does anything in `nodes` read the variable `v`? Being assigned by an edge copy
+/// isn't a read.
+fn reads(nodes: &[Node], v: &str) -> bool {
+    nodes.iter().any(|n| match n {
+        Node::Line(s) | Node::Exit(s) => mentions(s, v),
+        // the last copy of `other` may assign `v` (that's the point), but not read it
+        Node::Copy(s) => s.split_once(" = ").is_none_or(|(_, rhs)| mentions(rhs, v)),
+        Node::If { c, then, els } => mentions(c, v) || reads(then, v) || reads(els, v),
+        Node::While { c, body, .. } => mentions(c, v) || reads(body, v),
+        Node::Loop { body, .. } | Node::Block { body, .. } => reads(body, v),
+        Node::Dispatch { arms } => arms.iter().any(|(_, a)| reads(a, v)),
+        Node::Break(_) | Node::Continue(_) => false,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -854,7 +941,7 @@ impl Printer {
         let ind = "    ".repeat(depth);
         for n in nodes {
             match n {
-                Node::Line(s) | Node::Exit(s) => {
+                Node::Line(s) | Node::Copy(s) | Node::Exit(s) => {
                     let _ = writeln!(out, "{ind}{s}");
                 }
                 Node::Break(l) => {

@@ -2349,7 +2349,7 @@ impl Source for Emitter<'_> {
     }
 
     fn edge(&mut self, to: BlockId, args: &[ValueId]) -> Vec<Node> {
-        self.assign(to, args).map(Node::Line).into_iter().collect()
+        self.assign(to, args).map(Node::Copy).into_iter().collect()
     }
 
     fn cond(&self, c: ValueId) -> String {
@@ -2375,7 +2375,7 @@ impl Source for Emitter<'_> {
 }
 
 /// `e` uses the variable `name` (as a whole identifier).
-fn mentions(e: &str, name: &str) -> bool {
+pub(crate) fn mentions(e: &str, name: &str) -> bool {
     let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
     e.match_indices(name).any(|(i, _)| {
         !e[..i].ends_with(word) && !e[i + name.len()..].starts_with(word)

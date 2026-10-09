@@ -72,7 +72,7 @@ Each function header says how many of its accesses are safe. Byte slices remain 
 
 `--check` compiles the safe-mode output with rustc (in parallel batches; about two minutes for 18,000 functions on 4 cores) and emits every function rustc rejects in fast mode instead, which always compiles, then checks again.
 
-Control flow is structured ([`src/structure.rs`](../src/structure.rs)): branches become `if`/`else`, loops become `while` or `loop` with `break`, `continue` and early `return`, and block parameters become mutable variables assigned on each edge. A loop's exits are emitted after it, so leaving it is a `break`. A value used once, in the block that computes it, is written into its use instead of getting a `let` (a load only when nothing between the two writes memory or calls), and constants are literals, so a loop whose test comes first reads as a `while`:
+Control flow is structured ([`src/structure.rs`](../src/structure.rs)): branches become `if`/`else`, loops become `while` or `loop` with `break`, `continue` and early `return`, and block parameters become mutable variables assigned on each edge. An arm that does nothing but assign them (with values that need no call or memory access) runs before the `if` instead, so the other arm needs no `else`: `v = b; if a != 0 { *p = a; v = c; }`, as the source would have it. A loop's exits are emitted after it, so leaving it is a `break`. A value used once, in the block that computes it, is written into its use instead of getting a `let` (a load only when nothing between the two writes memory or calls), and constants are literals, so a loop whose test comes first reads as a `while`:
 
 ```rust
 pub unsafe fn find(mut rdi: u64, mut rsi: u64, mut rdx: u64) -> u64 {

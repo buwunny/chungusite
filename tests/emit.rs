@@ -152,6 +152,44 @@ fn main() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// An arm that only sets the join's variables runs before the `if` instead, so
+/// the other arm needs no `else`: `v = b; if a != 0 { *p = a; v = c * 3; }`.
+#[test]
+fn copy_only_arm_runs_before_the_if() {
+    // pick(a, b, c, p) = if a != 0 { *p = a; c * 3 + 1 } else { b + 1 }
+    let mut a = CodeAssembler::new(64).unwrap();
+    let (mut e, mut j) = (a.create_label(), a.create_label());
+    a.test(rdi, rdi).unwrap();
+    a.je(e).unwrap();
+    a.mov(qword_ptr(rcx), rdi).unwrap();
+    a.lea(rax, qword_ptr(rdx + rdx * 2)).unwrap();
+    a.jmp(j).unwrap();
+    a.set_label(&mut e).unwrap();
+    a.mov(rax, rsi).unwrap();
+    a.set_label(&mut j).unwrap();
+    a.add(rax, 1).unwrap();
+    a.ret().unwrap();
+    let pick = emit(&a.assemble(common::BASE).unwrap(), "pick", Mode::Fast);
+    assert!(!pick.contains("} else {"), "{pick}");
+
+    let main = r#"
+mod code { include!("code.rs"); }
+fn main() {
+    for (a, b, c) in [(0u64, 5u64, 7u64), (2, 5, 7), (9, 0, 0)] {
+        let mut slot = 0u64;
+        let got = unsafe { code::pick(a, b, c, &mut slot as *mut u64 as u64) };
+        assert_eq!(got, if a != 0 { c * 3 + 1 } else { b + 1 });
+        assert_eq!(slot, if a != 0 { a } else { 0 });
+    }
+}
+"#;
+    let dir = scratch("pick");
+    std::fs::write(dir.join("code.rs"), format!("{PRELUDE}{pick}").replace("#![allow", "#[allow")).unwrap();
+    rustc(&dir, "main.rs", main, &["-o", dir.join("run").to_str().unwrap()]);
+    let out = Command::new(dir.join("run")).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
 /// A jump table comes out as an `if`/`else if` chain on the case, or a `match`
 /// in a state machine, and computes the same thing in both modes.
 #[test]

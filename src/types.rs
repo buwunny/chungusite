@@ -934,7 +934,10 @@ fn ret_facts(f: &Function, cfg: &Cfg, returned: &[ValueId], evidence: &[i32], ad
     } else {
         all.bytes.max(all.konst)
     };
-    let boolish = all.boolish && all.bytes == 1;
+    // a tail call returns whatever its callee leaves in rax, all of it
+    let tail = cfg.rpo.iter().any(|&b| matches!(f.blocks[b].term, Terminator::TailCall { .. }));
+    let bytes = if tail { 8 } else { bytes };
+    let boolish = all.boolish && all.bytes == 1 && !tail;
     RetFacts { value: returned[0], bytes, boolish, evidence: ev, addr: returned.iter().any(|v| addr[v.index()]) }
 }
 

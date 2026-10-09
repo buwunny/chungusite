@@ -1126,3 +1126,8 @@ int64_t walk_ab(uint64_t x, int64_t n) { return walk_a(x, n) * 2 + 1; }
 // in registers: `va_arg` reads the rest from the caller's stack.
 // @diff call_vsum_many: i64(i64, i64, i64)
 int64_t call_vsum_many(int64_t a, int64_t b, int64_t c) { return vsum(8, a, b, c, a ^ b, b - c, c * 3, a + 7, b | 1); }
+
+// A constant on one path, a tail call's full 64-bit result on another.
+NOINLINE uint64_t big_mix(uint64_t x) { return x * 0x9E3779B97F4A7C15ull; }
+// @diff mix_or_zero: u64(u64, i64:-3..3)
+uint64_t mix_or_zero(uint64_t x, int64_t i) { if (i == -2) return 0; return big_mix(x + i); }

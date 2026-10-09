@@ -75,6 +75,11 @@ struct Cli {
     #[arg(long)]
     no_dwarf: bool,
 
+    /// Fail a function with an instruction the lifter has no model of, instead
+    /// of keeping that instruction as inline assembly (`asm!`).
+    #[arg(long)]
+    no_asm: bool,
+
     /// Safe mode: compile the output with rustc (in batches) and emit every
     /// function it rejects in fast mode instead, until everything compiles.
     #[arg(long)]
@@ -250,7 +255,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     if dataset && cli.no_dwarf {
         return Err("--emit dataset reads its labels from the debug info: it can't be combined with --no-dwarf".into());
     }
-    let build = BuildOptions { dwarf: !cli.no_dwarf, model, dataset };
+    let build = BuildOptions { asm: !cli.no_asm, dwarf: !cli.no_dwarf, model, dataset };
     let mut program = Program::build_with(inputs, file, cli.emit == Emit::RawIr, build);
     if dataset {
         let mut out = String::new();
@@ -471,6 +476,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 no_raw += (s.raw == 0) as usize;
                 safe_fns += body.starts_with("pub fn") as usize;
                 total.todo += s.todo;
+                total.asm += s.asm;
                 total.state_machines += s.state_machines;
                 let _ = ir;
             }
@@ -568,6 +574,9 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     }
     if total.state_machines > 0 {
         eprintln!("  {} with irreducible control flow, kept as a `loop {{ match bb }}` state machine", total.state_machines);
+    }
+    if total.asm > 0 {
+        eprintln!("  {} instructions the lifter has no model of, kept as inline assembly (`asm!`)", total.asm);
     }
     if total.todo > 0 {
         eprintln!("  {} todo!() left where the emitter can't express an instruction yet", total.todo);

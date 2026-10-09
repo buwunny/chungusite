@@ -194,7 +194,7 @@ fn decompile(file: &[u8], cases: &[Case], dwarf: bool) -> (Vec<Decompiled>, [Str
     let globals = Globals::new(&bin, used, &by_addr);
     let global_of = |addr: u64| globals.expr(addr);
     let global_end = |base: u64, at: u64| globals.end_expr(base, at);
-    let program = Program::build_with(inputs, Some(file), false, BuildOptions { dwarf, model: None, dataset: false });
+    let program = Program::build_with(inputs, Some(file), false, BuildOptions { asm: true, dwarf, model: None, dataset: false });
     let global_before = |addr: u64| globals.before_expr(addr);
     let opts = Options { global_of: &global_of, global_end: &global_end, global_before: &global_before, ..Options::default() };
     let [fast, safe] = [Mode::Fast, Mode::Safe].map(|m| program.emit_all_with(m, &opts));

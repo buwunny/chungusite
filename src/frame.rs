@@ -182,12 +182,6 @@ fn transfer(f: &Function, k: InstKind, o: &mut Offsets, record: bool) -> S {
             S::Not
         }
         Cmp { .. } | Const(_) | Undef | CallOut { .. } => S::Not,
-        Opaque { .. } => {
-            if record {
-                o.lost = true;
-            }
-            S::Not
-        }
         k => {
             if record {
                 let mut any = false;

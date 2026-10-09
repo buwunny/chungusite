@@ -100,9 +100,12 @@ pub struct Program {
     got_addr: HashMap<u64, u64>,
 }
 
-/// How `Program::build_with` recovers types.
+/// How `Program::build_with` lifts functions and recovers types.
 #[derive(Copy, Clone)]
 pub struct BuildOptions<'a> {
+    /// Keep an instruction the lifter has no model of as inline assembly
+    /// (`Lifter::asm`) instead of failing its function.
+    pub asm: bool,
     /// Use DWARF debug info when the file has it.
     pub dwarf: bool,
     /// Proposes argument and return types; the facts accept or reject them.
@@ -113,7 +116,7 @@ pub struct BuildOptions<'a> {
 
 impl Default for BuildOptions<'_> {
     fn default() -> Self {
-        BuildOptions { dwarf: true, model: None, dataset: false }
+        BuildOptions { asm: true, dwarf: true, model: None, dataset: false }
     }
 }
 
@@ -316,6 +319,7 @@ impl Program {
                         let mut l = Lifter::new();
                         l.track_exits = true;
                         l.thread_pointer = thread_pointer;
+                        l.asm = opts.asm;
                         l
                     },
                     |lifter, x| {
@@ -485,6 +489,24 @@ impl Program {
                         stack_args[*j] = stack_args[*j].max(g.2);
                     }
                 }
+            }
+        }
+        // A tail call passes on the caller's own stack arguments, where the
+        // callee reads its own: the caller takes as many as the callee does.
+        loop {
+            let mut changed = false;
+            for (i, f) in funcs.iter().enumerate() {
+                for (t, s) in f.targets.iter().zip(&f.sites) {
+                    if let (Target::Func(j), Site::Tail(_)) = (t, s) {
+                        if stack_args[*j] > stack_args[i] {
+                            stack_args[i] = stack_args[*j];
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
             }
         }
 

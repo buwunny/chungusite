@@ -14,6 +14,7 @@ chungusite --hex "48 8b 47 08 c3"          # raw bytes, loaded at 0x1000, no fil
 chungusite ./prog --cargo prog-rs          # a Cargo project: cd prog-rs && cargo run -- ARGS
 chungusite ./prog -j 1                     # one worker thread (default: one per CPU)
 chungusite ./prog --no-dwarf               # ignore debug info: infer every type
+chungusite ./prog --no-asm                 # fail a function with an instruction the lifter can't model, instead of keeping it as asm!
 chungusite ./prog --refine models/types     # ask a trained type model (--features ml)
 ```
 
@@ -134,9 +135,18 @@ On chungusite's own debug build, `strip` keeps none of its 20,025 function symbo
 
 A global symbol in code without a type (`global f` in nasm, `.globl f` without `.type` in gas) is a function too, and an assembler's local labels between functions (`.loop:`, `table:`) don't split them: a function without a size runs to the next function or global symbol. A label in code that the code reads data from (a table after the `ret`) becomes a `static`, like data in a data section. Functions whose bytes don't decode from start to end (junk after a `jmp`, overlapping instructions) are lifted along their control flow instead ([lift.md](lift.md#code-that-hides-from-a-linear-sweep)).
 
+An instruction the lifter has no model of (`rdtsc`, `crc32`, SSSE3's `pshufb`, AES-NI, `rcl`, a `div` with a real 128-bit dividend) no longer fails its function: it is kept as it is, in an `asm!` that runs it on the values of the registers it uses ([lift.md](lift.md#instructions-kept-as-inline-assembly)). The output is then x86_64-only, as the original was:
+
+```rust
+let v8_asm: [u64; 1] = unsafe { let mut asm1 = v7; core::arch::asm!("crc32 rax, qword ptr [{0}]", in(reg) v5, inout("rax") asm1, options(nostack)); [asm1] };
+v9 = v8_asm[0];
+```
+
+The summary counts them, and `--no-asm` turns this off.
+
 A packed binary carries its real code compressed or encrypted and unpacks it at run time, so all there is to decompile is the unpacking stub. chungusite warns when a binary looks packed: UPX's sections or header, or executable segments whose bytes look random (more than 7.4 bits of entropy a byte; machine code has about 6). It doesn't unpack anything itself: run `upx -d` first, or decompile a memory dump of the running process.
 
-`tests/hostile.rs` builds a program from hand-written assembly with a junk byte after a `jmp`, a jump into its own instruction, a table after a `ret` and an always-false branch to garbage, all with untyped symbols and local labels, and checks that the decompiled Cargo project prints what the original does in both modes; and that a binary with 64 KiB of random bytes in its code gets the packed warning while an ordinary one doesn't.
+`tests/hostile.rs` builds a program from hand-written assembly with a junk byte after a `jmp`, a jump into its own instruction, a table after a `ret` and an always-false branch to garbage, all with untyped symbols and local labels, and checks that the decompiled Cargo project prints what the original does in both modes; the same for a program whose hand-written functions use instructions only inline assembly can run (`crc32` on the heap and the stack, `pshufb`, `rcl`/`rcr` reading and setting the carry, `rdtsc`, rbx and bh as operands); and that a binary with 64 KiB of random bytes in its code gets the packed warning while an ordinary one doesn't.
 
 ## Cargo projects
 

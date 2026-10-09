@@ -26,6 +26,7 @@ pub(super) fn handled(m: Mnemonic) -> bool {
                 | Pmovmskb | Vpmovmskb | Movmskps | Movmskpd | Pshufd | Pshuflw | Pshufhw | Shufps | Shufpd | Pinsrw
                 | Pextrw | Cmpsd | Cmpss | Cmppd | Cmpps | Ucomisd | Comisd | Ucomiss | Comiss | Cvtsi2sd | Cvtsi2ss
                 | Cvttsd2si | Cvtsd2si | Cvttss2si | Cvtss2si | Cvtss2sd | Cvtsd2ss | Sqrtsd | Sqrtss | Sqrtpd | Sqrtps
+                | Packsswb | Packuswb | Packssdw | Packusdw
         )
 }
 
@@ -179,6 +180,20 @@ impl Lifter {
                 let (x, y) = if high { (a.1, b.1) } else { (a.0, b.0) };
                 let lo = self.lane(f, LaneOp::UnpackLo, w, x, y);
                 let hi = self.lane(f, LaneOp::UnpackHi, w, x, y);
+                self.xmm_set(d, (lo, hi));
+            }
+            // each operand's lanes narrowed into one half: the destination's
+            // into the low half, the source's into the high
+            Packsswb | Packuswb | Packssdw | Packusdw => {
+                let (op, w) = match m {
+                    Packsswb => (LaneOp::PackS, 2),
+                    Packuswb => (LaneOp::PackU, 2),
+                    Packssdw => (LaneOp::PackS, 4),
+                    _ => (LaneOp::PackU, 4),
+                };
+                let (d, a, b) = self.srcs(f, i)?;
+                let lo = self.lane(f, op, w, a.0, a.1);
+                let hi = self.lane(f, op, w, b.0, b.1);
                 self.xmm_set(d, (lo, hi));
             }
             Punpcklqdq | Movlhps | Unpcklpd => {

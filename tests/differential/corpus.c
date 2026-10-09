@@ -707,6 +707,16 @@ void simd_saturate(uint8_t *p) {
     _mm_storeu_si128((__m128i *)(p + 48), _mm_andnot_si128(_mm_cmpgt_epi8(a, b), r));
 }
 
+// Narrowing with saturation: packsswb, packuswb, packssdw.
+// @diff simd_pack: void(buf:96)
+void simd_pack(uint8_t *p) {
+    __m128i a = _mm_loadu_si128((const __m128i *)p);
+    __m128i b = _mm_loadu_si128((const __m128i *)(p + 16));
+    _mm_storeu_si128((__m128i *)(p + 32), _mm_packus_epi16(a, b));
+    _mm_storeu_si128((__m128i *)(p + 48), _mm_packs_epi16(b, a));
+    _mm_storeu_si128((__m128i *)(p + 64), _mm_packs_epi32(a, b));
+}
+
 // @diff simd_shuffle: void(buf:48)
 void simd_shuffle(uint8_t *p) {
     __m128i a = _mm_loadu_si128((const __m128i *)p);
@@ -852,6 +862,18 @@ int64_t lookup_key(int64_t k) {
     for (int i = 0; i < 16; i++)
         if (key_is(vals[i] - keys[i] * 10, k)) return vals[i];
     return -1;
+}
+
+// A loop walking down an array stops at `steps - 1`, inside the array before it.
+int64_t steps[6] = { 1, 4, 13, 40, 121, 364 };
+
+// @diff steps_down: u64(u64:0..400)
+uint64_t steps_down(uint64_t n) {
+    const int64_t *p = &steps[5];
+    while (p != steps && (uint64_t)*p >= n) p--;
+    uint64_t s = 0;
+    for (; p != steps - 1; p--) s = mix(*p, s);
+    return s;
 }
 
 struct pool { uint64_t (*release)(uint64_t opaque, uint64_t p); uint64_t opaque; };

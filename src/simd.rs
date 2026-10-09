@@ -40,6 +40,8 @@ pub fn name(op: LaneOp, w: u8) -> String {
         UnpackLo => "unpacklo",
         UnpackHi => "unpackhi",
         SumAbsDiff => "sad",
+        PackS => "pack_s",
+        PackU => "pack_u",
         FCmpLt => "cmplt",
         FCmpLe => "cmple",
         FCmpUnord => "cmpunord",
@@ -141,6 +143,17 @@ pub mod simd {
                 /// The top bit of each lane, packed into the low bits.
                 pub fn movemask(x: u64) -> u64 {
                     split(x).iter().enumerate().fold(0, |m, (k, &a)| m | ((a >> (8 * W - 1)) as u64) << k)
+                }
+                /// The (signed) lanes of `x`, then of `y`, each narrowed to half
+                /// its width, saturating to the signed (unsigned) range.
+                pub fn pack_s(x: u64, y: u64) -> u64 { pack(x, y, -(1i64 << (4 * W - 1)), (1i64 << (4 * W - 1)) - 1) }
+                pub fn pack_u(x: u64, y: u64) -> u64 { pack(x, y, 0, (1i64 << (4 * W)) - 1) }
+                fn pack(x: u64, y: u64, lo: i64, hi: i64) -> u64 {
+                    let (a, b) = (split(x), split(y));
+                    let mask = u64::MAX >> (64 - 4 * W);
+                    a.iter().chain(b.iter()).enumerate().fold(0, |out, (k, &v)| {
+                        out | ((v as $i as i64).clamp(lo, hi) as u64 & mask) << (k * 4 * W)
+                    })
                 }
                 /// The sum of the absolute differences of the lanes.
                 pub fn sad(x: u64, y: u64) -> u64 {

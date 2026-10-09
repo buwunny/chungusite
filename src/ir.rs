@@ -475,6 +475,9 @@ pub enum LaneOp {
     UnpackLo, UnpackHi,
     /// Sum of the absolute differences of the bytes (psadbw), as one u64.
     SumAbsDiff,
+    /// The signed lanes of the left operand, then of the right, each narrowed to
+    /// half its width with signed (unsigned) saturation (packsswb, packuswb).
+    PackS, PackU,
     FAdd, FSub, FMul, FDiv, FMin, FMax,
     FCmpEq, FCmpLt, FCmpLe, FCmpUnord, FCmpNeq, FCmpNlt, FCmpNle, FCmpOrd,
     /// Ordered `>`, `>=` and "less or greater", for the flags of `ucomis*`.

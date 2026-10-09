@@ -950,13 +950,14 @@ impl Emitter<'_> {
     /// `c`, compared with `other`, as the end of the static `other` points
     /// into, when `c` is the address just past it: a loop over one array may
     /// stop at the address of whatever follows it in the binary, which the
-    /// output's statics don't keep next to each other.
+    /// output's statics don't keep next to each other. A loop walking down
+    /// stops one element before the start the same way.
     fn past_end(&self, c: ValueId, other: ValueId) -> Option<String> {
-        let at = match self.f.insts[c].kind {
-            InstKind::IntToPtr(x) => self.konst(x)?,
-            InstKind::Const(_) => self.konst(c)?,
-            _ => return None,
-        };
+        let (mut ats, mut seen) = (Vec::new(), Vec::new());
+        if !self.constants(c, &mut ats, &mut seen) || ats.is_empty() || ats.iter().any(|&a| a != ats[0]) {
+            return None;
+        }
+        let at = ats[0];
         let (mut bases, mut seen) = (Vec::new(), Vec::new());
         if !self.bases(other, &mut bases, &mut seen) || bases.is_empty() {
             return None;
@@ -996,23 +997,53 @@ impl Emitter<'_> {
                 }
             }
             InstKind::Bin { op: BinOp::Sub, lhs, rhs } if self.konst(rhs).is_some() => self.bases(lhs, out, seen),
-            InstKind::BlockParam(_) => {
-                let Some((b, k)) = f.blocks.iter().find_map(|(b, blk)| {
-                    blk.params.get(&f.value_pool).iter().position(|&p| p == v).map(|k| (b, k))
-                }) else { return false };
-                let (mut any, mut ok) = (false, true);
-                for (p, blk) in f.blocks.iter() {
-                    if blk.term.successors(&f.value_pool).any(|s| s == b) {
-                        crate::abi::incoming(f, p, b, k, |x| {
-                            any = true;
-                            ok = ok && self.bases(x, out, seen);
-                        });
-                    }
-                }
-                any && ok
-            }
+            InstKind::BlockParam(_) => self.joined(v, |x| self.bases(x, out, seen)),
+            // A path where the value was never set constrains nothing.
+            InstKind::Undef => true,
             _ => false,
         }
+    }
+
+    /// The constants `v` may be, through block parameters; `false` if it may
+    /// be anything else.
+    fn constants(&self, v: ValueId, out: &mut Vec<u64>, seen: &mut Vec<ValueId>) -> bool {
+        if seen.contains(&v) {
+            return true;
+        }
+        if seen.len() >= 32 {
+            return false;
+        }
+        seen.push(v);
+        match self.f.insts[v].kind {
+            InstKind::Undef => true,
+            InstKind::Const(_) => {
+                out.extend(self.konst(v));
+                true
+            }
+            InstKind::IntToPtr(x) | InstKind::PtrToInt(x) => self.constants(x, out, seen),
+            InstKind::BlockParam(_) => self.joined(v, |x| self.constants(x, out, seen)),
+            _ => false,
+        }
+    }
+
+    /// Whether `each` holds for every value block parameter `v` receives. A
+    /// parameter of the entry block is the function's own; one of a block no
+    /// edge reaches is never set.
+    fn joined(&self, v: ValueId, mut each: impl FnMut(ValueId) -> bool) -> bool {
+        let f = self.f;
+        let Some((b, k)) = f.blocks.iter().find_map(|(b, blk)| {
+            blk.params.get(&f.value_pool).iter().position(|&p| p == v).map(|k| (b, k))
+        }) else { return false };
+        let (mut any, mut ok) = (false, true);
+        for (p, blk) in f.blocks.iter() {
+            if blk.term.successors(&f.value_pool).any(|s| s == b) {
+                crate::abi::incoming(f, p, b, k, |x| {
+                    any = true;
+                    ok = ok && each(x);
+                });
+            }
+        }
+        (any || b != f.entry) && ok
     }
 
     /// `v as u64`, or just `v` if it already is one.

@@ -55,6 +55,15 @@ impl DataSym {
     }
 }
 
+/// A symbol a shared library defines, `addend` bytes in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Import {
+    pub name: String,
+    /// Data (`stdout`) rather than a function.
+    pub data: bool,
+    pub addend: i64,
+}
+
 pub struct Binary<'a> {
     file: object::File<'a>,
     /// Defined functions, sorted by address, one per address.
@@ -71,6 +80,10 @@ pub struct Binary<'a> {
     /// binary at start (`R_X86_64_COPY`: `stdin`, `stderr`, `environ`), by address,
     /// with the library symbol's name.
     pub copied: BTreeMap<u64, String>,
+    /// Pointer-sized slots the dynamic loader fills with the address of a symbol
+    /// another library defines (`stdout`, `optarg`, or `free` passed as a callback),
+    /// by address. Weak imports, null when nothing defines them, are left out.
+    pub imports: BTreeMap<u64, Import>,
     /// How many of `funcs` came from `discover::functions` rather than a symbol
     /// (nonzero only when the static symbol table has no functions).
     pub discovered: usize,
@@ -186,6 +199,7 @@ impl<'a> Binary<'a> {
         }
         let pointers = if data.is_empty() { BTreeMap::new() } else { pointers(&file, &data) };
         let copied = copied(&file);
+        let imports = if data.is_empty() { BTreeMap::new() } else { imports(&file) };
 
         // Stripped: no function in the static symbol table, at most the dynamic exports.
         let stripped = file.kind() != ObjectKind::Relocatable
@@ -207,7 +221,7 @@ impl<'a> Binary<'a> {
             }
             funcs.sort_by_key(|f| f.addr);
         }
-        Ok(Binary { file, funcs, data, data_syms, pointers, copied, discovered })
+        Ok(Binary { file, funcs, data, data_syms, pointers, copied, imports, discovered })
     }
 
     pub fn entry(&self) -> u64 {
@@ -258,6 +272,30 @@ fn copied(file: &object::File) -> BTreeMap<u64, String> {
         let name = name.split('@').next().unwrap_or_default().to_string();
         if !name.is_empty() {
             out.insert(at, name);
+        }
+    }
+    out
+}
+
+fn imports(file: &object::File) -> BTreeMap<u64, Import> {
+    use object::elf::{R_X86_64_64, R_X86_64_GLOB_DAT};
+    let mut out = BTreeMap::new();
+    let Some(dynsyms) = file.dynamic_symbol_table() else { return out };
+    for (at, r) in file.dynamic_relocations().into_iter().flatten() {
+        let (RelocationFlags::Elf { r_type: R_X86_64_64 | R_X86_64_GLOB_DAT }, RelocationTarget::Symbol(i)) = (r.flags(), r.target()) else { continue };
+        let Ok(sym) = dynsyms.symbol_by_index(i) else { continue };
+        let data = match sym.kind() {
+            SymbolKind::Data => true,
+            SymbolKind::Text => false,
+            _ => continue, // `__gmon_start__`, untyped: nothing to say what it is
+        };
+        if sym.is_definition() || sym.is_weak() {
+            continue;
+        }
+        let Ok(name) = sym.name() else { continue };
+        let name = name.split('@').next().unwrap_or_default();
+        if !name.is_empty() {
+            out.insert(at, Import { name: name.to_string(), data, addend: r.addend() });
         }
     }
     out

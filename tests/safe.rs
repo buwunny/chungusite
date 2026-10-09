@@ -134,10 +134,24 @@ fn written_argument_is_mut_and_stored_value_is_not_a_pointer() {
 fn dereferenced_pointer_stored_to_memory_stays_raw() {
     let f = lift_clean(&asm(|a| {
         a.mov(rax, qword_ptr(rsi)).unwrap();
-        a.mov(qword_ptr(rdi), rsi).unwrap(); // *rdi = rsi: rsi outlives this call
+        a.mov(qword_ptr(0x9000), rsi).unwrap(); // a global: rsi outlives this call
         a.ret().unwrap();
     }));
     assert_eq!(param(&f, rsi).class, Class::Raw);
+}
+
+#[test]
+fn a_pointer_stored_into_another_argument_is_left_to_the_caller() {
+    let f = lift_clean(&asm(|a| {
+        a.mov(rax, qword_ptr(rsi)).unwrap();
+        a.mov(qword_ptr(rdi + 8), rsi).unwrap(); // out.r = rsi: the caller follows it
+        a.ret().unwrap();
+    }));
+    let p = param(&f, rsi);
+    assert_eq!(p.class, Class::Shared);
+    assert_eq!(p.into.len(), 1, "{:?}", p.into);
+    assert_eq!(p.into[0].1, Some(8));
+    assert!(!p.into[0].2, "the argument itself, not what it points to");
     assert_eq!(param(&f, rdi).class, Class::Mut);
 }
 

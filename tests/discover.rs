@@ -214,3 +214,40 @@ fn calls_that_dont_return_end_functions() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+const COLD_C: &str = r#"
+#include <stdlib.h>
+__attribute__((noinline)) long pick(long x) {
+    if (__builtin_expect(x > 100, 0)) abort();
+    return x * 3 + 1;
+}
+int main(int argc, char **argv) { return pick(argc); }
+"#;
+
+/// gcc moves the call to `abort` into `pick.cold` and jumps there: a jump to
+/// code that never returns says nothing about the result, so `pick` still
+/// returns one, with and without symbols.
+#[test]
+fn jumps_to_cold_parts_that_dont_return() {
+    if !have("cc") || !have("strip") {
+        eprintln!("discover: no C compiler or strip, skipping");
+        return;
+    }
+    let dir = scratch("cold");
+    let src = dir.join("cold.c");
+    std::fs::write(&src, COLD_C).unwrap();
+    let full = dir.join("cold");
+    let stripped = dir.join("cold-stripped");
+    let out = Command::new("cc").args(["-O2", "-o"]).arg(&full).arg(&src).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new("strip").arg("-o").arg(&stripped).arg(&full).output().unwrap();
+    assert!(out.status.success(), "strip: {}", String::from_utf8_lossy(&out.stderr));
+    let addr = list(&full).into_iter().find(|(_, (_, n))| n == "pick").map(|(a, _)| a).expect("no pick");
+    for (bin, name) in [(&full, "pick".to_string()), (&stripped, format!("sub_{addr:x}"))] {
+        let (code, out, err) = chungusite(&[bin.to_str().unwrap()]);
+        assert!(code == 0 || code == 1, "{err}");
+        let sig = out.lines().find(|l| l.contains(&format!("fn {name}("))).unwrap_or_else(|| panic!("no {name}:\n{out}"));
+        assert!(sig.contains(") -> "), "{}: {sig}", bin.display());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

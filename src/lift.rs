@@ -643,6 +643,18 @@ impl Lifter {
         Terminator::TailCall { callee, args: ListRef::EMPTY }
     }
 
+    /// The terminator for the jump `i` out of the function: a tail call, or,
+    /// to code that never returns (a `.cold` part that calls `abort`), a call
+    /// that doesn't return, so the path is evidence of no result.
+    fn jump_out(&mut self, f: &mut Function, i: &Instruction, noreturn: &dyn Fn(u64, Option<u64>) -> bool) -> Result<Terminator, LiftError> {
+        let target = i.near_branch_target();
+        if noreturn(self.ip, Some(target)) {
+            self.call(f, i)?;
+            return Ok(Terminator::Unreachable);
+        }
+        Ok(self.tail_call(f, target))
+    }
+
     /// The address block `b` starts at; a stub's is its branch's.
     fn block_ip(&self, b: usize) -> u64 {
         match self.leaders.get(b) {
@@ -694,7 +706,7 @@ impl Lifter {
                     self.nstub += 1;
                     self.end_block(f, Terminator::Branch { c, t: BlockId::new(stub), f: e, args: ListRef::EMPTY });
                     self.begin_block(stub, f);
-                    let term = self.tail_call(f, i.near_branch_target());
+                    let term = self.jump_out(f, &i, noreturn)?;
                     self.end_block(f, term);
                     return Ok(true);
                 };
@@ -705,7 +717,7 @@ impl Lifter {
                 let term = match self.block_at(i.near_branch_target()) {
                     Some(to) => Terminator::Jump { to, args: ListRef::EMPTY },
                     // Jump out of this function: a tail call.
-                    None => self.tail_call(f, i.near_branch_target()),
+                    None => self.jump_out(f, &i, noreturn)?,
                 };
                 self.end_block(f, term);
                 Ok(true)

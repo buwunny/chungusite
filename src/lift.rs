@@ -24,12 +24,19 @@ use iced_x86::{ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction,
 mod sse;
 
 const NGPR: usize = 16;
-/// The register file: the 16 GPRs, then xmm0-15 as (low, high) qword pairs.
-const NREG: usize = NGPR + 32;
+/// The register file: the 16 GPRs, then xmm0-15 as (low, high) qword pairs,
+/// then the upper halves of ymm0-15 the same way.
+const NREG: usize = NGPR + 64;
+/// Where the upper halves of the ymm registers start in the register file.
+const UPPER: usize = NGPR + 32;
 type RegFile = [Option<ValueId>; NREG];
 /// `BlockParam` register number of xmm register half `k` (2 * xmm + high).
 /// Float argument `j` is the low half of xmm `j`, `XMM_PARAM + 2 * j`.
 pub const XMM_PARAM: u8 = 0xc0;
+/// `BlockParam` register number of the upper half `k` of the ymm registers
+/// (2 * ymm + high). Never a parameter of the entry block: nothing passes or
+/// preserves them.
+const YMM_PARAM: u8 = 0xa0;
 /// Register number (in `CallOut`, `BlockParam`) of xmm0's low half: the first
 /// float argument, and where a float result is returned.
 pub const XMM0: u8 = XMM_PARAM;
@@ -192,10 +199,23 @@ pub struct Lifter {
     /// out from the callees' signatures. Most functions are like that, and
     /// threading 32 xmm halves through them doubles the lifting time.
     xmm: bool,
+    /// Does the function use a ymm register? Then the upper halves are
+    /// tracked too: undefined at the entry and after a call, zeroed by a VEX
+    /// instruction that writes the xmm part.
+    ymm: bool,
+    /// Lifting the upper half of a ymm instruction: xmm register `n` means
+    /// the upper half of ymm `n`, and memory 16 bytes further on.
+    upper: bool,
     /// Pass 2: the case index, read where the current block loads from its table.
     switch_index: Option<ValueId>,
     /// Each block that ends in a `Switch`, and its table (index into `tables`).
     switches: Vec<(BlockId, usize)>,
+    /// The address of each conditional branch out of the function (into
+    /// another function's `.cold` part), in order. Each gets a block after the
+    /// leaders' that tail-calls the target.
+    stubs: Vec<u64>,
+    /// The stubs pass 2 has lifted so far.
+    nstub: usize,
     /// Record the caller-saved registers at each return in an `Exit` instruction,
     /// for whole-program register summaries (`program.rs` sets this).
     pub track_exits: bool,
@@ -229,8 +249,12 @@ impl Lifter {
             rip_lea: [0; 16],
             starts: Vec::with_capacity(256),
             xmm: false,
+            ymm: false,
+            upper: false,
             switch_index: None,
             switches: Vec::with_capacity(4),
+            stubs: Vec::with_capacity(4),
+            nstub: 0,
             track_exits: false,
             thread_pointer: None,
             cur: 0,
@@ -270,7 +294,8 @@ impl Lifter {
         self.tails.clear();
         self.exits.clear();
         self.switches.clear();
-        for _ in 0..self.leaders.len() {
+        self.nstub = 0;
+        for _ in 0..self.leaders.len() + self.stubs.len() {
             self.state.push(EMPTY_STATE);
             f.blocks.push(Block { insts: ListRef::EMPTY, params: ListRef::EMPTY, term: Terminator::Unreachable });
         }
@@ -279,7 +304,11 @@ impl Lifter {
         let mut next_leader = 1;
         let mut open = true;
         self.fall = None;
+        self.upper = false;
         self.begin_block(0, f);
+        if self.ymm {
+            self.clear_upper(f, false);
+        }
         while dec.can_decode() {
             dec.decode_out(&mut self.insn);
             self.ip = self.insn.ip();
@@ -343,7 +372,9 @@ impl Lifter {
         self.nrecent = 0;
         self.rip_lea = [0; 16];
         self.starts.clear();
+        self.stubs.clear();
         self.xmm = false;
+        self.ymm = false;
         let mut dec = Decoder::with_ip(64, code, ip, DecoderOptions::NONE);
         while dec.can_decode() {
             dec.decode_out(&mut self.insn);
@@ -358,10 +389,15 @@ impl Lifter {
             }
             let i = &self.insn;
             self.xmm |= (0..i.op_count()).any(|k| i.op_kind(k) == OpKind::Register && i.op_register(k).is_vector_register());
+            self.ymm |= (0..i.op_count()).any(|k| i.op_kind(k) == OpKind::Register && i.op_register(k).is_ymm());
             match self.insn.flow_control() {
                 FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch => {
                     let t = self.insn.near_branch_target();
-                    if in_range(t) { self.leaders.push(t); }
+                    if in_range(t) {
+                        self.leaders.push(t);
+                    } else if self.insn.flow_control() == FlowControl::ConditionalBranch {
+                        self.stubs.push(self.ip);
+                    }
                     if in_range(next) { self.leaders.push(next); }
                 }
                 FlowControl::IndirectBranch => {
@@ -597,6 +633,24 @@ impl Lifter {
         f.blocks[BlockId::new(idx)].insts.start = f.value_pool.len() as u32;
     }
 
+    /// The terminator of the current block for a jump to `target`, outside
+    /// the function.
+    fn tail_call(&mut self, f: &mut Function, target: u64) -> Terminator {
+        let a = self.konst(f, target, TyId::B8);
+        let callee = self.emit(f, InstKind::IntToPtr(a), TyId::PTR);
+        let regs = self.call_regs(f);
+        self.tails.push((BlockId::new(self.cur), regs));
+        Terminator::TailCall { callee, args: ListRef::EMPTY }
+    }
+
+    /// The address block `b` starts at; a stub's is its branch's.
+    fn block_ip(&self, b: usize) -> u64 {
+        match self.leaders.get(b) {
+            Some(&a) => a,
+            None => self.stubs[b - self.leaders.len()],
+        }
+    }
+
     fn end_block(&mut self, f: &mut Function, term: Terminator) {
         let len = f.value_pool.len() as u32;
         let b = &mut f.blocks[BlockId::new(self.cur)];
@@ -633,22 +687,25 @@ impl Lifter {
             }
             FlowControl::ConditionalBranch if i.condition_code() != ConditionCode::None => {
                 let c = self.condition(f, i.condition_code())?;
-                let t = self.target(i.near_branch_target())?;
                 let e = self.target(i.next_ip())?;
+                let Some(t) = self.block_at(i.near_branch_target()) else {
+                    // Out of the function: a block of its own tail-calls the target.
+                    let stub = self.leaders.len() + self.nstub;
+                    self.nstub += 1;
+                    self.end_block(f, Terminator::Branch { c, t: BlockId::new(stub), f: e, args: ListRef::EMPTY });
+                    self.begin_block(stub, f);
+                    let term = self.tail_call(f, i.near_branch_target());
+                    self.end_block(f, term);
+                    return Ok(true);
+                };
                 self.end_block(f, Terminator::Branch { c, t, f: e, args: ListRef::EMPTY });
                 Ok(true)
             }
             FlowControl::UnconditionalBranch if i.op0_kind() == OpKind::NearBranch64 => {
                 let term = match self.block_at(i.near_branch_target()) {
                     Some(to) => Terminator::Jump { to, args: ListRef::EMPTY },
-                    None => {
-                        // Jump out of this function: a tail call.
-                        let a = self.konst(f, i.near_branch_target(), TyId::B8);
-                        let callee = self.emit(f, InstKind::IntToPtr(a), TyId::PTR);
-                        let regs = self.call_regs(f);
-                        self.tails.push((BlockId::new(self.cur), regs));
-                        Terminator::TailCall { callee, args: ListRef::EMPTY }
-                    }
+                    // Jump out of this function: a tail call.
+                    None => self.tail_call(f, i.near_branch_target()),
                 };
                 self.end_block(f, term);
                 Ok(true)
@@ -809,6 +866,26 @@ impl Lifter {
                 let zero = self.konst(f, 0, TyId::B8);
                 self.write(f, Register::RDI, d2)?;
                 self.write(f, Register::RCX, zero)?;
+            }
+            // The CPU's answer, read through `simd::cpu`: feature checks pick
+            // a code path on the machine the output runs on.
+            Mnemonic::Cpuid | Mnemonic::Xgetbv => {
+                let cpuid = i.mnemonic() == Mnemonic::Cpuid;
+                let c = self.read(f, Register::ECX)?;
+                let a = if cpuid { self.read(f, Register::EAX)? } else { c };
+                use Register::*;
+                let (op, outs) = match cpuid {
+                    true => (LaneOp::Cpuid, &[(0, EAX), (1, EBX), (2, ECX), (3, EDX)][..]),
+                    false => (LaneOp::Xgetbv, &[(0, EAX), (3, EDX)][..]),
+                };
+                // All outputs read the inputs before any is written.
+                let mut vals = [a; 4];
+                for (v, &(k, _)) in vals.iter_mut().zip(outs) {
+                    *v = self.emit(f, InstKind::Bin { op: BinOp::Lane(op, k), lhs: a, rhs: c }, TyId::B4);
+                }
+                for (&(_, r), v) in outs.iter().zip(vals) {
+                    self.write(f, r, v)?;
+                }
             }
             Mnemonic::Bswap => {
                 let r = i.op0_register();
@@ -1344,6 +1421,9 @@ impl Lifter {
             let v = self.emit(f, InstKind::CallOut { call, reg: XMM_PARAM + k as u8 }, TyId::B8);
             self.state[self.cur].out[NGPR + k] = Some(v);
         }
+        if self.ymm {
+            self.clear_upper(f, false);
+        }
         self.flags = Flags::Unknown;
         Ok(())
     }
@@ -1716,9 +1796,13 @@ impl Lifter {
     /// Create a block parameter for GPR `n` in block `b`. Not part of the block's
     /// instruction list; `finalize` lists it in `Block::params`.
     fn live_in(&mut self, f: &mut Function, b: usize, n: usize) -> ValueId {
-        let reg = if n < NGPR { n as u8 } else { XMM_PARAM + (n - NGPR) as u8 };
+        let reg = match n {
+            _ if n < NGPR => n as u8,
+            _ if n < UPPER => XMM_PARAM + (n - NGPR) as u8,
+            _ => YMM_PARAM + (n - UPPER) as u8,
+        };
         let id = f.insts.push(Inst { kind: InstKind::BlockParam(reg), ty: TyId::B8 });
-        f.origin.push(self.leaders[b]);
+        f.origin.push(self.block_ip(b));
         self.state[b].params[n] = Some(id);
         self.state[b].out[n] = Some(id);
         id
@@ -1736,7 +1820,7 @@ impl Lifter {
             st.flags_read = read;
         }
         let id = f.insts.push(Inst { kind: InstKind::BlockParam(FLAG_PARAM), ty: TyId::BOOL });
-        f.origin.push(self.leaders[b]);
+        f.origin.push(self.block_ip(b));
         self.state[b].cparams[cc as usize] = Some(id);
         id
     }
@@ -1990,7 +2074,7 @@ fn handled(i: &Instruction) -> bool {
                 m,
                 Nop | Endbr64 | Mov | Lea | Add | Sub | And | Or | Xor | Cmp | Test | Inc | Dec | Neg | Not | Shl | Shr
                     | Sar | Mul | Imul | Movzx | Movsx | Movsxd | Div | Idiv | Cqo | Cdq | Cdqe | Cwde | Push | Pop
-                    | Leave | Movsb | Movsw | Movsd | Movsq | Stosb | Stosw | Stosd | Stosq | Bswap | Tzcnt | Lzcnt | Popcnt | Bsf | Bsr
+                    | Leave | Movsb | Movsw | Movsd | Movsq | Stosb | Stosw | Stosd | Stosq | Bswap | Cpuid | Xgetbv | Tzcnt | Lzcnt | Popcnt | Bsf | Bsr
                     | Shld | Shrd | Rol | Ror | Adc | Sbb | Bt | Bts | Btr | Btc | Xchg | Xadd | Cmpxchg | Pause
             ) || cmov_or_setcc(m).is_some()
                 || sse::handled(m)

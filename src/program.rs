@@ -67,7 +67,7 @@ pub struct Func {
     pub types: Option<FnTypes>,
     sites: Vec<Site>,
     targets: Vec<Target>,
-    guesses: Vec<(u8, u8)>,
+    guesses: Vec<(u8, u8, u8)>,
 }
 
 /// An `extern "C"` declaration in `mod ffi`.
@@ -309,7 +309,9 @@ impl Program {
                     Ok(f) => {
                         let sites = abi::sites(f);
                         let targets = sites.iter().map(|&s| resolve(f, s)).collect();
-                        let guesses = sites.iter().map(|&s| (abi::guess_args(f, s), abi::guess_fargs(f, s))).collect();
+                        let args: Vec<u8> = sites.iter().map(|&s| abi::guess_args(f, s)).collect();
+                        let stack = abi::guess_stack(f, &sites, &args);
+                        let guesses = sites.iter().zip(args).zip(stack).map(|((&s, a), st)| (a, abi::guess_fargs(f, s), st)).collect();
                         (sites, targets, guesses)
                     }
                     Err(_) => Default::default(),
@@ -501,7 +503,7 @@ impl Program {
                         let s = guessed.get(&Target::Func(*j)).copied().unwrap_or(sigs[*j]);
                         (funcs[*j].name.clone(), s)
                     }
-                    Target::Import(n) => (n.clone(), site_sig(&funcs[fi].targets[k], (0, 0), &sigs, &guessed)),
+                    Target::Import(n) => (n.clone(), site_sig(&funcs[fi].targets[k], (0, 0, 0), &sigs, &guessed)),
                     _ => continue,
                 };
                 if extern_of.contains_key(&name) {
@@ -562,7 +564,7 @@ impl Program {
             Target::Import(n) => ext(n),
             // through a pointer: integers and the float arguments the call sets up
             Target::Indirect => {
-                let (args, fargs) = f.guesses[k];
+                let (args, fargs, _) = f.guesses[k];
                 let sig = Sig { args, fargs, ..Sig::default() };
                 Some(CallInfo { path: None, ret: true, foreign: true, arg_tys: arg_tys(sig, &[]), ..CallInfo::default() })
             }
@@ -1130,14 +1132,18 @@ fn arg_tys(sig: Sig, int: &[Option<TyId>]) -> Vec<Option<TyId>> {
 }
 
 /// What a call site passes: the callee's signature, with a variadic one's
-/// extra arguments as far as the site sets registers up.
-fn site_sig(t: &Target, (args, fargs): (u8, u8), sigs: &[Sig], guessed: &HashMap<Target, Sig>) -> Sig {
+/// extra arguments as far as the site sets registers up, and the stack
+/// arguments it stores after all six registers.
+fn site_sig(t: &Target, (args, fargs, stack): (u8, u8, u8), sigs: &[Sig], guessed: &HashMap<Target, Sig>) -> Sig {
     let s = match t {
         Target::Func(j) => guessed.get(t).copied().unwrap_or(sigs[*j]),
         Target::Import(n) => crate::libc::lookup(n).or_else(|| guessed.get(t).copied()).unwrap_or_default(),
         Target::Indirect => Sig { args, fargs, ret: true, ..Sig::default() },
     };
-    if s.variadic { Sig { args: s.args.max(args), fargs: s.fargs.max(fargs), ..s } } else { s }
+    match s.variadic {
+        true => Sig { args: s.args.max(args), fargs: s.fargs.max(fargs), stack_args: s.stack_args.max(stack), ..s },
+        false => s,
+    }
 }
 
 /// One line for a lift error.

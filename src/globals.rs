@@ -133,10 +133,15 @@ impl<'b, 'a> Globals<'b, 'a> {
 
     /// `at` as the end of the item holding `base`: a loop over one array may
     /// stop at the address of the next item, or past the end of the section.
+    /// A loop walking down stops one element before the start instead, which
+    /// lands inside whatever precedes it.
     pub fn end_expr(&self, base: u64, at: u64) -> Option<String> {
         let item = self.item_at(base)?;
-        (item.start + item.len == at && self.item_at(at).is_none_or(|i| i.start == at))
-            .then(|| format!("({} as u64).wrapping_add({:#x})", self.addr_of(&item), item.len))
+        if item.start + item.len == at && self.item_at(at).is_none_or(|i| i.start == at) {
+            return Some(format!("({} as u64).wrapping_add({:#x})", self.addr_of(&item), item.len));
+        }
+        (at < item.start && item.start - at <= 16)
+            .then(|| format!("({} as u64).wrapping_sub({:#x})", self.addr_of(&item), item.start - at))
     }
 
     /// The static holding `addr`, if safe code can read it as a slice: a

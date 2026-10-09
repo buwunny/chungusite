@@ -236,6 +236,40 @@ fn set_before(f: &Function, a: ValueId, reg: Option<u8>, seen: &mut Vec<ValueId>
     }
 }
 
+/// How many 8-byte stack arguments each call that sets up all six argument
+/// registers stores just before it, at `[rsp]`, `[rsp+8]`, ... in its own
+/// block: the seventh and later arguments of a variadic call (`printf`).
+pub fn guess_stack(f: &Function, sites: &[Site], args: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; sites.len()];
+    if !args.contains(&6) {
+        return out;
+    }
+    let a = analyze(f);
+    for (k, &site) in sites.iter().enumerate() {
+        let Site::Call(id) = site else { continue };
+        let list = site.parts(f).1.get(&f.value_pool);
+        if args[k] < 6 || list.len() != CALL_ARGS {
+            continue;
+        }
+        let rsp = a.origin[list[6].index()];
+        let (Off::Known(base), true) = (rsp.off, rsp.roots != 0) else { continue };
+        let Some(blk) = f.blocks.iter().map(|(_, b)| b.insts.get(&f.value_pool)).find(|i| i.contains(&id)) else { continue };
+        let mut written = 0u64;
+        for &i in blk.iter().take_while(|&&i| i != id) {
+            if let InstKind::Store { ptr, .. } = f.insts[i].kind {
+                let o = a.origin[ptr.index()];
+                if let (Off::Known(off), true) = (o.off, o.roots == rsp.roots) {
+                    if (0..8 * 64).contains(&(off - base)) {
+                        written |= 1 << ((off - base) / 8);
+                    }
+                }
+            }
+        }
+        out[k] = written.trailing_ones() as u8;
+    }
+    out
+}
+
 /// How many float arguments a call to unknown code passes: up to the last xmm
 /// register the function set up, like `guess_args`.
 pub fn guess_fargs(f: &Function, site: Site) -> u8 {

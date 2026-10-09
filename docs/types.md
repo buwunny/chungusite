@@ -82,7 +82,7 @@ It is asked about each argument and the return value (`Var::Arg`, `Var::Ret`) of
 
 ## Tests
 
-`tests/types.rs` checks prototypes and structs from `gcc -O2 -g`, safe-mode struct references, `--no-dwarf` inference, one struct across callers and callees (with and without the callees' debug info), typed pointer locals, `&[T]` arguments, `parse_label` and the gate. `tests/differential.rs` runs each corpus build both without and with `-g`, so a wrong type from either source shows up as a wrong result; 1,724 of 1,728 pairs pass and none disagree.
+`tests/types.rs` checks prototypes and structs from `gcc -O2 -g`, safe-mode struct references, `--no-dwarf` inference, one struct across callers and callees (with and without the callees' debug info), typed pointer locals, `&[T]` arguments, `parse_label` and the gate. `tests/differential.rs` runs each corpus build both without and with `-g`, so a wrong type from either source shows up as a wrong result; 1,918 of 1,920 pairs pass and none disagree.
 
 ## Next
 

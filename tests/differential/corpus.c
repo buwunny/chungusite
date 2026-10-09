@@ -26,6 +26,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <emmintrin.h>
+#include <cpuid.h>
+#include <immintrin.h>
 
 #define NOINLINE __attribute__((noinline))
 
@@ -707,6 +709,55 @@ void simd_saturate(uint8_t *p) {
     _mm_storeu_si128((__m128i *)(p + 48), _mm_andnot_si128(_mm_cmpgt_epi8(a, b), r));
 }
 
+// AVX2: 32-byte registers, each instruction working on both 16-byte halves.
+// @diff avx2_lanes: u32(buf:128)
+__attribute__((target("avx2"))) uint32_t avx2_lanes(uint8_t *p) {
+    __m256i a = _mm256_loadu_si256((const __m256i *)p);
+    __m256i b = _mm256_loadu_si256((const __m256i *)(p + 32));
+    __m256i c = _mm256_loadu_si256((const __m256i *)(p + 64));
+    __m256i r = _mm256_xor_si256(_mm256_add_epi8(a, b), _mm256_sub_epi32(c, a));
+    r = _mm256_or_si256(r, _mm256_andnot_si256(b, _mm256_cmpgt_epi8(c, b)));
+    _mm256_storeu_si256((__m256i *)(p + 96), _mm256_and_si256(r, _mm256_max_epu8(a, c)));
+    return (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, c));
+}
+
+// The first byte equal to `c` in 64 bytes, as memchr finds it; 64 if none.
+// @diff avx2_find: u64(buf:64, u8:0..4)
+__attribute__((target("avx2"))) uint64_t avx2_find(const uint8_t *p, uint8_t c) {
+    __m256i n = _mm256_set1_epi8((char)c);
+    for (uint64_t k = 0; k < 64; k += 32) {
+        uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(p + k)), n));
+        if (m) return k + __builtin_ctz(m);
+    }
+    return 64;
+}
+
+// Feature checks ask the CPU: cpuid's leaf 0 and 1 (the vendor, family and
+// feature bits, the same on every core) and xgetbv's enabled state.
+// @diff cpu_info: u64(u64:0..2)
+uint64_t cpu_info(uint64_t leaf) {
+    unsigned a, b, c, d;
+    __cpuid_count((unsigned)leaf, 0, a, b, c, d);
+    if (leaf == 1) b &= 0xffff;  // the APIC id differs between cores
+    uint64_t r = ((uint64_t)b << 32 | d) ^ ((uint64_t)a << 17) ^ c;
+    if (leaf == 1 && (c >> 27 & 1)) {  // OSXSAVE
+        unsigned lo, hi;
+        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        r += (uint64_t)hi << 32 | lo;
+    }
+    return r;
+}
+
+// Narrowing with saturation: packsswb, packuswb, packssdw.
+// @diff simd_pack: void(buf:96)
+void simd_pack(uint8_t *p) {
+    __m128i a = _mm_loadu_si128((const __m128i *)p);
+    __m128i b = _mm_loadu_si128((const __m128i *)(p + 16));
+    _mm_storeu_si128((__m128i *)(p + 32), _mm_packus_epi16(a, b));
+    _mm_storeu_si128((__m128i *)(p + 48), _mm_packs_epi16(b, a));
+    _mm_storeu_si128((__m128i *)(p + 64), _mm_packs_epi32(a, b));
+}
+
 // @diff simd_shuffle: void(buf:48)
 void simd_shuffle(uint8_t *p) {
     __m128i a = _mm_loadu_si128((const __m128i *)p);
@@ -854,6 +905,18 @@ int64_t lookup_key(int64_t k) {
     return -1;
 }
 
+// A loop walking down an array stops at `steps - 1`, inside the array before it.
+int64_t steps[6] = { 1, 4, 13, 40, 121, 364 };
+
+// @diff steps_down: u64(u64:0..400)
+uint64_t steps_down(uint64_t n) {
+    const int64_t *p = &steps[5];
+    while (p != steps && (uint64_t)*p >= n) p--;
+    uint64_t s = 0;
+    for (; p != steps - 1; p--) s = mix(*p, s);
+    return s;
+}
+
 struct pool { uint64_t (*release)(uint64_t opaque, uint64_t p); uint64_t opaque; };
 // @diff pool_release: u64(u64, u64)
 NOINLINE uint64_t pool_release(uint64_t opaque, uint64_t p) { return opaque * 31 + p; }
@@ -892,4 +955,11 @@ void fmt_either(char *b, uint64_t x, uint64_t y) {
     if (x > y) { f = "%lu >"; v = x / (y | 1); }
     else { f = "%lu <="; v = y % (x | 1); }
     snprintf(b, 64, f, (unsigned long)v);
+}
+
+// Variadic arguments past the sixth go on the stack.
+// @diff fmt_many: void(buf:96, u64, u64, u64)
+void fmt_many(char *b, uint64_t x, uint64_t y, uint64_t z) {
+    snprintf(b, 96, "%lu %lu %lu %lu %lu %lu", (unsigned long)x, (unsigned long)y, (unsigned long)z,
+             (unsigned long)(x ^ y), (unsigned long)(y + z), (unsigned long)(z * 3));
 }

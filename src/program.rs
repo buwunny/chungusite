@@ -210,13 +210,13 @@ fn loaded_sections(data: &[u8]) -> Vec<(u64, Vec<u8>)> {
     out
 }
 
-/// Which nodes of the graph `succ` lie on a cycle of two or more nodes
-/// (Tarjan's strongly connected components, without recursion).
-fn in_cycle(succ: &[Vec<usize>]) -> Vec<bool> {
+/// The strongly connected components of the graph `succ` (Tarjan's,
+/// without recursion): each node's component, numbered from 0.
+fn components(succ: &[Vec<usize>]) -> Vec<usize> {
     let n = succ.len();
     let (mut index, mut low) = (vec![usize::MAX; n], vec![0usize; n]);
-    let (mut on, mut stack, mut out) = (vec![false; n], Vec::new(), vec![false; n]);
-    let mut next = 0;
+    let (mut on, mut stack, mut comp) = (vec![false; n], Vec::new(), vec![0usize; n]);
+    let (mut next, mut ncomp) = (0, 0);
     for root in 0..n {
         if index[root] != usize::MAX {
             continue;
@@ -245,15 +245,15 @@ fn in_cycle(succ: &[Vec<usize>]) -> Vec<bool> {
             }
             if low[v] == index[v] {
                 let at = stack.iter().rposition(|&w| w == v).unwrap();
-                let many = stack.len() - at > 1;
                 for w in stack.drain(at..) {
                     on[w] = false;
-                    out[w] = many;
+                    comp[w] = ncomp;
                 }
+                ncomp += 1;
             }
         }
     }
-    out
+    comp
 }
 
 fn konst(f: &Function, v: ValueId) -> Option<u64> {
@@ -471,21 +471,24 @@ impl Program {
         //    change last round gets the same result again, so only the others
         //    are re-inferred.
         let mut sigs: Vec<Sig> = stack_args.iter().map(|&s| Sig { stack_args: s, ..Sig::default() }).collect();
-        // Functions that call each other in a cycle (`next()` tail-calling
-        // `step()`, which tail-calls `next()`) start from keeping every
-        // register and returning a value, which the rounds drop where it
-        // doesn't hold: starting from nothing, a cycle could never show
-        // that it returns what each member returns.
+        // Functions that call each other, directly or in a cycle (`next()`
+        // tail-calling `step()`, which tail-calls `next()`), are inferred
+        // together: they start from keeping every register and returning a
+        // value across the calls among them, and drop what doesn't hold, to
+        // a fixpoint (a tree walk keeping `r8` for its caller; a matcher
+        // returning `match(s + 1, p)`). Starting from nothing, a cycle could
+        // never show that it returns what each member returns.
         let succ: Vec<Vec<usize>> = funcs
             .iter()
             .map(|f| f.targets.iter().filter_map(|t| if let Target::Func(j) = t { Some(*j) } else { None }).collect())
             .collect();
-        for (i, c) in in_cycle(&succ).into_iter().enumerate() {
-            if c && funcs[i].ir.is_ok() {
-                sigs[i].ret = true;
-                sigs[i].preserves = abi::CALLER_SAVED;
-                sigs[i].xpreserves = u32::MAX;
+        let comp = components(&succ);
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (i, &c) in comp.iter().enumerate() {
+            if groups.len() <= c {
+                groups.resize(c + 1, Vec::new());
             }
+            groups[c].push(i);
         }
         let mut wanted_by = vec![0u8; funcs.len()];
         let mut callers: Vec<Vec<usize>> = vec![Vec::new(); funcs.len()];
@@ -502,44 +505,49 @@ impl Program {
         let mut results: Vec<(Sig, Vec<u8>)> = sigs.iter().map(|&s| (s, Vec::new())).collect();
         let mut dirty = vec![true; funcs.len()];
         for _round in 0..MAX_ROUNDS {
-            let next: Vec<Option<(Sig, Vec<u8>)>> = funcs
+            let next: Vec<Vec<(usize, Sig, Vec<u8>)>> = groups
                 .par_iter()
-                .enumerate()
-                .map(|(i, f)| match &f.ir {
-                    Ok(ir) if dirty[i] => {
-                        // A function that calls itself keeps a register across
-                        // that call if it keeps it everywhere else, and returns
-                        // a value from it if it does everywhere else: start from
-                        // keeping every one (and returning one) and drop what
-                        // doesn't hold, to a fixpoint (a tree walk keeping `r8`
-                        // for its caller; a matcher returning `match(s + 1, p)`).
-                        let recursive = f.targets.iter().any(|t| *t == Target::Func(i));
-                        let mut own = sigs[i];
-                        if recursive {
-                            own.preserves = abi::CALLER_SAVED;
-                            own.xpreserves = u32::MAX;
-                            own.ret = true;
-                        }
-                        loop {
-                            let callee = |k: usize| match f.targets[k] {
-                                Target::Func(j) if j == i => Sig { preserves: own.preserves, xpreserves: own.xpreserves, ret: own.ret, ..sigs[i] },
-                                _ => site_sig(&f.targets[k], f.guesses[k], &sigs, &guessed),
-                            };
-                            let r = abi::infer(ir, &f.sites, &callee, sigs[i], wanted_by[i], set_args[i]);
-                            let kept = (own.preserves & r.sig.preserves, own.xpreserves & r.sig.xpreserves, own.ret && r.sig.ret);
-                            if !recursive || kept == (own.preserves, own.xpreserves, own.ret) {
-                                break Some((Sig { stack_args: stack_args[i], ..r.sig }, r.reads));
-                            }
-                            (own.preserves, own.xpreserves, own.ret) = kept;
-                        }
+                .map(|g| {
+                    let g: Vec<usize> = g.iter().copied().filter(|&i| funcs[i].ir.is_ok()).collect();
+                    if !g.iter().any(|&i| dirty[i]) {
+                        return Vec::new();
                     }
-                    _ => None,
+                    let cyclic = g.len() > 1 || funcs[g[0]].targets.iter().any(|t| *t == Target::Func(g[0]));
+                    // what each member keeps and returns, for the calls among them
+                    let mut own: Vec<(u16, u32, bool)> = g
+                        .iter()
+                        .map(|&i| if cyclic { (abi::CALLER_SAVED, u32::MAX, true) } else { (sigs[i].preserves, sigs[i].xpreserves, sigs[i].ret) })
+                        .collect();
+                    loop {
+                        let out: Vec<(usize, Sig, Vec<u8>)> = g
+                            .iter()
+                            .map(|&i| {
+                                let f = &funcs[i];
+                                let callee = |k: usize| match f.targets[k] {
+                                    Target::Func(j) if cyclic && comp[j] == comp[i] => {
+                                        let (preserves, xpreserves, ret) = own[g.iter().position(|&m| m == j).unwrap()];
+                                        Sig { preserves, xpreserves, ret, ..site_sig(&f.targets[k], f.guesses[k], &sigs, &guessed) }
+                                    }
+                                    _ => site_sig(&f.targets[k], f.guesses[k], &sigs, &guessed),
+                                };
+                                let r = abi::infer(f.ir.as_ref().unwrap(), &f.sites, &callee, sigs[i], wanted_by[i], set_args[i]);
+                                (i, Sig { stack_args: stack_args[i], ..r.sig }, r.reads)
+                            })
+                            .collect();
+                        let kept: Vec<(u16, u32, bool)> = own
+                            .iter()
+                            .zip(&out)
+                            .map(|(o, (_, s, _))| (o.0 & s.preserves, o.1 & s.xpreserves, o.2 && s.ret))
+                            .collect();
+                        if !cyclic || kept == own {
+                            break out;
+                        }
+                        own = kept;
+                    }
                 })
                 .collect();
-            for (i, r) in next.into_iter().enumerate() {
-                if let Some(r) = r {
-                    results[i] = r;
-                }
+            for (i, sig, reads) in next.into_iter().flatten() {
+                results[i] = (sig, reads);
             }
             let mut wanted = called.clone();
             for (f, w) in funcs.iter().zip(&wanted_by) {

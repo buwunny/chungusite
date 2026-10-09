@@ -42,8 +42,8 @@ pub enum Off {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Origin {
     /// Bit `r` set: may be derived from root `r` (`Analysis::roots`; bit
-    /// `OTHER` stands for the roots past the 63rd).
-    pub roots: u64,
+    /// `OTHER` stands for the roots past the 127th).
+    pub roots: u128,
     /// Meaningful only when `roots` is non-zero.
     pub off: Off,
     /// The lowest offset it may have: pointer arithmetic moves up within an
@@ -53,8 +53,8 @@ pub struct Origin {
     pub lo: i64,
 }
 
-/// The root index shared by every root past the 63rd. It is never safe.
-pub const OTHER: u8 = 63;
+/// The root index shared by every root past the 127th. It is never safe.
+pub const OTHER: u8 = 127;
 
 impl Origin {
     pub const NONE: Origin = Origin { roots: 0, off: Off::Known(0), lo: 0 };
@@ -64,7 +64,7 @@ impl Origin {
     }
 
     fn root(r: u8) -> Origin {
-        Origin { roots: 1 << r, off: Off::Known(0), lo: 0 }
+        Origin { roots: 1u128 << r, off: Off::Known(0), lo: 0 }
     }
 
     /// The root, if there is exactly one.
@@ -109,7 +109,7 @@ impl Origin {
     }
 
     pub fn each_root(self) -> impl Iterator<Item = u8> {
-        (0..64u8).filter(move |&k| self.roots & (1 << k) != 0)
+        (0..128u8).filter(move |&k| self.roots & (1u128 << k) != 0)
     }
 }
 
@@ -127,6 +127,12 @@ pub enum Root {
     Global(u64),
     /// The result of the allocating call that defines this value.
     Alloc(ValueId),
+    /// What argument `k`'s object holds: pointers loaded from it, and from what
+    /// they point to, and so on, to objects of the caller's. Never safe. Whether
+    /// the function keeps one of them is part of its summary
+    /// (`Pass::Borrow::keeps`), so a caller can lend a struct of references
+    /// without what they point to escaping.
+    Contents(u8),
 }
 
 /// What a callee does with one argument (its summary, from its own analysis, or
@@ -143,6 +149,10 @@ pub enum Pass {
         /// It accesses at most this many bytes from the pointer, also through
         /// callees; `None` if it indexes or doesn't know.
         len: Option<u32>,
+        /// It may keep a pointer it loads from the object, or from what that
+        /// points to (store it, return it, or pass it on to a callee that may):
+        /// the objects the caller's pointers stored there point to escape.
+        keeps: bool,
     },
     /// Frees it (`free`, `operator delete`): a move of an owned allocation.
     Free,
@@ -164,6 +174,13 @@ pub struct Callee {
     pub alloc: Option<(u8, Option<u8>)>,
     /// The result points into these arguments (bit = position).
     pub ret_from: u64,
+    /// The same for the high half of a 16-byte result (rdx).
+    pub ret2_from: u64,
+    /// The result may be a pointer loaded from what these arguments point to
+    /// (or from what that points to, ...): `Vec::len`, `Option<&T>::unwrap`.
+    pub ret_contents: u64,
+    /// The same for rdx.
+    pub ret2_contents: u64,
     /// The call goes to the callee's raw twin: arguments it borrows are passed
     /// as addresses (they escape), but it still accesses only `len` bytes of
     /// them during the call.
@@ -196,6 +213,8 @@ pub enum FactKind {
     Escape,
     /// Returned to the caller (a reborrow if the root turns out to be a pointer).
     Return,
+    /// Returned in rdx, the high half of a 16-byte result.
+    Return2,
     /// Compared with zero: the argument is `Option<&T>` / `Option<&mut T>`.
     NullCheck,
     /// Passed to a callee that takes a slice.
@@ -252,6 +271,13 @@ pub struct ParamBorrow {
     /// A value derived from it is returned. With a pointer class this means the
     /// return borrows from this argument (`fn(&'a T) -> &'a U`).
     pub returned: bool,
+    /// The same, in rdx.
+    pub returned2: bool,
+    /// A pointer loaded from its object (or deeper) may be returned, in rax and
+    /// in rdx (`Callee::ret_contents`).
+    pub returns_contents: (bool, bool),
+    /// A pointer loaded from its object may be kept (`Pass::Borrow::keeps`).
+    pub keeps: bool,
     /// Compared against null: emit as `Option<&T>` / `Option<&mut T>`.
     pub nullable: bool,
     /// Constant offsets read or written through it, sorted; `true` if written.
@@ -272,7 +298,7 @@ pub struct Analysis {
     pub facts: Vec<Fact>,
     /// One entry per entry-block parameter, in parameter order.
     pub params: Vec<ParamBorrow>,
-    /// What each root index stands for (at most 63; see `OTHER`).
+    /// What each root index stands for (at most 127; see `OTHER`).
     pub roots: Vec<Root>,
     /// Accesses through the root can be bounds-checked, and it can be reborrowed.
     pub safe: Vec<bool>,
@@ -347,6 +373,76 @@ fn konst(f: &Function, v: ValueId) -> Option<i64> {
     }
 }
 
+/// Masks that keep a register's bits above a byte or word written into it.
+const PARTIAL_WRITE: [u64; 3] = [!0xff, !0xff00, !0xffff];
+
+/// Who uses each value, for `only_compared`.
+struct Users {
+    of: Vec<Vec<ValueId>>,
+    /// Used by a terminator other than as a branch condition or an edge
+    /// argument: returned, or an argument of a tail call.
+    kept: Vec<bool>,
+}
+
+impl Users {
+    fn new(f: &Function, cfg: &Cfg) -> Users {
+        let mut u = Users { of: vec![Vec::new(); f.insts.len()], kept: vec![false; f.insts.len()] };
+        for &b in &cfg.rpo {
+            let blk = &f.blocks[b];
+            for &id in blk.insts.get(&f.value_pool) {
+                crate::verify::for_each_operand(f.insts[id].kind, f, |v| u.of[v.index()].push(id));
+            }
+            for (k, &p) in blk.params.get(&f.value_pool).iter().enumerate() {
+                for &pred in cfg.preds(b) {
+                    incoming(f, pred, b, k, |a| u.of[a.index()].push(p));
+                }
+            }
+            match blk.term {
+                Terminator::Return(Some(v)) => u.kept[v.index()] = true,
+                Terminator::TailCall { callee, args } => {
+                    u.kept[callee.index()] = true;
+                    for &a in args.get(&f.value_pool) {
+                        u.kept[a.index()] = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        u
+    }
+}
+
+/// `v` is computed from a pointer, but it and whatever is computed from it only
+/// end up compared (`p & (align - 1) == 0`, the low byte of a register that
+/// held a pointer): nothing can get the pointer back.
+fn only_compared(f: &Function, users: &Users, v: ValueId) -> bool {
+    use InstKind::*;
+    let mut seen = vec![v];
+    let mut work = vec![v];
+    while let Some(x) = work.pop() {
+        if users.kept[x.index()] {
+            return false;
+        }
+        for &u in &users.of[x.index()] {
+            match f.insts[u].kind {
+                Cmp { .. } => {}
+                Bin { op: BinOp::And, lhs, rhs } if [lhs, rhs].iter().any(|&m| konst(f, m).is_some_and(|m| PARTIAL_WRITE.contains(&(m as u64)))) => {}
+                Bin { .. } | Un { .. } | Cast { .. } | Select { .. } | BlockParam(_) => {
+                    if !seen.contains(&u) {
+                        if seen.len() == 64 {
+                            return false;
+                        }
+                        seen.push(u);
+                        work.push(u);
+                    }
+                }
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
 /// Edge argument `k` on every edge from `p` into `b`.
 pub(crate) fn incoming(f: &Function, p: BlockId, b: BlockId, k: usize, mut cb: impl FnMut(ValueId)) {
     match f.blocks[p].term {
@@ -398,7 +494,10 @@ fn callees(f: &Function, cfg: &Cfg, ctx: &Ctx) -> Callees {
     c
 }
 
-/// Every root, and the root each value starts (if it starts one).
+/// Every root, and the root each value starts (if it starts one). Globals come
+/// last: when there are more roots than `OTHER`, the ones that share it (and are
+/// raw) should be globals, whose accesses safe mode reads from statics anyway,
+/// rather than the frame or an allocation.
 fn find_roots(f: &Function, cfg: &Cfg, callees: &Callees) -> (Vec<Root>, HashMap<ValueId, u8>) {
     let mut roots = Vec::new();
     let mut starts = HashMap::new();
@@ -412,36 +511,44 @@ fn find_roots(f: &Function, cfg: &Cfg, callees: &Callees) -> (Vec<Root>, HashMap
         roots.push(r);
         (roots.len() - 1) as u8
     };
-    for k in 0..f.blocks[f.entry].params.len as usize {
+    let params = f.blocks[f.entry].params.len as usize;
+    for k in 0..params {
         add(&mut roots, Root::Param(k.min(255) as u8));
     }
-    for &b in &cfg.rpo {
-        for &id in f.blocks[b].insts.get(&f.value_pool) {
-            let r = match f.insts[id].kind {
-                InstKind::AddrOfLocal(_) => Root::Frame(0),
-                InstKind::IntToPtr(v) => match konst(f, v) {
-                    Some(c) => Root::Global(c as u64),
-                    None => continue,
-                },
-                // an allocation whose size arguments are there
-                InstKind::Call { args, .. }
-                    if callees.call.get(&id).and_then(|c| c.alloc).is_some_and(|(a, b)| {
-                        (a.max(b.unwrap_or(0)) as u32) < args.len
-                    }) =>
-                {
-                    Root::Alloc(id)
+    for k in 0..params {
+        add(&mut roots, Root::Contents(k.min(255) as u8));
+    }
+    for globals in [false, true] {
+        for &b in &cfg.rpo {
+            for &id in f.blocks[b].insts.get(&f.value_pool) {
+                let r = match f.insts[id].kind {
+                    InstKind::AddrOfLocal(_) => Root::Frame(0),
+                    InstKind::IntToPtr(v) => match konst(f, v) {
+                        Some(c) => Root::Global(c as u64),
+                        None => continue,
+                    },
+                    // an allocation whose size arguments are there
+                    InstKind::Call { args, .. }
+                        if callees.call.get(&id).and_then(|c| c.alloc).is_some_and(|(a, b)| {
+                            (a.max(b.unwrap_or(0)) as u32) < args.len
+                        }) =>
+                    {
+                        Root::Alloc(id)
+                    }
+                    _ => continue,
+                };
+                if matches!(r, Root::Global(_)) == globals {
+                    starts.insert(id, add(&mut roots, r));
                 }
-                _ => continue,
-            };
-            starts.insert(id, add(&mut roots, r));
+            }
         }
     }
     (roots, starts)
 }
 
 /// The roots that are objects of the frame.
-fn frame_mask(roots: &[Root]) -> u64 {
-    roots.iter().enumerate().filter(|(_, r)| matches!(r, Root::Frame(_))).fold(0, |m, (i, _)| m | 1 << i)
+fn frame_mask(roots: &[Root]) -> u128 {
+    roots.iter().enumerate().filter(|(_, r)| matches!(r, Root::Frame(_))).fold(0, |m, (i, _)| m | 1u128 << i)
 }
 
 /// Bytes a load or store of this type accesses.
@@ -517,25 +624,32 @@ fn frame_pieces(f: &Function, facts: &[Fact], fr: u8, callees: &Callees, end: i6
 }
 
 /// Makes each piece of the frame its own root (`Root::Frame(lo)`), and points
-/// every value into the frame at the piece holding its lowest offset.
+/// every value into the frame at the piece holding its lowest offset. The new
+/// roots go right after the frame's, ahead of the globals (`find_roots`).
 fn split_frame(roots: &mut Vec<Root>, origin: &mut [Origin], fr: u8, pieces: &[(i64, i64)]) {
-    let mut index = vec![fr];
-    roots[fr as usize] = Root::Frame(pieces[0].0 as u32);
-    for &(lo, _) in &pieces[1..] {
-        if roots.len() < OTHER as usize {
-            roots.push(Root::Frame(lo as u32));
-            index.push((roots.len() - 1) as u8);
-        } else {
-            index.push(OTHER);
+    let fr = fr as usize;
+    let mut new: Vec<Root> = roots[..fr].to_vec();
+    new.extend(pieces.iter().map(|p| Root::Frame(p.0 as u32)));
+    new.extend_from_slice(&roots[fr + 1..]);
+    let at = |i: usize| i.min(OTHER as usize) as u8;
+    // old root index -> new one; the frame's own is replaced per value below
+    let moved: Vec<u8> = (0..=OTHER as usize).map(|r| if r < fr || r == OTHER as usize { at(r) } else { at(r + pieces.len() - 1) }).collect();
+    new.truncate(OTHER as usize);
+    *roots = new;
+    for o in origin.iter_mut().filter(|o| !o.is_none()) {
+        let mut bits = 0u128;
+        for r in o.each_root() {
+            bits |= 1u128 << if r as usize == fr {
+                let off = match o.off {
+                    Off::Known(x) => x,
+                    Off::Unknown => o.lo,
+                };
+                at(fr + pieces.iter().rposition(|p| p.0 <= off).unwrap_or(0))
+            } else {
+                moved[r as usize]
+            };
         }
-    }
-    for o in origin.iter_mut().filter(|o| o.roots & (1 << fr) != 0) {
-        let at = match o.off {
-            Off::Known(x) => x,
-            Off::Unknown => o.lo,
-        };
-        let k = pieces.iter().rposition(|p| p.0 <= at).unwrap_or(0);
-        o.roots = (o.roots & !(1 << fr)) | 1 << index[k];
+        o.roots = bits;
     }
 }
 
@@ -600,37 +714,89 @@ fn transfer(f: &Function, id: ValueId, o: &[Origin], starts: &HashMap<ValueId, u
         },
         Bin { op: BinOp::Sub, lhs, rhs } => match konst(f, rhs) {
             Some(c) if of(rhs).is_none() => of(lhs).shift(c.wrapping_neg()),
+            // `end - start` of one object: a length, not a pointer
+            _ if !of(rhs).is_none() && of(lhs).roots == of(rhs).roots => Origin::NONE,
             // `p - q` is usually a length; treated as derived from `p` (sound, and
             // monotone), and `facts` doesn't count `q` as escaping.
             _ => of(lhs).unknown(),
         },
         Select { t, f: e, .. } => of(t).join(of(e)),
         Cast { kind: CastKind::Bitcast, v } | IntToPtr(v) | PtrToInt(v) => of(v),
-        // A pointer loaded from the frame or an allocation: whatever was stored there.
-        Load { ptr, .. } => match of(ptr).single() {
-            Some(r) if is_container(roots, r) => mem_load(mem, r, of(ptr).off),
+        // A pointer loaded from the frame or an allocation: whatever was stored
+        // there. Fewer than 8 bytes can't be a pointer (`movzbl 0x448(%rsp)` of a
+        // flag next to one).
+        Load { ptr, .. } if access_len(f.insts[id].ty).is_none_or(|n| n >= 8) => match of(ptr).single().map(|r| (r, roots.get(r as usize))) {
+            Some((r, _)) if is_container(roots, r) => mem_load(mem, r, of(ptr).off),
+            // whatever the caller stored in an argument's object, and in what
+            // that points to, and so on
+            Some((r, Some(Root::Param(_) | Root::Contents(_)))) => held(r, roots, mem),
             _ => Origin::NONE,
         },
         Call { args, .. } => match callees.call.get(&id) {
-            Some(c) if c.ret_from != 0 => {
-                let args = args.get(&f.value_pool);
-                (0..args.len().min(64))
-                    .filter(|&k| c.ret_from & (1 << k) != 0)
-                    .fold(Origin::NONE, |a, k| a.join(of(args[k])))
-                    .unknown()
-            }
+            Some(c) => returned(f, args, c.ret_from, c.ret_contents, o, roots, mem),
+            None => Origin::NONE,
+        },
+        CallOut { call, reg: 2 } => match (f.insts[call].kind, callees.call.get(&call)) {
+            (Call { args, .. }, Some(c)) => returned(f, args, c.ret2_from, c.ret2_contents, o, roots, mem),
             _ => Origin::NONE,
         },
         _ => Origin::NONE,
     }
 }
 
+/// What a call returns: derived from the arguments in `from`, or loaded from what
+/// those in `contents` point to, which is whatever is stored there and in what
+/// that points to, and so on.
+fn returned(f: &Function, args: ListRef, from: u64, contents: u64, o: &[Origin], roots: &[Root], mem: &Mem) -> Origin {
+    let args = args.get(&f.value_pool);
+    let picked = |bits: u64| (0..args.len().min(64)).filter(move |&k| bits & (1 << k) != 0).map(|k| o[args[k].index()]);
+    let r = picked(from).fold(Origin::NONE, |a, x| a.join(x)).unknown();
+    picked(contents).fold(r, |r, x| r.join(reach(x, roots, mem)))
+}
+
+/// What pointers stored in the objects root `c` stands for may point to.
+/// Pointers stored in a global (or past `OTHER`) escape when they are stored.
+fn held(c: u8, roots: &[Root], mem: &Mem) -> Origin {
+    let o = match roots.get(c as usize) {
+        Some(Root::Frame(_) | Root::Alloc(_)) => mem_load(mem, c, Off::Unknown),
+        Some(&Root::Param(k)) => match roots.iter().position(|&x| x == Root::Contents(k)) {
+            Some(i) => Origin::root(i as u8),
+            None => Origin::NONE,
+        },
+        Some(Root::Contents(_)) => Origin::root(c),
+        _ => Origin::NONE,
+    };
+    if o.is_none() {
+        o
+    } else {
+        Origin { lo: i64::MIN, ..o.unknown() }
+    }
+}
+
+/// What pointers stored in the objects `o` points into may point to, and what
+/// pointers stored there may, and so on.
+fn reach(o: Origin, roots: &[Root], mem: &Mem) -> Origin {
+    let mut r = Origin::NONE;
+    let mut seen: u128 = 0;
+    let mut work: Vec<u8> = o.each_root().collect();
+    while let Some(c) = work.pop() {
+        if seen & (1u128 << c) != 0 {
+            continue;
+        }
+        seen |= 1u128 << c;
+        let h = held(c, roots, mem);
+        work.extend(h.each_root());
+        r = r.join(h);
+    }
+    r
+}
+
 /// Roots that are certainly pointers: everything but arguments, which may be
 /// integers.
-fn pointer_roots(roots: &[Root]) -> u64 {
-    let mut m = 1 << OTHER;
+fn pointer_roots(roots: &[Root]) -> u128 {
+    let mut m = 1u128 << OTHER;
     for (r, root) in roots.iter().enumerate() {
-        if !matches!(root, Root::Param(_)) {
+        if !matches!(root, Root::Param(_) | Root::Contents(_)) {
             m |= 1 << r;
         }
     }
@@ -691,12 +857,9 @@ fn origins(f: &Function, cfg: &Cfg, roots: &[Root], starts: &HashMap<ValueId, u8
                         }
                     }
                     InstKind::MemCopy { dst, src, .. } => {
-                        let (d, s) = (o[dst.index()].single(), o[src.index()].single());
-                        if let (Some(d), Some(s)) = (d, s) {
-                            if is_container(roots, d) && is_container(roots, s) {
-                                let all = mem_load(&mem, s, Off::Unknown);
-                                changed |= mem_join(&mut mem, (d, None), all);
-                            }
+                        if let (Some(d), Some(s)) = (o[dst.index()].single().filter(|&d| is_container(roots, d)), o[src.index()].single()) {
+                            let all = held(s, roots, &mem);
+                            changed |= mem_join(&mut mem, (d, None), all);
                         }
                     }
                     _ => {}
@@ -743,6 +906,8 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callee
     let mut unprovable = Vec::new();
     let mut bad_calls = Vec::new();
     let mut opaque = false;
+    let users = std::cell::OnceCell::new();
+    let users = || users.get_or_init(|| Users::new(f, cfg));
     for &b in &cfg.rpo {
         let blk = &f.blocks[b];
         let mut fx = FactSink { o, out: &mut out, unprovable: &mut unprovable, bad_calls: &mut bad_calls, point: 0, at: None };
@@ -764,6 +929,14 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callee
                     fx.access(dst, FactKind::Write);
                     fx.access(src, FactKind::Read);
                     fx.add(len, FactKind::Escape);
+                    // copying an argument's object into one that isn't followed
+                    // copies the pointers the caller stored in it there
+                    if let Some(s) = o[src.index()].single().filter(|&s| matches!(roots.get(s as usize), Some(Root::Param(_)))) {
+                        if !o[dst.index()].single().is_some_and(|d| is_container(roots, d)) {
+                            let lo = o[src.index()].lo;
+                            fx.out.push(Fact { root: s, off: Off::Unknown, lo, kind: FactKind::Spill, at: fx.at, point: fx.point, site: None });
+                        }
+                    }
                     if let Some(s) = o[src.index()].single().filter(|&s| is_container(roots, s)) {
                         let kind = match o[dst.index()].single().filter(|&d| is_container(roots, d)) {
                             Some(d) => FactKind::CopyTo(d),
@@ -787,7 +960,7 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callee
                     if kept & frame_mask(roots) != 0 {
                         kept |= frame_mask(roots);
                     }
-                    if !is_pointer_difference(k, o) {
+                    if !is_pointer_difference(k, o) && !only_compared(f, users(), id) {
                         crate::verify::for_each_operand(k, f, |v| {
                             if o[v.index()].roots & !kept != 0 && !is_index(roots, o, id, v) {
                                 fx.add(v, FactKind::Escape);
@@ -795,6 +968,18 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callee
                         });
                     }
                 }
+                // `p & 7`: the low bits (an alignment check, a tag) aren't a
+                // pointer to anything. Nor is a register that held a pointer
+                // with its low byte or word overwritten (`sete al` lifts as
+                // `rax & !0xff | ...`): no compiler uses what's left as one.
+                Bin { op: BinOp::And, lhs, rhs }
+                    if konst(f, rhs).or(konst(f, lhs)).is_some_and(|m| (0..4096).contains(&m) || PARTIAL_WRITE.contains(&(m as u64))) => {}
+                // An address scaled or shifted by a constant (a hash, a page
+                // number; or an integer that shares a slot with a pointer) isn't
+                // a pointer to anything.
+                Bin { op: BinOp::Mul, lhs, rhs } if konst(f, rhs).or(konst(f, lhs)).is_some_and(|c| c != 1) => {}
+                Bin { op: BinOp::Shl | BinOp::LShr | BinOp::AShr, rhs, .. } if konst(f, rhs).is_some_and(|c| c >= 1) => {}
+                Bin { op: BinOp::UDiv | BinOp::SDiv | BinOp::URem | BinOp::SRem, rhs, .. } if konst(f, rhs).is_some_and(|c| c >= 2) => {}
                 // Comparisons (null checks, `p < end`) don't let the pointer out.
                 Cmp { cc: Cond::Eq | Cond::Ne, lhs, rhs } => {
                     if konst(f, rhs) == Some(0) && o[lhs.index()].off == Off::Known(0) {
@@ -805,6 +990,19 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callee
                 // registers after a call, and at a return: bookkeeping, not uses
                 CallOut { .. } | Exit { .. } => {}
                 Opaque { .. } => opaque = true,
+                // what is only compared doesn't let the pointer out
+                Bin { .. } | Un { .. } | Cast { .. } if only_compared(f, users(), id) => {}
+                // rax:rdx returned: rax is the return value, the sret pointer of a
+                // function that returns a struct in memory
+                Aggregate { fields, .. } if users().of[id.index()].is_empty() && users().kept[id.index()] => {
+                    for (k, &v) in fields.get(&f.value_pool).iter().enumerate() {
+                        fx.add(v, match k {
+                            0 => FactKind::Return,
+                            1 => FactKind::Return2,
+                            _ => FactKind::Escape,
+                        });
+                    }
+                }
                 k => crate::verify::for_each_operand(k, f, |v| fx.add(v, FactKind::Escape)),
             }
         }
@@ -821,6 +1019,13 @@ fn facts(f: &Function, cfg: &Cfg, o: &[Origin], roots: &[Root], callees: &Callee
                     for (k, &a) in args.get(&f.value_pool).iter().enumerate().take(64) {
                         if c.ret_from & (1 << k) != 0 {
                             fx.add(a, FactKind::Return);
+                        }
+                        if c.ret2_from & (1 << k) != 0 {
+                            fx.add(a, FactKind::Return2);
+                        }
+                        // (what is stored in it is our return value)
+                        if (c.ret_contents | c.ret2_contents) & (1 << k) != 0 {
+                            fx.add(a, FactKind::Spill);
                         }
                     }
                 }
@@ -926,6 +1131,7 @@ struct Uses {
     write: bool,
     escape: bool,
     returned: bool,
+    returned2: bool,
     nullable: bool,
     borrowed: bool,
     borrowed_mut: bool,
@@ -953,6 +1159,7 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
             FactKind::Write => r.write = true,
             FactKind::Escape => r.escape = true,
             FactKind::Return => r.returned = true,
+            FactKind::Return2 => r.returned2 = true,
             FactKind::NullCheck => r.nullable = true,
             FactKind::Borrow { mutbl } => {
                 r.borrowed = true;
@@ -976,6 +1183,35 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
             r.negative |= matches!(x.off, Off::Known(o) if o < 0);
         }
     }
+    // A container lent to callees that may keep a pointer they load from it: what
+    // its pointers point to escapes. Lent only to callees that don't, the objects
+    // reachable from it are read and written during the call through them.
+    let mut lent_keeps = vec![false; n];
+    for x in &a.facts {
+        if let (FactKind::Borrow { .. } | FactKind::RawLend { .. }, Some((site, k))) = (x.kind, x.site) {
+            let keeps = match (ctx.callee)(site).and_then(|c| c.args.get(k as usize).copied()) {
+                Some(Pass::Borrow { keeps, .. }) => keeps,
+                _ => true,
+            };
+            if let Some(l) = lent_keeps.get_mut(x.root as usize) {
+                *l |= keeps;
+            }
+        }
+    }
+    let mut work: Vec<usize> = (0..n).filter(|&c| u[c].borrowed).collect();
+    let mut reached = vec![false; n];
+    while let Some(c) = work.pop() {
+        for x in &a.facts {
+            let r = x.root as usize;
+            if x.kind == FactKind::Stash(c as u8) && r < n && !reached[r] {
+                reached[r] = true;
+                u[r].read = true;
+                u[r].write = true;
+                u[r].borrowed = true;
+                work.push(r);
+            }
+        }
+    }
     let in_loop: Vec<bool> = a.roots.iter().map(|r| matches!(r, Root::Alloc(id) if in_cycle(f, cfg, *id))).collect();
 
     // Downgrade to a fixpoint: `safe` only goes from true to false, and the sets
@@ -989,7 +1225,7 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
     loop {
         // a container's contents escape if it isn't safe itself, is copied out,
         // or is lent to a callee (which could read the pointers in it)
-        let mut contents_escape: Vec<bool> = (0..n).map(|c| !safe[c] || u[c].spill || u[c].borrowed).collect();
+        let mut contents_escape: Vec<bool> = (0..n).map(|c| !safe[c] || u[c].spill || lent_keeps[c]).collect();
         loop {
             let mut more = false;
             for x in &a.facts {
@@ -1052,6 +1288,7 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
                         common,
                         if x.write || x.borrowed_mut || x.freed { "written" } else { "" },
                     ]),
+                    Root::Contents(_) => "loaded from an argument",
                     Root::Alloc(_) => first(&[
                         common,
                         neg,
@@ -1167,7 +1404,33 @@ fn classify(f: &Function, cfg: &Cfg, ctx: &Ctx, points: &Points, a: &mut Analysi
                 Class::Shared
             };
             let extent = extent.and_then(|e| u32::try_from(e).ok());
-            ParamBorrow { value, reg: reg(k), class, returned: x.returned, nullable: x.nullable, fields, indexed, extent }
+            // what the caller stored in the object leaves if a pointer loaded from
+            // it escapes, or the object is copied or lent where that may happen
+            let keeps = x.spill
+                || lent_keeps.get(r).copied().unwrap_or(true)
+                || a.facts.iter().any(|y| y.root as usize == r && y.kind == FactKind::Read && y.site.is_some())
+                || match a.roots.iter().position(|&c| c == Root::Contents(k.min(255) as u8)) {
+                    Some(c) => {
+                        let y = u[c];
+                        a.escaped[c] || y.freed || y.spill || lent_keeps[c]
+                    }
+                    None => true,
+                };
+            let contents = a.roots.iter().position(|&c| c == Root::Contents(k.min(255) as u8));
+            let returns_contents = contents.map_or((false, false), |c| (u[c].returned, u[c].returned2));
+            ParamBorrow {
+                value,
+                reg: reg(k),
+                class,
+                returned: x.returned,
+                returned2: x.returned2,
+                returns_contents,
+                keeps,
+                nullable: x.nullable,
+                fields,
+                indexed,
+                extent,
+            }
         })
         .collect();
 }

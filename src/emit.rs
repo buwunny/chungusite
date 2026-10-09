@@ -371,7 +371,7 @@ fn struct_arg(
     if !a.safe[r] {
         return false;
     }
-    let through = |v: ValueId| a.origin[v.index()].roots & (1 << r) != 0;
+    let through = |v: ValueId| a.origin[v.index()].roots & (1u128 << r) != 0;
     let mut any = false;
     for &b in &cfg.rpo {
         for &id in f.blocks[b].insts.get(&f.value_pool) {
@@ -422,7 +422,7 @@ fn elems_arg(f: &Function, cfg: &Cfg, a: &Analysis, k: usize, p: ValueId, w: u8)
     if !a.safe[r] {
         return false;
     }
-    let through = |v: ValueId| a.origin[v.index()].roots & (1 << r) != 0;
+    let through = |v: ValueId| a.origin[v.index()].roots & (1u128 << r) != 0;
     let res = residues(f, cfg, p, w as u64);
     let lent = |args: ListRef| args.get(&f.value_pool).iter().any(|&v| through(v));
     let mut any = false;
@@ -1808,6 +1808,7 @@ impl Emitter<'_> {
                         let g = global_slice(c)?;
                         Place { read: format!("{g}.b"), write: None, base: format!("(core::ptr::addr_of!({g}) as u64)"), elem: None }
                     }
+                    Root::Contents(_) => return None,
                     Root::Alloc(id) => {
                         let h = format!("heap{}", id.index());
                         Place { read: h.clone(), write: Some(h.clone()), base: format!("{h}_base"), elem: None }

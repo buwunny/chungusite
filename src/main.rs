@@ -552,11 +552,12 @@ fn borrows(func: &Function, a: &Analysis, out: &mut String) {
             p.fields.iter().map(|&(o, w)| format!("{o:+}{}", if w { " (written)" } else { "" })).collect();
         let _ = writeln!(
             out,
-            "  {}: {class}{}{}{}",
+            "  {}: {class}{}{}{}{}",
             if p.reg >= 16 { "stack".to_string() } else { REG[p.reg as usize].to_string() },
             if fields.is_empty() { String::new() } else { format!(", fields at {}", fields.join(", ")) },
             if p.indexed { ", indexed" } else { "" },
             if p.returned && p.class != Class::NotPointer { ", return value borrows from it" } else { "" },
+            if p.keeps && matches!(p.class, Class::Shared | Class::Mut) { ", may keep the pointers in it" } else { "" },
         );
     }
     for (r, root) in a.roots.iter().enumerate() {
@@ -566,7 +567,7 @@ fn borrows(func: &Function, a: &Analysis, out: &mut String) {
             continue;
         }
         let name = match root {
-            Root::Param(_) => continue,
+            Root::Param(_) | Root::Contents(_) => continue,
             Root::Frame(0) => "frame".to_string(),
             Root::Frame(lo) => format!("frame from {lo}"),
             Root::Global(c) => format!("global {c:#x}"),

@@ -51,18 +51,19 @@ The first question is not "is this a reference?" but "*which object and which of
   - each entry parameter (a possible pointer argument; this includes RSP in IR straight from the lifter, which makes the stack one more root);
   - the stack frame, `AddrOfLocal` (after `frame::promote`, rsp is replaced by the frame's address);
   - a global, `IntToPtr(Const(addr))`, one root per address;
-  - an allocation, the result of a call whose summary says it allocates (`malloc`, `calloc`, `operator new`, `__rust_alloc`).
-  A function has at most 63 roots; the rest share one root that is never safe.
-- **Lattice.** An origin is a set of roots (a `u64` bitmask) plus an offset, either `Known(i64)` or `Unknown`. Join takes the union of the roots. The offset survives only if both sides agree. That is finite height, so it terminates.
+  - an allocation, the result of a call whose summary says it allocates (`malloc`, `calloc`, `operator new`, `__rust_alloc`);
+  - for each parameter, its *contents* (`Root::Contents(k)`): the pointers loaded from argument `k`'s object, and from what those point to. It is never safe (nothing in the function owns it); it is there so that a callee's summary can say whether such pointers are kept or returned (stage 5).
+  A function has at most 127 roots; the rest share one root that is never safe. Globals come last, so in a function that reads hundreds of them it is globals that share the overflow root, not the frame.
+- **Lattice.** An origin is a set of roots (a `u128` bitmask) plus an offset, either `Known(i64)` or `Unknown`. Join takes the union of the roots. The offset survives only if both sides agree. That is finite height, so it terminates.
 - **Transfer.**
   - `PtrOffset base+disp` shifts by `disp`.
   - An index makes the offset `Unknown`, which is array or slice access.
-  - `Add`/`Sub` by a constant shift the offset. `Add` with a non-constant gives `Unknown`.
+  - `Add`/`Sub` by a constant shift the offset. `Add` with a non-constant gives `Unknown`. `p - q` where both point into the same roots is a length, with no origin.
   - In `a + b` (or `[a + b*1]`) where both are derived, either could be the pointer, so both are kept, except that when one side certainly points into an object (the frame, a global, an allocation) and the other only comes from arguments, the argument is the index.
   - `Select` joins its two inputs; casts and `IntToPtr`/`PtrToInt` pass them through.
   - Block parameters join their incoming edge arguments.
-  - A call returns an allocation (an allocator), or what its summary says the result points into (`memcpy` returns its first argument), with an unknown offset.
-  - **A load from the frame or an allocation** gets whatever was stored at that root and offset (plus whatever was stored there at an unknown offset). This is a flow-insensitive points-to map, keyed on `(root, offset)`, built in the same fixpoint. Debug builds keep almost everything in the frame, so without it every pointer that passes through a spilled local would be lost. Loads from argument memory or globals still have no origin: what the caller stored there is outside the function.
+  - A call returns an allocation (an allocator), or what its summary says the result points into (`memcpy` returns its first argument), with an unknown offset. The summary also says which arguments' *contents* the result may be (`Vec::as_ptr`, `Option<&T>::unwrap` on a `&Option<&T>`): then the result points wherever the caller's pointers stored in that object point. The same goes for the high half of a 16-byte result in rdx (`(ptr, len)` pairs).
+  - **A load from the frame or an allocation** gets whatever was stored at that root and offset (plus whatever was stored there at an unknown offset). This is a flow-insensitive points-to map, keyed on `(root, offset)`, built in the same fixpoint. Debug builds keep almost everything in the frame, so without it every pointer that passes through a spilled local would be lost. A load through an argument gets that argument's contents root. Loads from globals still have no origin, and neither does a load narrower than 8 bytes (it can't be a pointer).
   - Everything else has no origin.
 - **Fixpoint.** Iterate blocks in RPO until nothing changes. The transfer functions are monotone. One detail matters: "no origin" must have exactly one representation. Shifting it must not invent an offset, or a decrementing loop counter never converges. The random-program test found that bug.
 
@@ -79,13 +80,17 @@ One pass over the reachable blocks turns uses of derived values into facts about
 | `call f(args)`, tail call | per argument, what `f`'s summary says (stage 5); `Escape` for every argument of an unknown callee |
 | `ret v` | `Return(root(v))` |
 | `cmp.eq/ne p, 0` at offset 0 | `NullCheck(root(p))` |
-| any other operation on a derived value | `Escape` (it leaves what we can track) |
+| any other operation on a derived value | `Escape` (it leaves what we can track), except the ones below that reveal nothing usable as an address |
+| `p & mask` with a small mask (below 4096: alignment checks), or a mask clearing the low 1, 2 or 4 bytes (a partial-register write) | nothing |
+| `p * c`, `p << c`, `p >> c`, `p / c`, `p % c` by a constant (hashing a pointer) | nothing |
+| arithmetic whose result only reaches comparisons | nothing |
+| a struct of two values only returned (`{rax, rdx}`) | `Return` / `Return2` for its two fields |
 | `p - q` of two derived values | nothing (a length, like `offset_from`) |
 | `p < end` and other comparisons | nothing |
 
 Then a fixpoint decides which roots are **safe**: they start safe, and a root becomes raw (never the other way) when
 
-- something lets a pointer to it escape: an `Escape` fact, or a `Stash` into a container whose contents escape (a container that is raw itself, lent to a callee, or spilled), or a call that can't lend it (below);
+- something lets a pointer to it escape: an `Escape` fact, or a `Stash` into a container whose contents escape (a container that is raw itself, spilled, or lent to a callee that may keep what it holds), or a call that can't lend it (below);
 - it is accessed before its start (a negative constant offset), except a global, whose offset is from the address the code used;
 - and per kind of root: an argument must be dereferenced, not demoted and not freed; the frame must not be returned or freed, and not be the 64 KiB fallback frame for stack use the frame pass can't follow; a global must be in a read-only static that is emitted as `Bytes` (no pointer slots), and only read; an allocation must not be returned, not be made inside a loop (one variable holds it), be freed only at offset 0, and not be used after it may have been freed (stage 6).
 
@@ -146,12 +151,16 @@ On chungusite's own debug build (29,724 functions), splitting took bounds-checke
 | `Pass` | Meaning | Fact at the call |
 |---|---|---|
 | `Ignore` | the callee uses it as an integer and doesn't keep it | none |
-| `Borrow { mutbl, nullable }` | the callee takes a slice | `Borrow`: the caller lends its root |
+| `Borrow { mutbl, nullable, keeps }` | the callee takes a slice; `keeps` if it may keep a pointer loaded from it | `Borrow`: the caller lends its root |
 | `Access { write }` | read or written during the call only (`memcpy`, `memset`) | `Read` / `Write` |
 | `Free` | freed (`free`, `operator delete`, `__rust_dealloc`) | `Free`: a move |
 | `Escape` | anything else | `Escape` |
 
-plus whether the result is a new allocation and which arguments it points into. A decompiled function's summary comes from its own analysis (a `&T`/`&mut T` argument is a `Borrow`, an integer that doesn't escape is `Ignore`); C library functions come from `libc::summary`. Summaries start optimistic (`Ignore` everywhere) and are recomputed for the callers of every function whose summary changed, until none does. They only get worse, so this terminates; after 64 rounds whatever still changes takes integers.
+plus whether the result is a new allocation, which arguments it (and rdx) points into, and which arguments' contents it may be. A decompiled function's summary comes from its own analysis (a `&T`/`&mut T` argument is a `Borrow`, an integer that doesn't escape is `Ignore`); C library functions come from `libc::summary`. Summaries start optimistic (`Ignore` everywhere) and are recomputed for the callers of every function whose summary changed, until none does. They only get worse, so this terminates; after 64 rounds whatever still changes takes integers.
+
+**Lending objects that hold pointers.** Debug builds pass most things by reference to a struct on the stack: `fmt::Arguments` holds pointers to the values being formatted, an iterator holds a pointer to its slice. A local whose address is stored in another local that is then lent would escape, unless the callee's summary says what it does with the pointers it loads from the argument. That is what the contents root is for: in the callee, everything loaded through argument `k` points into `Contents(k)`, and the summary's `keeps` is set when that root escapes, is spilled, stored through, freed or lent on to a callee that keeps. When the callee keeps nothing, the caller's container doesn't leak what it holds, and the objects stored in it (and in what they hold, transitively) count as read, written and lent at the call. When the callee returns those pointers (`ret_contents`), the result points wherever they do.
+
+Two limits, the same as for raw twins: the objects reached through a lent container aren't checked against other loans (they are accessed through the addresses stored when the container was filled), and a pointer stored in a lent container keeps the provenance of that address. An indirect call keeps everything.
 
 **Lending.** At a call whose callee borrows an argument, the caller passes a slice of the root that argument points into, starting at the argument:
 
@@ -241,6 +250,23 @@ On a debug build of chungusite itself (20,025 functions, 18,131 lift), safe mode
 "Raw" counts loads, stores and copies through a raw pointer; the source of each comes from `sources.rs`, which classifies pointers the same way before and after. A function with no raw pointer has no raw access and no FFI or indirect call. There are fewer accesses in all because calls through GOT slots no longer load the slot (they are direct calls now). Counting the twins' raw accesses too, the output has 78,070 raw accesses instead of 111,630. The differential test (`tests/differential.rs`, 504 cases) passes as before, with new cases for lending two locals at once, the same local twice, a `Box` lent to a callee and freed, and `memset`/`memcpy` into a local.
 
 Before, only arguments could be safe, and a function that some decompiled function called took every argument as an integer. Some of the old output was also unsound: functions that data points to (vtables, callbacks) took slices while being called through `extern "C" fn(u64, ..)` pointers, and a pointer into two objects was accessed raw while one of them was a `&mut` argument. Both now stay raw.
+
+### Pointers lent inside other objects
+
+On a debug build of chungusite itself (34,811 functions), the contents roots, `keeps`, 127 roots with globals last, and the arithmetic that doesn't escape:
+
+| | before | after |
+|---|---:|---:|
+| memory accesses bounds-checked | 251,780 of 390,554 (64%) | 286,870 of 390,554 (73%) |
+| raw accesses through the frame | 104,464 | 72,809 |
+| raw accesses through globals | 1,580 | 1,543 |
+| raw accesses through arguments | 15,740 | 12,534 |
+| raw accesses through other pointers | 16,990 | 16,798 |
+| functions with no raw pointer at all | 23,878 | 23,981 |
+| safe `fn`s | 10,417 | 10,607 |
+| raw twins | 23,459 | 25,101 |
+
+Most of what is left in the frame is lent to callees that do keep (`fmt::Arguments` handed down to `write_fmt`, `Vec::push` storing a pointer), to indirect calls, or a frame object holding pointers to itself. Analysis takes about 30 s instead of 21 s.
 
 ## Costs
 

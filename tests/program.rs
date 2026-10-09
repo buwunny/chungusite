@@ -2,7 +2,8 @@
 //! callers and callees together, real calls, and stack slots as values.
 use chungusite::emit::Mode;
 use chungusite::ir::Function;
-use chungusite::program::{BuildOptions, Input, Program};
+use chungusite::borrow::Root;
+use chungusite::program::{BuildOptions, Input, Options, Program};
 use chungusite::types::{Proposal, TypeModel, Var};
 use iced_x86::code_asm::*;
 
@@ -453,4 +454,158 @@ fn a_type_models_proposals_pass_the_gate_or_change_nothing() {
     assert_eq!((p.type_stats.accepted, p.type_stats.rejected), (1, 1));
     let src = emitted(&p, Mode::Fast);
     assert!(src[0].contains("fn f(rdi: i32) -> u32 {"), "{}", src[0]);
+}
+
+// ---- what callees keep (docs/ownership.md, "Calls") ----
+
+/// The frame objects of `p.funcs[i]` that aren't safe.
+fn raw_frame(p: &Program, i: usize) -> Vec<Root> {
+    let a = p.analyses(&Options::default())[i].clone().expect("safe mode analysis");
+    a.roots.iter().enumerate().filter(|&(r, root)| matches!(root, Root::Frame(_)) && !a.safe[r]).map(|(_, &root)| root).collect()
+}
+
+/// `caller(x)`: a local holding `x`, a second local holding its address, and the
+/// second lent to `callee` (index 0) before `x` is read back.
+fn lend_a_reference(a: &mut CodeAssembler) {
+    a.sub(rsp, 40).unwrap();
+    a.mov(qword_ptr(rsp + 16), rdi).unwrap();
+    a.lea(rax, qword_ptr(rsp + 16)).unwrap();
+    a.mov(qword_ptr(rsp), rax).unwrap();
+    a.mov(rdi, rsp).unwrap();
+    a.call(addr(0)).unwrap();
+    a.add(rax, qword_ptr(rsp + 16)).unwrap();
+    a.add(rsp, 40).unwrap();
+    a.ret().unwrap();
+}
+
+#[test]
+fn a_reference_lent_inside_a_struct_stays_safe_if_the_callee_keeps_nothing() {
+    // deref(pp) = **pp
+    let (p, _) = program(&[
+        ("deref", &|a| {
+            a.mov(rax, qword_ptr(rdi)).unwrap();
+            a.mov(rax, qword_ptr(rax)).unwrap();
+            a.ret().unwrap();
+        }),
+        ("caller", &lend_a_reference),
+    ]);
+    let a = p.analyses(&Options::default())[0].clone().unwrap();
+    assert!(!a.params[0].keeps, "{:?}", a.params[0]);
+    assert_eq!(raw_frame(&p, 1), []);
+}
+
+#[test]
+fn a_callee_that_keeps_a_lent_reference_makes_it_escape() {
+    // stash(pp): a global = *pp
+    let (p, _) = program(&[
+        ("stash", &|a| {
+            a.mov(rax, qword_ptr(rdi)).unwrap();
+            a.mov(qword_ptr(0x9000), rax).unwrap();
+            a.ret().unwrap();
+        }),
+        ("caller", &lend_a_reference),
+    ]);
+    let a = p.analyses(&Options::default())[0].clone().unwrap();
+    assert!(a.params[0].keeps, "{:?}", a.params[0]);
+    assert_ne!(raw_frame(&p, 1), []);
+}
+
+#[test]
+fn a_returned_pointer_loaded_from_an_argument_still_borrows() {
+    // first(v) = v.ptr, like `Vec::as_ptr`; caller reads x through it
+    let (p, _) = program(&[
+        ("first", &|a| {
+            a.mov(rax, qword_ptr(rdi)).unwrap();
+            a.ret().unwrap();
+        }),
+        ("caller", &|a| {
+            a.sub(rsp, 40).unwrap();
+            a.mov(qword_ptr(rsp + 16), rdi).unwrap();
+            a.lea(rax, qword_ptr(rsp + 16)).unwrap();
+            a.mov(qword_ptr(rsp), rax).unwrap();
+            a.mov(rdi, rsp).unwrap();
+            a.call(addr(0)).unwrap();
+            a.mov(rax, qword_ptr(rax)).unwrap();
+            a.add(rsp, 40).unwrap();
+            a.ret().unwrap();
+        }),
+    ]);
+    let a = p.analyses(&Options::default())[0].clone().unwrap();
+    assert_eq!(a.params[0].returns_contents, (true, false), "{:?}", a.params[0]);
+    assert!(!a.params[0].keeps, "{:?}", a.params[0]);
+    assert_eq!(raw_frame(&p, 1), []);
+}
+
+#[test]
+fn a_pointer_returned_in_rdx_still_borrows() {
+    // pair(a, b) = (a, b); caller reads both locals back through the results
+    let (p, _) = program(&[
+        ("pair", &|a| {
+            a.mov(rax, rdi).unwrap();
+            a.mov(rdx, rsi).unwrap();
+            a.ret().unwrap();
+        }),
+        ("caller", &|a| {
+            a.sub(rsp, 24).unwrap();
+            a.mov(qword_ptr(rsp), rdi).unwrap();
+            a.mov(qword_ptr(rsp + 8), rsi).unwrap();
+            a.mov(rdi, rsp).unwrap();
+            a.lea(rsi, qword_ptr(rsp + 8)).unwrap();
+            a.call(addr(0)).unwrap();
+            a.mov(rax, qword_ptr(rax)).unwrap();
+            a.add(rax, qword_ptr(rdx)).unwrap();
+            a.add(rsp, 24).unwrap();
+            a.ret().unwrap();
+        }),
+    ]);
+    let a = p.analyses(&Options::default())[0].clone().unwrap();
+    let reg = |r: u8| a.params.iter().find(|x| x.reg == r).unwrap();
+    assert!(reg(7).returned && reg(6).returned2, "{:?}", a.params);
+    assert_eq!(raw_frame(&p, 1), []);
+}
+
+#[test]
+fn an_alignment_check_on_a_local_is_not_an_escape() {
+    // the low bits of &x tested, then x read: `(&x as usize) & 7` reveals nothing
+    let (p, _) = program(&[("f", &|a| {
+        a.sub(rsp, 24).unwrap();
+        a.mov(qword_ptr(rsp + 8), rdi).unwrap();
+        a.lea(rcx, qword_ptr(rsp + 8)).unwrap();
+        a.and(rcx, 7).unwrap();
+        a.mov(rax, qword_ptr(rsp + 8)).unwrap();
+        a.add(rax, rcx).unwrap();
+        a.add(rsp, 24).unwrap();
+        a.ret().unwrap();
+    })]);
+    assert_eq!(raw_frame(&p, 0), []);
+}
+
+#[test]
+fn many_globals_do_not_crowd_out_the_frame() {
+    // 140 globals read, more than there are roots, and a local lent to `load`
+    let (p, _) = program(&[
+        ("load", &|a| {
+            a.mov(rax, qword_ptr(rdi)).unwrap();
+            a.ret().unwrap();
+        }),
+        ("caller", &|a| {
+            a.push(rbx).unwrap();
+            a.sub(rsp, 16).unwrap();
+            a.mov(qword_ptr(rsp + 8), rdi).unwrap();
+            a.xor(ebx, ebx).unwrap();
+            for g in 0..140u64 {
+                a.add(rbx, qword_ptr(0x10_0000 + 0x100 * g)).unwrap();
+            }
+            a.lea(rdi, qword_ptr(rsp + 8)).unwrap();
+            a.call(addr(0)).unwrap();
+            a.add(rax, rbx).unwrap();
+            a.add(rsp, 16).unwrap();
+            a.pop(rbx).unwrap();
+            a.ret().unwrap();
+        }),
+    ]);
+    let a = p.analyses(&Options::default())[1].clone().unwrap();
+    assert!(a.roots.len() <= 128, "{}", a.roots.len());
+    assert!(a.roots.iter().any(|r| matches!(r, Root::Frame(_))), "{:?}", a.roots);
+    assert_eq!(raw_frame(&p, 1), []);
 }

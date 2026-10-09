@@ -954,7 +954,7 @@ pub fn stack_args(f: &Function) -> u8 {
                 _ => continue,
             };
             let o = a.origin[ptr.index()];
-            if o.roots == 1 << k {
+            if o.roots == 1u128 << k {
                 if let Off::Known(off) = o.off {
                     if (8..8 + 8 * 64).contains(&off) {
                         end = end.max(off + size as i64);

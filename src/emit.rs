@@ -34,7 +34,7 @@ use crate::lift::XMM_PARAM;
 use crate::borrow::{analyze_with, Analysis, Class, Ctx, Off, ParamBorrow, Pass, Root, RSP};
 use crate::cfg::Cfg;
 use crate::expr::{self, lit};
-use crate::structure::{print, structure, Node, Source, DISPATCH_VAR};
+use crate::structure::{declare_in_place, print, structure, Node, Source, DISPATCH_VAR};
 use crate::ir::*;
 use crate::sources::bucket;
 use crate::types::{base_of, leaf, render, width, FnTypes};
@@ -1307,6 +1307,7 @@ impl Emitter<'_> {
             }
         }
         // Up-front declarations for block params and cross-block values.
+        let mut decls: Vec<(String, String, &str)> = Vec::new();
         for &b in &cfg.rpo {
             let blk = &f.blocks[b];
             for &v in blk.params.get(&f.value_pool).iter().chain(blk.insts.get(&f.value_pool)) {
@@ -1317,12 +1318,20 @@ impl Emitter<'_> {
                         _ if matches!(self.table.tys[self.vt[v.index()]], Ty::RawPtr { .. }) => "core::ptr::null_mut()",
                         _ => "0",
                     };
-                    let _ = writeln!(out, "    let mut {}: {} = {zero};", self.name(v), self.rt(v));
+                    decls.push((self.name(v), self.rt(v), zero));
                 }
             }
         }
+        let declare = |decls: &[(String, String, &str)], skip: &[bool], out: &mut String| {
+            for (k, (n, t, zero)) in decls.iter().enumerate() {
+                if !skip.get(k).copied().unwrap_or(false) {
+                    let _ = writeln!(out, "    let mut {n}: {t} = {zero};");
+                }
+            }
+        };
         let has_edges = cfg.rpo.iter().any(|&b| f.blocks[b].term.successors(&f.value_pool).next().is_some());
         if !has_edges {
+            declare(&decls, &[], out);
             self.block(f.entry, "    ", out);
             return;
         }
@@ -1330,7 +1339,13 @@ impl Emitter<'_> {
         // again below if it doesn't, so count them only once.
         let before = self.stats;
         if self.structure {
-            if let Some(s) = structure(f, cfg, self) {
+            if let Some(mut s) = structure(f, cfg, self) {
+                // a variable assigned once, and used only after that in the same
+                // scope, is declared there
+                let names: Vec<&str> = decls.iter().map(|d| d.0.as_str()).collect();
+                let types: Vec<String> = decls.iter().map(|d| d.1.clone()).collect();
+                let inline = declare_in_place(&mut s.nodes, &names, &types);
+                declare(&decls, &inline, out);
                 if s.regions > 0 {
                     self.stats.state_machines += 1;
                     let _ = writeln!(out, "    let mut {DISPATCH_VAR}: u32 = {};", f.entry.index());
@@ -1340,6 +1355,7 @@ impl Emitter<'_> {
             }
             self.stats = before;
         }
+        declare(&decls, &[], out);
         self.stats.state_machines += 1;
         let _ = writeln!(out, "    let mut bb: u32 = {};", f.entry.index());
         out.push_str("    loop {\n        match bb {\n");

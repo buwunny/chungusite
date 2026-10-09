@@ -7,6 +7,8 @@
 //! by `v`. Dead-code elimination then drops pure instructions and parameters
 //! nothing uses. Instructions stay in the arena (ids are stable); they are only
 //! removed from their block's list.
+use crate::abi::Site;
+use std::collections::HashMap;
 use crate::ir::*;
 use crate::verify::for_each_operand;
 
@@ -313,5 +315,178 @@ pub fn map_operands(k: &mut InstKind, pool: &mut [ValueId], r: impl Fn(&mut Valu
         MemFill { dst, val, count } => { r(dst); r(val); r(count) }
         Aggregate { fields, .. } => map_list(pool, *fields, r),
         Assign { val, .. } => r(val),
+    }
+}
+
+/// Most instructions a return block may have and still be copied into each of
+/// its predecessors (`split_returns`), and most it may add to the function.
+const SPLIT_RETURN_MAX: usize = 16;
+const SPLIT_RETURN_BUDGET: usize = 64;
+
+/// Give each predecessor of a small return block its own copy of it, the way
+/// the source most likely had one `return` per path before the compiler merged
+/// them into one epilogue. The copy has one predecessor, so `clean` replaces its
+/// parameters by the edge's arguments: `if c { return a; } return b;` instead of
+/// a join that assigns a variable on both paths (and, when the paths have code
+/// of their own, a labeled block to reach it). Returns how many copies were
+/// made, and each call site that was copied with its copy; the caller runs
+/// `clean` after.
+pub fn split_returns(f: &mut Function) -> (usize, Vec<(Site, Site)>) {
+    let mut sites = Vec::new();
+    let mut budget = SPLIT_RETURN_BUDGET;
+    let mut made = 0;
+    // A copy can make its predecessor the start of a straight line to a return
+    // (`tail`), which the next round copies in turn.
+    for _ in 0..4 {
+        let n = split_round(f, &mut budget, &mut sites);
+        made += n;
+        if n == 0 {
+            break;
+        }
+    }
+    (made, sites)
+}
+
+fn split_round(f: &mut Function, budget: &mut usize, sites: &mut Vec<(Site, Site)>) -> usize {
+    use InstKind::*;
+    let preds = preds(f);
+    let mut made = 0;
+    for bi in 0..f.blocks.len() {
+        let b = BlockId::new(bi);
+        let n = preds[bi].len();
+        if b == f.entry || n < 2 {
+            continue;
+        }
+        let Some(chain) = tail(f, &preds, b) else { continue };
+        let size: usize = chain.iter().map(|&c| f.blocks[c].insts.len as usize).sum();
+        let cost = size.max(1) * (n - 1);
+        let small = size <= SPLIT_RETURN_MAX
+            && cost <= *budget
+            && chain.iter().flat_map(|&c| f.blocks[c].insts.get(&f.value_pool)).all(|&v| {
+                !matches!(f.insts[v].kind, Store { .. } | MemCopy { .. } | MemFill { .. } | Opaque { .. } | Exit { .. } | Assign { .. } | Borrow { .. } | Move(_))
+            });
+        if !small {
+            continue;
+        }
+        *budget -= cost;
+        for &p in &preds[bi][1..] {
+            let copy = copy_block(f, b, sites, &mut HashMap::new());
+            redirect(f, p, b, copy);
+            made += 1;
+        }
+    }
+    made
+}
+
+/// The blocks from `b` to the end of the function, if that is a straight line:
+/// each one after `b` reached only from the one before, the last one leaving
+/// the function. Blocks copied since `preds` was made aren't followed.
+fn tail(f: &Function, preds: &Preds, b: BlockId) -> Option<Vec<BlockId>> {
+    let mut chain = vec![b];
+    loop {
+        match f.blocks[*chain.last().unwrap()].term {
+            Terminator::Return(_) | Terminator::Unreachable | Terminator::TailCall { .. } => return Some(chain),
+            Terminator::Jump { to, .. } if chain.len() < 8 && to != f.entry && !chain.contains(&to) && to.index() + 1 < preds.start.len() && preds[to.index()].len() == 1 => chain.push(to),
+            _ => return None,
+        }
+    }
+}
+
+/// A copy of block `b` and the blocks it jumps on to (`tail`), with fresh values
+/// (its own parameters), unreachable until an edge is pointed at it. Its calls
+/// are added to `sites`.
+fn copy_block(f: &mut Function, b: BlockId, sites: &mut Vec<(Site, Site)>, map: &mut HashMap<ValueId, ValueId>) -> BlockId {
+    let blk = &f.blocks[b];
+    let (params, insts, term) = (blk.params.get(&f.value_pool).to_vec(), blk.insts.get(&f.value_pool).to_vec(), blk.term);
+    // a list operand gets a list of its own, so mapping it doesn't touch the original's
+    let own_list = |f: &mut Function, l: &mut ListRef| {
+        let start = f.value_pool.len() as u32;
+        f.value_pool.extend_from_within(l.start as usize..(l.start + l.len) as usize);
+        l.start = start;
+    };
+    let fresh = |f: &mut Function, v: ValueId, map: &mut HashMap<ValueId, ValueId>| {
+        let mut inst = f.insts[v];
+        if let InstKind::Aggregate { fields: l, .. } | InstKind::Call { args: l, .. } = &mut inst.kind {
+            own_list(f, l);
+        }
+        map_operands(&mut inst.kind, &mut f.value_pool, |x| {
+            if let Some(&y) = map.get(x) {
+                *x = y;
+            }
+        });
+        let id = f.insts.push(inst);
+        let at = f.origin.get(v.index()).copied().unwrap_or(0);
+        f.origin.push(at);
+        map.insert(v, id);
+        id
+    };
+    let new_params: Vec<ValueId> = params.iter().map(|&v| fresh(f, v, map)).collect();
+    let mut new_insts = Vec::with_capacity(insts.len());
+    for &v in &insts {
+        let id = fresh(f, v, map);
+        if matches!(f.insts[v].kind, InstKind::Call { .. }) {
+            sites.push((Site::Call(v), Site::Call(id)));
+        }
+        new_insts.push(id);
+    }
+    let list = |f: &mut Function, vs: &[ValueId]| {
+        let start = f.value_pool.len() as u32;
+        f.value_pool.extend_from_slice(vs);
+        ListRef { start, len: vs.len() as u32 }
+    };
+    let params = list(f, &new_params);
+    let insts = list(f, &new_insts);
+    let term = match term {
+        Terminator::Return(Some(v)) => Terminator::Return(Some(map.get(&v).copied().unwrap_or(v))),
+        Terminator::Jump { to, mut args } => {
+            own_list(f, &mut args);
+            for x in &mut f.value_pool[args.start as usize..(args.start + args.len) as usize] {
+                *x = map.get(x).copied().unwrap_or(*x);
+            }
+            Terminator::Jump { to: copy_block(f, to, sites, map), args }
+        }
+        Terminator::TailCall { callee, mut args } => {
+            own_list(f, &mut args);
+            for x in &mut f.value_pool[args.start as usize..(args.start + args.len) as usize] {
+                *x = map.get(x).copied().unwrap_or(*x);
+            }
+            Terminator::TailCall { callee: map.get(&callee).copied().unwrap_or(callee), args }
+        }
+        t => t,
+    };
+    let copy = f.blocks.push(Block { insts, params, term });
+    if matches!(term, Terminator::TailCall { .. }) {
+        sites.push((Site::Tail(b), Site::Tail(copy)));
+    }
+    copy
+}
+/// Point every edge from `p` into `from` at `to` instead (a block with the same
+/// parameters).
+fn redirect(f: &mut Function, p: BlockId, from: BlockId, to: BlockId) {
+    match &mut f.blocks[p].term {
+        Terminator::Jump { to: t, .. } => {
+            if *t == from {
+                *t = to;
+            }
+        }
+        Terminator::Branch { t, f: e, .. } => {
+            for x in [t, e] {
+                if *x == from {
+                    *x = to;
+                }
+            }
+        }
+        Terminator::Switch { table, default, .. } => {
+            if *default == from {
+                *default = to;
+            }
+            let table = *table;
+            for x in &mut f.value_pool[table.start as usize..(table.start + table.len) as usize] {
+                if BlockId::from_value(*x) == from {
+                    *x = to.as_value();
+                }
+            }
+        }
+        _ => {}
     }
 }

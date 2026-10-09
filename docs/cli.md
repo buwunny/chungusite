@@ -75,27 +75,27 @@ Each function header says how many of its accesses are safe. Byte slices remain 
 Control flow is structured ([`src/structure.rs`](../src/structure.rs)): branches become `if`/`else`, loops become `while` or `loop` with `break`, `continue` and early `return`, and block parameters become mutable variables assigned on each edge. An arm that does nothing but assign them (with values that need no call or memory access) runs before the `if` instead, so the other arm needs no `else`: `v = b; if a != 0 { *p = a; v = c; }`, as the source would have it. A loop's exits are emitted after it, so leaving it is a `break`. A value used once, in the block that computes it, is written into its use instead of getting a `let` (a load only when nothing between the two writes memory or calls), and constants are literals, so a loop whose test comes first reads as a `while`:
 
 ```rust
-pub unsafe fn find(mut rdi: u64, mut rsi: u64, mut rdx: u64) -> u64 {
+pub unsafe fn find(rdi_p: *const u64, mut rsi: u64, mut rdx: u64) -> u64 {
+    let mut rdi: u64 = rdi_p as u64;
     let mut v6: u64 = 0;
-    let mut v36: u64 = 0;
     if rsi == 0 {
-        v36 = rsi;
-    } else {
-        v6 = 0_u64;
-        while (unsafe { (rdi.wrapping_add(v6.wrapping_mul(8)) as *const u64).read_unaligned() }) != rdx {
-            let v13: u64 = v6.wrapping_add(1); // 0x17
-            if rsi == v13 {
-                return rsi;
-            }
-            v6 = v13;
-        }
-        v36 = v6;
+        return rsi;
     }
-    return v36;
+    v6 = 0_u64;
+    while (unsafe { (rdi.wrapping_add(v6.wrapping_mul(8)) as *const u64).read_unaligned() }) != rdx {
+        let v13: u64 = v6.wrapping_add(1); // 0x1110
+        if rsi == v13 {
+            return rsi;
+        }
+        v6 = v13;
+    }
+    return v6;
 }
 ```
 
-A block that only tests a condition joins its predecessor's test, so `a || b` and `a && b` stay one `if`. Where the nesting still needs it (two paths with code of their own into the same block), a labeled block (`'b7: { .. break 'b7; .. }`) stands in. An irreducible cycle (one with two entries) has no nesting: just its blocks become a `loop { match bb { ... } }`, and edges into it set `bb`; the rest of the function is structured around it. The summary on stderr counts the functions that have one.
+Variables are declared up front (`let mut v6`) only when they need to be: one assigned by a single statement and used only after it in the same scope is declared there instead (`let v13`). And compilers merge the returns of a function into one epilogue, so a small block that returns (at most 16 instructions, no stores) is copied back into each path that reaches it, so each path returns on its own (`if rsi == 0 { return rsi; }`) instead of assigning a variable for a shared `return`, and needs no labeled block to get there.
+
+A block that only tests a condition joins its predecessor's test, so `a || b` and `a && b` stay one `if`. Where the nesting still needs it (two paths with code of their own into the same block, which isn't a small return), a labeled block (`'b7: { .. break 'b7; .. }`) stands in. An irreducible cycle (one with two entries) has no nesting: just its blocks become a `loop { match bb { ... } }`, and edges into it set `bb`; the rest of the function is structured around it. The summary on stderr counts the functions that have one.
 
 Every statement ends with the address of the instruction it came from.
 

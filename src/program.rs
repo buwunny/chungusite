@@ -18,7 +18,7 @@ use crate::borrow::{analyze_with, Analysis, Callee, Class, Ctx, Pass};
 use crate::emit::{emit_function_in, CallInfo, EmitStats, Env, Mode};
 use crate::ir::*;
 use crate::lift::Lifter;
-use crate::opt::clean;
+use crate::opt::{clean, split_returns};
 use crate::types::{FnTypes, TypeModel, TypeStats};
 use crate::verify::verify;
 use object::{Object, ObjectKind, ObjectSection, ObjectSymbol, RelocationTarget, SectionKind};
@@ -446,6 +446,17 @@ impl Program {
                 .map(|k| site_sig(&f.targets[k], f.guesses[k], &sigs, &guessed))
                 .collect();
             f.sites = abi::apply(ir, sigs[i], &f.sites, &|k| shapes[k]);
+            // one `return` per path; the calls it copies are new sites
+            let (made, copied) = split_returns(ir);
+            if made > 0 {
+                clean(ir);
+            }
+            for (old, new) in copied {
+                let k = f.sites.iter().position(|&s| s == old).expect("a call site");
+                f.sites.push(new);
+                f.targets.push(f.targets[k].clone());
+                f.guesses.push(f.guesses[k]);
+            }
             debug_assert!(verify(ir).is_ok(), "{}: {:?}", f.name, verify(ir));
         });
         // `apply` must leave valid IR; a failure is a bug, reported like a lift error.

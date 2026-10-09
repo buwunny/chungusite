@@ -69,6 +69,16 @@ Stages 5 to 7 in [ownership.md](ownership.md) are in: the frame, read-only globa
 - ~~Demangle C++ and Rust symbol names.~~ Done.
 - ~~Lift functions in parallel with `rayon`, one `Lifter` and `Function` per thread, as ir.md plans.~~ Done (`-j`).
 
+## Hostile binaries
+
+Code written to resist analysis, in three kinds, cheapest first:
+
+- **Hand-written assembly.** Done for the common cases ([cli.md](cli.md#hand-written-obfuscated-and-packed-code)): untyped function symbols, local labels that aren't functions, data in code read through a label, and junk or overlapping instructions ([lift.md](lift.md#code-that-hides-from-a-linear-sweep)). Signatures were already inferred from the registers a function reads and writes rather than assumed from the ABI ([calls.md](calls.md)). Still open: functions that share code (one jumps into the middle of another, which today becomes a tail call to an address that isn't a function), computed jumps that aren't a table (`jmp rax` after arithmetic), and a fallback that keeps an unliftable instruction as inline `asm!` instead of failing the whole function.
+- **Obfuscation.** Done: branches whose condition is a constant, in code that hides from a linear sweep. Open, roughly in order of payoff: opaque predicates that depend on inputs (number-theory identities like `x * (x + 1)` being even, and comparisons against globals the program never writes), which need a small SMT query (`z3`) per suspicious branch; mixed boolean-arithmetic expressions (`(x ^ y) + 2 * (x & y)` is `x + y`), simplified by pattern rules or by evaluating the expression on a few inputs and matching a linear combination; and control-flow flattening (one dispatcher `switch` on a state variable), undone by tracking the constant each block stores into the state variable and wiring each block straight to the next one.
+- **Packing.** Done: a warning when a binary looks packed (UPX, or high-entropy code). Open: unpacking by emulation, running the binary in an emulator (Unicorn) until it jumps into memory it wrote, then dumping that memory as a binary to decompile. UPX itself needs none of that: `upx -d`.
+
+Robustness against malformed files: 7,600 mutated binaries (ELF executables, shared libraries, a stripped binary, an object file and one with thread-locals, with bytes changed in the headers or anywhere; 2,200 of them on a debug build, which catches arithmetic overflow) found four crashes, all fixed: a thread-local section claiming petabytes, an unwind entry running past its section, a symbol past its section's end, and a stack slot far above the return address taken for a stack argument. None of the last 4,200 crashed or hung. `tests/hostile.rs` keeps 60 of them and the thread-local one.
+
 ## 9. Checking the output means the same thing
 
 `tests/emit.rs` already runs one decompiled function in both modes and compares results. Generalize that into differential testing: compile small C functions, decompile them, call both on random inputs, and compare. That is the test that says the decompiler is *correct*, not just that its output compiles.

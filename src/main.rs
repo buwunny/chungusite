@@ -180,8 +180,17 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         (None, Some(path)) => {
             data = Some(map(path).map_err(|e| format!("{}: {e}", path.display()))?);
             bin = Binary::parse(data.as_deref().unwrap()).map_err(|e| format!("{}: {e}", path.display()))?;
+            let packed = bin.packed(data.as_deref().unwrap());
+            if let Some(why) = &packed {
+                eprintln!("chungusite: warning: {}: {why}", path.display());
+            }
+            let packed = packed.map(|_| "the binary looks packed (see above)");
             let all = bin.funcs.iter().map(copy).collect();
-            (all, select(&bin, cli)?, path.display().to_string(), Some(&bin))
+            let selected = select(&bin, cli).map_err(|e| match packed {
+                Some(p) if bin.funcs.is_empty() => format!("{e}; {p}"),
+                _ => e,
+            })?;
+            (all, selected, path.display().to_string(), Some(&bin))
         }
         (None, None) => unreachable!("clap requires one"),
     };

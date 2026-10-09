@@ -241,3 +241,51 @@ fn copy_relocated_library_data() {
         assert_eq!(String::from_utf8_lossy(&run.stderr), "x=5\n", "{mode}");
     }
 }
+
+const GOT_C: &str = r#"
+#include <stdio.h>
+#include <unistd.h>
+int (*volatile say)(const char *) = puts;
+int report(int x) {
+    fprintf(stderr, "x=%d\n", x);
+    optind = x;
+    say("hi");
+    fflush(stdout);
+    return fileno(stderr) * 100 + optind;
+}
+int main(int argc, char **argv) { return report(argc); }
+"#;
+
+/// Library data and functions a position-independent program reaches through
+/// GOT slots or pointers in its data (`stderr`, `optind`, `puts` stored in a
+/// variable) are the library's: the slots the loader fills aren't left null.
+#[test]
+fn imported_symbols_in_pointer_slots() {
+    let dir = scratch("got");
+    let c = dir.join("orig.c");
+    std::fs::write(&c, GOT_C).unwrap();
+    let exe = dir.join("orig");
+    let Ok(out) = Command::new("cc").args(["-O2", "-fPIC", "-pie", "-o"]).arg(&exe).arg(&c).output() else {
+        assert!(std::env::var_os("CI").is_none(), "no C compiler");
+        return;
+    };
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let bin = env!("CARGO_BIN_EXE_chungusite");
+    for mode in ["fast", "safe"] {
+        let out = Command::new(bin).arg(&exe).args(["--mode", mode, "-f", "report"]).output().unwrap();
+        let src = String::from_utf8(out.stdout).unwrap();
+        assert!(out.status.success(), "{}\n{src}", String::from_utf8_lossy(&out.stderr));
+        for name in ["stderr", "optind", "puts"] {
+            assert!(src.contains(&format!("#[link_name = \"{name}\"]")), "{mode}: {name}\n{src}");
+        }
+        let d = dir.join(mode);
+        std::fs::create_dir_all(&d).unwrap();
+        rustc(&d, "dec.rs", &src, &["--crate-type", "rlib", "--crate-name", "dec"]);
+        let rlib = d.join("libdec.rlib");
+        rustc(&d, "main.rs", STDERR_MAIN, &["--extern", &format!("dec={}", rlib.display()), "-o", d.join("run").to_str().unwrap()]);
+        let run = Command::new(d.join("run")).output().unwrap();
+        assert!(run.status.success(), "{mode}: {}\n{src}", String::from_utf8_lossy(&run.stderr));
+        assert_eq!(String::from_utf8_lossy(&run.stderr), "x=5\n", "{mode}");
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "hi\n", "{mode}");
+    }
+}

@@ -19,8 +19,11 @@
 //! slots the code uses are emitted. A slot whose target is outside the output is
 //! null if it is an import, and keeps its bytes from the file if it is a function
 //! of the binary that isn't emitted (not selected, or skipped by `--skip-failed`).
+//! A slot holding another library's symbol (`Binary::imports`: `stdout`, `optarg`)
+//! points to that symbol, declared `extern` right in the initializer, so the
+//! output's own dynamic linker fills it in as the original's did.
 use crate::ir::{Function, Idx, InstKind};
-use crate::load::{Binary, TLS_SECTION};
+use crate::load::{Binary, Import, TLS_SECTION};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
@@ -149,15 +152,24 @@ impl<'b, 'a> Globals<'b, 'a> {
     pub fn slice(&self, addr: u64) -> Option<String> {
         let item = self.item_at(addr)?;
         let sec = &self.bin.data[item.section];
-        let words = self.bin.pointers.range(item.start..item.start + item.len).next().is_some();
+        let words = !self.slots(&item).is_empty();
         (!sec.writable && !words).then(|| self.ident(&item))
     }
 
     /// Is `item` emitted as `Words` (it holds pointer slots), not `Bytes`?
     fn words(&self, item: &Item) -> bool {
         let end = item.start + item.len;
-        let mut slots = self.bin.pointers.range(item.start..end).peekable();
-        slots.peek().is_some() && item.start.is_multiple_of(8) && slots.all(|(&a, _)| a.is_multiple_of(8) && a + 8 <= end)
+        let slots = self.slots(item);
+        !slots.is_empty() && item.start.is_multiple_of(8) && slots.iter().all(|&(a, _)| a.is_multiple_of(8) && a + 8 <= end)
+    }
+
+    /// The pointer slots in `item`, by address.
+    fn slots(&self, item: &Item) -> Vec<(u64, Slot<'b>)> {
+        let r = item.start..item.start + item.len;
+        let mut v: Vec<(u64, Slot)> = self.bin.pointers.range(r.clone()).map(|(&a, &t)| (a, Slot::To(t))).collect();
+        v.extend(self.bin.imports.range(r).map(|(&a, i)| (a, Slot::Import(i))));
+        v.sort_by_key(|s| s.0);
+        v
     }
 
     /// `item`'s static with the right name and type but zero contents, which
@@ -244,8 +256,7 @@ impl<'b, 'a> Globals<'b, 'a> {
         }
         out.push('\n');
         let m = if sec.writable { "mut " } else { "" };
-        let end = item.start + n;
-        let slots: Vec<(u64, u64)> = self.bin.pointers.range(item.start..end).map(|(&a, &t)| (a, t)).collect();
+        let slots = self.slots(item);
         if !self.words(item) {
             let init = match bytes {
                 Some(b) if b.iter().any(|&c| c != 0) => byte_string(b),
@@ -262,8 +273,11 @@ impl<'b, 'a> Globals<'b, 'a> {
             let at = item.start + 8 * j;
             out.push_str(if j % 4 == 0 { "\n    " } else { " " });
             if slots.peek().is_some_and(|&(a, _)| a == at) {
-                let (_, t) = slots.next().unwrap();
-                if let Some(p) = self.pointer(t, more) {
+                let p = match slots.next().unwrap().1 {
+                    Slot::To(t) => self.pointer(t, more),
+                    Slot::Import(i) => Some(import(i)),
+                };
+                if let Some(p) = p {
                     let _ = write!(out, "Word {{ p: {p} }},");
                     continue;
                 }
@@ -276,6 +290,26 @@ impl<'b, 'a> Globals<'b, 'a> {
             let _ = write!(out, "Word {{ b: {} }},", byte_string(&w));
         }
         out.push_str("\n] };\n");
+    }
+}
+
+/// Where a pointer slot points.
+#[derive(Copy, Clone)]
+enum Slot<'b> {
+    To(u64),
+    Import(&'b Import),
+}
+
+/// The initializer of a slot holding `i`: its address, declared in a block of
+/// its own so that two slots holding one symbol don't declare it twice.
+fn import(i: &Import) -> String {
+    let p = match i.data {
+        true => format!("{{ extern \"C\" {{ #[link_name = \"{}\"] static mut S: u8; }} unsafe {{ core::ptr::addr_of!(S) }} }}", i.name),
+        false => format!("{{ extern \"C\" {{ #[link_name = \"{}\"] fn F(); }} F as *const u8 }}", i.name),
+    };
+    match i.addend {
+        0 => p,
+        a => format!("{p}.wrapping_offset({a})"),
     }
 }
 

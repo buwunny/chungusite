@@ -14,6 +14,7 @@ use chungusite::{
     load::{Binary, FuncBytes},
     names::rust_ident,
     program::{BuildOptions, Input, Options, Program},
+    project::{self, Main, Piece, Project},
     sources::SOURCES,
 };
 use clap::{Parser, ValueEnum};
@@ -60,6 +61,11 @@ struct Cli {
     /// Write the output here instead of stdout.
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Write a Cargo project to this directory instead of one file: the functions
+    /// in modules by source file, and a `main` that runs the decompiled one.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["output", "list"])]
+    cargo: Option<PathBuf>,
 
     /// Skip functions that fail to lift instead of emitting a todo!() stub for them.
     #[arg(long)]
@@ -182,6 +188,9 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     };
     let mode_name = if mode == Mode::Fast { "fast" } else { "safe" };
     let rust = cli.emit == Emit::Rust && !cli.list;
+    if cli.cargo.is_some() && !rust {
+        return Err("--cargo writes Rust: it can't be combined with --emit".into());
+    }
 
     // Identifiers are assigned in address order before anything runs in parallel,
     // so they (and the output) don't depend on scheduling.
@@ -251,10 +260,16 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     let global_end = |base: u64, at: u64| globals.as_ref().and_then(|g| g.end_expr(base, at));
     // Function pointers in data, other than GOT slots (calls through those are
     // direct calls; `program.rs` sees which ones are loaded for other uses).
-    let address_taken: Vec<u64> = bin.map_or(Vec::new(), |b| {
+    let mut address_taken: Vec<u64> = bin.map_or(Vec::new(), |b| {
         let got = |at: u64| b.data_section_at(at).is_some_and(|s| matches!(b.data[s].name.as_str(), ".got" | ".got.plt" | "__got"));
         b.pointers.iter().filter(|(&at, _)| !got(at)).map(|(_, &t)| t).collect()
     });
+    // --cargo: the C runtime calls `main` through a pointer, as the generated
+    // `fn main` does, so in safe mode it gets a raw twin taking integers.
+    let main_at = cli.cargo.as_ref().and_then(|_| funcs.iter().position(|f| f.name == "main" || f.name == "_main"));
+    if let Some(k) = main_at {
+        address_taken.push(funcs[k].addr);
+    }
     let opts = Options { global_of: &global_of, global_end: &global_end, global_slice: &global_slice, fast: &[], address_taken: &address_taken };
     let mut emitted = if rust { program.emit_all_with(mode, &opts) } else { Vec::new() };
     let analyses = if cli.emit == Emit::Borrows { program.analyses(&opts) } else { Vec::new() };
@@ -348,6 +363,8 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         out.push_str("#![allow(unused_mut, unused_variables, unused_assignments, unreachable_code, non_snake_case, non_upper_case_globals, non_camel_case_types, unused_parens, unused_unsafe, clippy::all)]\n");
         out.push_str(&program.prelude());
     }
+    // --cargo: each function's text, to split into modules
+    let mut pieces: Vec<Piece> = Vec::new();
     let mut failures: BTreeMap<String, usize> = BTreeMap::new();
     let (mut ok, mut total) = (0, EmitStats::default());
     let (mut no_raw, mut safe_fns, mut emitted_fns) = (0, 0, 0);
@@ -365,6 +382,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             };
             continue;
         }
+        let start = out.len();
         match (&pf.ir, cli.emit) {
             (Err(e), _) if cli.skip_failed => eprintln!("skipped {header}: {e}"),
             (Err(e), Emit::Rust) => {
@@ -408,14 +426,54 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 let _ = ir;
             }
         }
+        if cli.cargo.is_some() && out.len() > start {
+            pieces.push(Piece { name: fb.pretty().to_string(), addr: fb.addr, src: out[start..].to_string() });
+        }
     }
     if rust && !cli.list {
         out.push_str(&statics_src);
     }
 
-    match &cli.output {
-        Some(p) => std::fs::write(p, &out).map_err(|e| format!("{}: {e}", p.display()))?,
-        None => print!("{out}"),
+    if let Some(dir) = &cli.cargo {
+        // The function to call: safe mode's raw twin, which takes integers.
+        let main = main_at.map(|k| {
+            let i = index[k];
+            let pf = &program.funcs[i];
+            let ident = if mode == Mode::Safe && pf.ir.is_ok() {
+                program.pointer_idents(&Options { fast: &fast, ..opts }).swap_remove(i)
+            } else {
+                pf.ident.clone()
+            };
+            let sig = pf.sig;
+            match pf.ir {
+                Ok(_) => Main { ident, args: (sig.args + sig.stack_args) as usize, fargs: sig.fargs as usize },
+                Err(_) => Main { ident, args: 0, fargs: 0 },
+            }
+        });
+        let main = main.filter(|_| !(cli.skip_failed && main_at.is_some_and(|k| program.funcs[index[k]].ir.is_err())));
+        let project = Project {
+            source: &source,
+            mode: mode_name,
+            package: project::package_name(&source),
+            prelude: program.prelude_parts(true),
+            statics: statics_src.clone(),
+            funcs: pieces,
+            main,
+            units: data.as_deref().map_or(Vec::new(), project::units),
+            libs: data.as_deref().map_or(Vec::new(), project::needed),
+        };
+        let modules = project::write(dir, &project).map_err(|e| format!("{}: {e}", dir.display()))?;
+        eprintln!(
+            "chungusite: wrote a Cargo project to {} ({} modules of functions); `cargo run` there {}",
+            dir.display(),
+            modules.len(),
+            if project.main.is_some() { "runs it" } else { "has no main: it's a library" }
+        );
+    } else {
+        match &cli.output {
+            Some(p) => std::fs::write(p, &out).map_err(|e| format!("{}: {e}", p.display()))?,
+            None => print!("{out}"),
+        }
     }
 
     eprintln!("chungusite: lifted {ok} of {} functions ({mode_name} mode)", funcs.len());

@@ -316,3 +316,144 @@ fn dominators(entry: usize, succ: &[Vec<usize>]) -> Vec<Option<usize>> {
     }
     idom
 }
+
+/// Fewest jumps through one table worth sharing a dispatch between.
+const MIN_SHARED: usize = 4;
+
+/// One dispatch per jump table that many jumps go through. An interpreter's
+/// computed `goto *labels[op]` ends every opcode's code (QuickJS's
+/// `JS_CallInternal` has hundreds), and each of those `Switch`es reaches every
+/// label through a block of its own that passes the registers on: jumps times
+/// labels blocks, more than rustc can compile. Instead each jump passes its
+/// index and registers to one new block `D`, which switches to one block per
+/// label: jumps plus labels. `D` has a slot per register (and type), like the
+/// header `one_region` makes. Run on the lifter's output, where each case
+/// block passes on its jump's registers; a jump whose case blocks pass two
+/// values for one register is left alone. Returns how many tables were shared.
+pub fn share_switches(f: &mut Function) -> usize {
+    // each Switch: its block, its index, and every case's (target, arguments)
+    struct Site {
+        b: BlockId,
+        v: ValueId,
+        cases: Vec<(BlockId, Vec<ValueId>)>,
+    }
+    let resolve = |f: &Function, c: BlockId| -> (BlockId, Vec<ValueId>) {
+        let blk = &f.blocks[c];
+        match blk.term {
+            Terminator::Jump { to, args } if blk.params.len == 0 && blk.insts.len == 0 => (to, args.get(&f.value_pool).to_vec()),
+            _ => (c, Vec::new()),
+        }
+    };
+    let mut groups: HashMap<Vec<BlockId>, Vec<Site>> = HashMap::new();
+    for (b, blk) in f.blocks.iter() {
+        let Terminator::Switch { v, table, default } = blk.term else { continue };
+        let mut cases: Vec<(BlockId, Vec<ValueId>)> = table.get(&f.value_pool).iter().map(|&c| resolve(f, BlockId::from_value(c))).collect();
+        cases.push(resolve(f, default));
+        let key: Vec<BlockId> = cases.iter().map(|c| c.0).collect();
+        groups.entry(key).or_default().push(Site { b, v, cases });
+    }
+    let mut done = 0;
+    let mut keys: Vec<Vec<BlockId>> = groups.iter().filter(|(_, s)| s.len() >= MIN_SHARED).map(|(k, _)| k.clone()).collect();
+    keys.sort_by_key(|k| k.iter().map(|b| b.index()).collect::<Vec<_>>());
+    for key in keys {
+        let sites = &groups[&key];
+        let new_inst = |f: &mut Function, kind: InstKind, ty: TyId, origin: u64| {
+            let id = f.insts.push(Inst { kind, ty });
+            f.origin.push(origin);
+            id
+        };
+        let list = |f: &mut Function, vs: &[ValueId]| {
+            let start = f.value_pool.len() as u32;
+            f.value_pool.extend_from_slice(vs);
+            ListRef { start, len: vs.len() as u32 }
+        };
+        // the slots: a target's parameters, by register (and type) and occurrence
+        let mut targets: Vec<BlockId> = key.clone();
+        targets.sort_by_key(|b| b.index());
+        targets.dedup();
+        let mut slots: Vec<(InstKind, TyId, usize)> = Vec::new();
+        let mut slot_of: HashMap<BlockId, Vec<usize>> = HashMap::new();
+        for &t in &targets {
+            let mut mine: Vec<usize> = Vec::new();
+            for &p in f.blocks[t].params.get(&f.value_pool) {
+                let Inst { kind, ty } = f.insts[p];
+                let same = |s: &(InstKind, TyId, usize)| s.1 == ty && matches!((s.0, kind), (InstKind::BlockParam(a), InstKind::BlockParam(b)) if a == b);
+                let nth = mine.iter().filter(|&&j| same(&slots[j])).count();
+                let j = match slots.iter().position(|s| same(s) && s.2 == nth) {
+                    Some(j) => j,
+                    None => {
+                        slots.push((kind, ty, nth));
+                        slots.len() - 1
+                    }
+                };
+                mine.push(j);
+            }
+            slot_of.insert(t, mine);
+        }
+        // each jump's value for each slot, the same from every case
+        let mut fills: Vec<Vec<Option<ValueId>>> = Vec::with_capacity(sites.len());
+        let mut ok = true;
+        for s in sites {
+            let mut fill = vec![None; slots.len()];
+            for (t, args) in &s.cases {
+                for (&j, &a) in slot_of[t].iter().zip(args) {
+                    match fill[j] {
+                        None => fill[j] = Some(a),
+                        Some(x) if x == a => {}
+                        Some(_) => ok = false,
+                    }
+                }
+            }
+            fills.push(fill);
+        }
+        let vty = f.insts[sites[0].v].ty;
+        if !ok || sites.iter().any(|s| f.insts[s.v].ty != vty) {
+            continue;
+        }
+        let origin = f.blocks[sites[0].b].insts.get(&f.value_pool).last().map_or(0, |v| f.origin[v.index()]);
+        let sel = new_inst(f, InstKind::BlockParam(u8::MAX), vty, origin);
+        let d_slots: Vec<ValueId> = slots.iter().map(|s| new_inst(f, s.0, s.1, origin)).collect();
+        // D's case blocks: one per target, passing it its slots
+        let mut case_of: HashMap<BlockId, BlockId> = HashMap::new();
+        for &t in &targets {
+            let args: Vec<ValueId> = slot_of[&t].iter().map(|&j| d_slots[j]).collect();
+            let args = list(f, &args);
+            let none = list(f, &[]);
+            let c = f.blocks.push(Block { insts: none, params: none, term: Terminator::Jump { to: t, args } });
+            case_of.insert(t, c);
+        }
+        let n = key.len() - 1;
+        let table: Vec<ValueId> = key[..n].iter().map(|t| case_of[t].as_value()).collect();
+        let d = {
+            let params: Vec<ValueId> = std::iter::once(sel).chain(d_slots.iter().copied()).collect();
+            let params = list(f, &params);
+            let table = list(f, &table);
+            let insts = list(f, &[]);
+            f.blocks.push(Block { insts, params, term: Terminator::Switch { v: sel, table, default: case_of[&key[n]] } })
+        };
+        // every jump passes its index and registers to D
+        for (s, fill) in sites.iter().zip(&fills) {
+            let mut extra = Vec::new();
+            let mut args = vec![s.v];
+            for (j, v) in fill.iter().enumerate() {
+                match v {
+                    Some(v) => args.push(*v),
+                    None => {
+                        let u = new_inst(f, InstKind::Undef, slots[j].1, origin);
+                        extra.push(u);
+                        args.push(u);
+                    }
+                }
+            }
+            if !extra.is_empty() {
+                let mut insts = f.blocks[s.b].insts.get(&f.value_pool).to_vec();
+                insts.extend(extra);
+                f.blocks[s.b].insts = list(f, &insts);
+            }
+            let args = list(f, &args);
+            f.blocks[s.b].term = Terminator::Jump { to: d, args };
+        }
+        done += 1;
+    }
+    done
+}

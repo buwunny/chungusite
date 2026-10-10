@@ -107,6 +107,9 @@ enum Flags {
     Mul { lhs: ValueId, rhs: ValueId, lo: ValueId, signed: bool },
     /// bt: only CF is defined.
     Carry { cf: ValueId },
+    /// adc / sbb: `res = lhs + rhs + cin` (`lhs - rhs - cin` if `sub`), `cin`
+    /// the carry in, zero-extended. Every integer condition is derivable.
+    AddCarry { lhs: ValueId, rhs: ValueId, cin: ValueId, res: ValueId, sub: bool },
     /// dec: the flags of `lhs - one` except CF, which is left alone.
     Dec { lhs: ValueId, one: ValueId },
     /// inc: the flags of `lhs + one = res` except CF.
@@ -262,6 +265,14 @@ pub struct Lifter {
     /// Keep an instruction the lifter has no model of as inline assembly
     /// (`InstKind::Opaque`) instead of failing the function (`lift/asm.rs`).
     pub asm: bool,
+    /// Every function's start (`program.rs` sets this). A jump out of the
+    /// function to anywhere else lands in the middle of another function: a
+    /// `.cold` part jumping back to its function's return (`epilogues`).
+    pub entries: std::sync::Arc<std::collections::HashSet<u64>>,
+    /// Pass 1: the code at each jump target out of the function that isn't a
+    /// function's start, when it is a few plain instructions ending in `ret`
+    /// (`mov eax, esi ; ret`), lifted in place of a tail call.
+    epilogues: Vec<(u64, Vec<Instruction>)>,
     /// Instructions the lifter models, but not in the form found at these
     /// addresses: kept as inline assembly on the next try.
     forced: Vec<u64>,
@@ -313,6 +324,8 @@ impl Lifter {
             track_exits: false,
             thread_pointer: None,
             asm: false,
+            entries: Default::default(),
+            epilogues: Vec::new(),
             forced: Vec::new(),
             asm_args: Vec::new(),
             asm_vals: Vec::new(),
@@ -511,6 +524,7 @@ impl Lifter {
         self.case_stubs.clear();
         self.probes.clear();
         self.spill_skips.clear();
+        self.epilogues.clear();
         self.xmm = false;
         self.ymm = false;
         self.x87 = false;
@@ -571,6 +585,12 @@ impl Lifter {
                         self.leaders.push(t);
                     } else if self.insn.flow_control() == FlowControl::ConditionalBranch {
                         self.stubs.push(self.ip);
+                    }
+                    if !in_range(t) && !self.epilogues.iter().any(|e| e.0 == t) {
+                        if let Some(e) = self.epilogue(data, t) {
+                            self.xmm |= e.iter().any(|i| (0..i.op_count()).any(|k| i.op_kind(k) == OpKind::Register && i.op_register(k).is_vector_register()));
+                            self.epilogues.push((t, e));
+                        }
                     }
                     if in_range(next) && self.walked(next) { self.leaders.push(next); }
                 }
@@ -863,14 +883,17 @@ impl Lifter {
             }
             OpKind::Register => {
                 let r = j.op0_register();
-                let Some(add) = self.before(0).filter(|a| {
+                // the `add` of entry and table, last to write the register
+                // (gcc may schedule an unrelated store between it and the jump)
+                let Some(ka) = (0..RECENT).find(|&k| self.before(k).is_some_and(|w| writes(w, r))) else { return Ok(()) };
+                let Some(add) = self.before(ka).filter(|a| {
                     a.mnemonic() == Mnemonic::Add && a.op0_kind() == OpKind::Register && a.op0_register() == r
                         && a.op1_kind() == OpKind::Register
                 }) else { return Ok(()) };
                 let other = add.op1_register();
                 // The entry, sign-extended into one of the two: `movsxd`, or
                 // `mov eax, [..]; cdqe` (gcc -O0).
-                let Some((k, load, dst)) = (1..RECENT).find_map(|k| {
+                let Some((k, load, dst)) = (ka + 1..RECENT).find_map(|k| {
                     let m = self.before(k)?;
                     let dst = m.op0_register();
                     match m.mnemonic() {
@@ -884,7 +907,7 @@ impl Lifter {
                     }
                 }) else { return Ok(()) };
                 // the table, added to the entry
-                let Some(table) = self.rip_value(if dst == r { other } else { r }, 0) else { return Ok(()) };
+                let Some(table) = self.rip_value(if dst == r { other } else { r }, ka) else { return Ok(()) };
                 if load.memory_displacement64() != 0 {
                     return Ok(());
                 }
@@ -1002,13 +1025,50 @@ impl Lifter {
     /// The terminator for the jump `i` out of the function: a tail call, or,
     /// to code that never returns (a `.cold` part that calls `abort`), a call
     /// that doesn't return, so the path is evidence of no result.
-    fn jump_out(&mut self, f: &mut Function, i: &Instruction, noreturn: &dyn Fn(u64, Option<u64>) -> bool) -> Result<Terminator, LiftError> {
+    /// None when the block already ended: the target's few instructions, up to
+    /// its `ret`, were lifted here (`epilogues`).
+    fn jump_out(&mut self, f: &mut Function, i: &Instruction, noreturn: &dyn Fn(u64, Option<u64>) -> bool) -> Result<Option<Terminator>, LiftError> {
         let target = i.near_branch_target();
         if noreturn(self.ip, Some(target)) {
             self.call(f, i)?;
-            return Ok(Terminator::Unreachable);
+            return Ok(Some(Terminator::Unreachable));
         }
-        Ok(self.tail_call(f, target))
+        if let Some(k) = self.epilogues.iter().position(|e| e.0 == target) {
+            for n in 0..self.epilogues[k].1.len() {
+                self.insn = self.epilogues[k].1[n];
+                self.ip = self.insn.ip();
+                if self.lift_insn(f, noreturn)? {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(self.tail_call(f, target)))
+    }
+
+    /// The instructions at `t`, outside the function and not another
+    /// function's start, if they are at most a few that only move registers
+    /// or pop, then `ret`.
+    fn epilogue(&self, data: &[(u64, &[u8])], t: u64) -> Option<Vec<Instruction>> {
+        if self.entries.is_empty() || self.entries.contains(&t) {
+            return None;
+        }
+        let bytes = (1..=64).rev().find_map(|n| read(data, t, n))?;
+        let mut dec = Decoder::with_ip(64, bytes, t, DecoderOptions::NONE);
+        let mut out = Vec::new();
+        while dec.can_decode() && out.len() < 8 {
+            let i = dec.decode();
+            if i.is_invalid() || !handled(&i) {
+                return None;
+            }
+            out.push(i);
+            match i.flow_control() {
+                FlowControl::Return => return Some(out),
+                FlowControl::Next if matches!(i.mnemonic(), Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsxd | Mnemonic::Xor | Mnemonic::Pop | Mnemonic::Add | Mnemonic::Lea)
+                    && (0..i.op_count()).all(|k| i.op_kind(k) != OpKind::Memory) => {}
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// The address block `b` starts at; a stub's is its branch's.
@@ -1092,8 +1152,9 @@ impl Lifter {
                     self.nstub += 1;
                     self.end_block(f, Terminator::Branch { c, t: BlockId::new(stub), f: e, args: ListRef::EMPTY });
                     self.begin_block(stub, f);
-                    let term = self.jump_out(f, &i, noreturn)?;
-                    self.end_block(f, term);
+                    if let Some(term) = self.jump_out(f, &i, noreturn)? {
+                        self.end_block(f, term);
+                    }
                     return Ok(true);
                 };
                 self.end_block(f, Terminator::Branch { c, t, f: e, args: ListRef::EMPTY });
@@ -1103,7 +1164,10 @@ impl Lifter {
                 let term = match self.block_at(i.near_branch_target()) {
                     Some(to) => Terminator::Jump { to, args: ListRef::EMPTY },
                     // Jump out of this function: a tail call.
-                    None => self.jump_out(f, &i, noreturn)?,
+                    None => match self.jump_out(f, &i, noreturn)? {
+                        Some(term) => term,
+                        None => return Ok(true),
+                    },
                 };
                 self.end_block(f, term);
                 Ok(true)
@@ -1165,7 +1229,9 @@ impl Lifter {
     fn lift_data(&mut self, f: &mut Function, i: &Instruction) -> Result<(), LiftError> {
         match i.mnemonic() {
             // endbr64: CET landing pad; pause: a spin-loop hint. Neither touches data.
-            Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Pause => {}
+            // prefetches are hints with no visible effect
+            Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Pause | Mnemonic::Prefetcht0 | Mnemonic::Prefetcht1
+            | Mnemonic::Prefetcht2 | Mnemonic::Prefetchnta | Mnemonic::Prefetchw | Mnemonic::Prefetch => {}
             Mnemonic::Mov => match (i.op0_kind(), i.op1_kind()) {
                 // mov rax, rcx: no instruction at all, just rename in the register file
                 (OpKind::Register, OpKind::Register) => {
@@ -1361,7 +1427,7 @@ impl Lifter {
                 let t = self.emit(f, InstKind::Bin { op, lhs: a, rhs: b }, ty);
                 let res = self.emit(f, InstKind::Bin { op, lhs: t, rhs: cf }, ty);
                 self.put(f, dst, res)?;
-                self.flags = Flags::Res { res }; // ZF and SF; the carry out isn't modelled
+                self.flags = Flags::AddCarry { lhs: a, rhs: b, cin: cf, res, sub: i.mnemonic() == Mnemonic::Sbb };
             }
             // bt: CF = bit n of the operand; bts / btr / btc then set, clear or flip it
             Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => {
@@ -1448,19 +1514,26 @@ impl Lifter {
                 self.write(f, dst, v)?;
             }
             Mnemonic::Div | Mnemonic::Idiv => self.div(f, i)?,
-            // cqo / cdq: rdx (edx) = the sign of rax (eax), ready for idiv
-            Mnemonic::Cqo | Mnemonic::Cdq => {
-                let (lo, hi, bits) =
-                    if i.mnemonic() == Mnemonic::Cqo { (Register::RAX, Register::RDX, 63) } else { (Register::EAX, Register::EDX, 31) };
+            // cqo / cdq / cwd: rdx (edx, dx) = the sign of rax (eax, ax), ready for idiv
+            Mnemonic::Cqo | Mnemonic::Cdq | Mnemonic::Cwd => {
+                let (lo, hi, bits) = match i.mnemonic() {
+                    Mnemonic::Cqo => (Register::RAX, Register::RDX, 63),
+                    Mnemonic::Cdq => (Register::EAX, Register::EDX, 31),
+                    _ => (Register::AX, Register::DX, 15),
+                };
                 let v = self.read(f, lo)?;
                 let ty = f.insts[v].ty;
                 let s = self.konst(f, bits, TyId::B1);
                 let sign = self.emit(f, InstKind::Bin { op: BinOp::AShr, lhs: v, rhs: s }, ty);
                 self.write(f, hi, sign)?;
             }
-            // cdqe / cwde: sign-extend the low half of rax (eax) in place
-            Mnemonic::Cdqe | Mnemonic::Cwde => {
-                let (src, dst) = if i.mnemonic() == Mnemonic::Cdqe { (Register::EAX, Register::RAX) } else { (Register::AX, Register::EAX) };
+            // cdqe / cwde / cbw: sign-extend the low half of rax (eax, ax) in place
+            Mnemonic::Cdqe | Mnemonic::Cwde | Mnemonic::Cbw => {
+                let (src, dst) = match i.mnemonic() {
+                    Mnemonic::Cdqe => (Register::EAX, Register::RAX),
+                    Mnemonic::Cwde => (Register::AX, Register::EAX),
+                    _ => (Register::AL, Register::AX),
+                };
                 let v = self.read(f, src)?;
                 let v = self.emit(f, InstKind::Cast { kind: CastKind::SExt, v }, TyId::unknown(dst.size()));
                 self.write(f, dst, v)?;
@@ -2093,6 +2166,7 @@ impl Lifter {
                     _ => Err(self.unsupported()),
                 };
             }
+            Flags::AddCarry { lhs, rhs, cin, res, sub } => return self.carry_condition(f, cc, lhs, rhs, cin, res, sub),
             Flags::Res { res } => {
                 let cond = match cc {
                     C::e => Cond::Eq, C::ne => Cond::Ne, C::s => Cond::Slt, C::ns => Cond::Sge,
@@ -2123,6 +2197,82 @@ impl Lifter {
             }
         };
         Ok(self.emit(f, InstKind::Cmp { cc: cond, lhs, rhs }, TyId::BOOL))
+    }
+
+    /// A condition after adc / sbb (`Flags::AddCarry`). CF is the carry (borrow)
+    /// out of either step, OF the signs of the operands against the result's.
+    #[allow(clippy::too_many_arguments)]
+    fn carry_condition(
+        &mut self, f: &mut Function, cc: ConditionCode, lhs: ValueId, rhs: ValueId, cin: ValueId, res: ValueId, sub: bool,
+    ) -> Result<ValueId, LiftError> {
+        use ConditionCode as C;
+        let ty = f.insts[res].ty;
+        let zero = self.konst(f, 0, ty);
+        let not = |l: &mut Self, f: &mut Function, v: ValueId| {
+            let no = l.konst(f, 0, TyId::BOOL);
+            l.emit(f, InstKind::Cmp { cc: Cond::Eq, lhs: v, rhs: no }, TyId::BOOL)
+        };
+        let or = |l: &mut Self, f: &mut Function, a: ValueId, b: ValueId| {
+            let a = l.emit(f, InstKind::Cast { kind: CastKind::ZExt, v: a }, TyId::B1);
+            let b = l.emit(f, InstKind::Cast { kind: CastKind::ZExt, v: b }, TyId::B1);
+            let v = l.emit(f, InstKind::Bin { op: BinOp::Or, lhs: a, rhs: b }, TyId::B1);
+            let z = l.konst(f, 0, TyId::B1);
+            l.emit(f, InstKind::Cmp { cc: Cond::Ne, lhs: v, rhs: z }, TyId::BOOL)
+        };
+        let carry = |l: &mut Self, f: &mut Function| {
+            let op = if sub { BinOp::Sub } else { BinOp::Add };
+            let t = l.emit(f, InstKind::Bin { op, lhs, rhs }, ty);
+            // sub: lhs < rhs, or the difference < cin; add: either sum wrapped
+            let (a, b) = if sub {
+                (l.emit(f, InstKind::Cmp { cc: Cond::Ult, lhs, rhs }, TyId::BOOL), l.emit(f, InstKind::Cmp { cc: Cond::Ult, lhs: t, rhs: cin }, TyId::BOOL))
+            } else {
+                (l.emit(f, InstKind::Cmp { cc: Cond::Ult, lhs: t, rhs: lhs }, TyId::BOOL), l.emit(f, InstKind::Cmp { cc: Cond::Ult, lhs: res, rhs: t }, TyId::BOOL))
+            };
+            or(l, f, a, b)
+        };
+        // the sign bit of OF (and of SF ^ OF, for the signed orders)
+        let overflow = |l: &mut Self, f: &mut Function| {
+            let (a, b) = if sub { (rhs, lhs) } else { (res, rhs) };
+            let a = l.emit(f, InstKind::Bin { op: BinOp::Xor, lhs, rhs: a }, ty);
+            let b = l.emit(f, InstKind::Bin { op: BinOp::Xor, lhs: b, rhs: res }, ty);
+            l.emit(f, InstKind::Bin { op: BinOp::And, lhs: a, rhs: b }, ty)
+        };
+        let less = |l: &mut Self, f: &mut Function| {
+            let o = overflow(l, f);
+            let x = l.emit(f, InstKind::Bin { op: BinOp::Xor, lhs: res, rhs: o }, ty);
+            l.sign(f, x, true)
+        };
+        let is_zero = |l: &mut Self, f: &mut Function| l.emit(f, InstKind::Cmp { cc: Cond::Eq, lhs: res, rhs: zero }, TyId::BOOL);
+        Ok(match cc {
+            C::e => is_zero(self, f),
+            C::ne => self.emit(f, InstKind::Cmp { cc: Cond::Ne, lhs: res, rhs: zero }, TyId::BOOL),
+            C::s | C::ns => self.sign(f, res, cc == C::s),
+            C::b => carry(self, f),
+            C::ae => {
+                let c = carry(self, f);
+                not(self, f, c)
+            }
+            C::be | C::a => {
+                let (c, z) = (carry(self, f), is_zero(self, f));
+                let v = or(self, f, c, z);
+                if cc == C::be { v } else { not(self, f, v) }
+            }
+            C::o | C::no => {
+                let o = overflow(self, f);
+                self.sign(f, o, cc == C::o)
+            }
+            C::l => less(self, f),
+            C::ge => {
+                let v = less(self, f);
+                not(self, f, v)
+            }
+            C::le | C::g => {
+                let (lt, z) = (less(self, f), is_zero(self, f));
+                let v = or(self, f, lt, z);
+                if cc == C::le { v } else { not(self, f, v) }
+            }
+            _ => return Err(self.unsupported()),
+        })
     }
 
     /// `v < 0` (signed) if `neg`, else `v >= 0`.
@@ -2547,9 +2697,10 @@ fn handled(i: &Instruction) -> bool {
             matches!(
                 m,
                 Nop | Endbr64 | Mov | Lea | Add | Sub | And | Or | Xor | Cmp | Test | Inc | Dec | Neg | Not | Shl | Shr
-                    | Sar | Mul | Imul | Movzx | Movsx | Movsxd | Div | Idiv | Cqo | Cdq | Cdqe | Cwde | Push | Pop
+                    | Sar | Mul | Imul | Movzx | Movsx | Movsxd | Div | Idiv | Cqo | Cdq | Cwd | Cdqe | Cwde | Cbw | Push | Pop
                     | Leave | Movsb | Movsw | Movsd | Movsq | Stosb | Stosw | Stosd | Stosq | Bswap | Cpuid | Xgetbv | Tzcnt | Lzcnt | Popcnt | Bsf | Bsr
                     | Shld | Shrd | Rol | Ror | Adc | Sbb | Bt | Bts | Btr | Btc | Xchg | Xadd | Cmpxchg | Pause
+                    | Prefetcht0 | Prefetcht1 | Prefetcht2 | Prefetchnta | Prefetchw | Prefetch
             ) || cmov_or_setcc(m).is_some()
                 || sse::handled(m)
                 || x87::handled(m)
@@ -2642,7 +2793,7 @@ fn writes(i: &Instruction, reg: Register) -> bool {
     let full = reg.full_register();
     (i.op_count() > 0 && i.op0_kind() == OpKind::Register && i.op0_register().full_register() == full
         && !matches!(i.mnemonic(), Mnemonic::Cmp | Mnemonic::Test))
-        || (matches!(i.mnemonic(), Mnemonic::Cdqe | Mnemonic::Cqo) && full == Register::RAX)
+        || (matches!(i.mnemonic(), Mnemonic::Cdqe | Mnemonic::Cwde | Mnemonic::Cbw | Mnemonic::Cqo) && full == Register::RAX)
 }
 
 /// `Lifter::fixed_lea` for the function `code` at `ip`. Calls don't count as

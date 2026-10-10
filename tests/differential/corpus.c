@@ -1168,3 +1168,38 @@ int64_t call_on_one_edge(int64_t *p, int64_t a, int64_t b) {
     p[1] += x; // (a store, so the join isn't copied into each path)
     return x * 3 + p[0];
 }
+
+// 128-bit compares and carries: `cmp lo; sbb hi` then setb / setl, and
+// `add; adc` then setc, read the flags adc and sbb leave.
+#define U128(h, l) (((unsigned __int128)(h) << 64) | (l))
+// @diff lt_u128: i32(u64, u64, u64, u64)
+int lt_u128(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) { return U128(ah, al) < U128(bh, bl); }
+// @diff ge_u128: i32(u64, u64, u64, u64)
+int ge_u128(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) { return U128(ah, al) >= U128(bh, bl); }
+// @diff lt_i128: i32(u64, u64, u64, u64)
+int lt_i128(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) { return (__int128)U128(ah, al) < (__int128)U128(bh, bl); }
+// @diff ge_i128: i32(u64, u64, u64, u64)
+int ge_i128(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) { return (__int128)U128(ah, al) >= (__int128)U128(bh, bl); }
+// @diff add_u128_carries: i32(u64, u64, u64, u64)
+int add_u128_carries(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) {
+    unsigned __int128 r;
+    return __builtin_add_overflow(U128(ah, al), U128(bh, bl), &r);
+}
+// @diff sub_i128_overflows: i32(u64, u64, u64, u64)
+int sub_i128_overflows(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) {
+    __int128 r;
+    return __builtin_sub_overflow((__int128)U128(ah, al), (__int128)U128(bh, bl), &r);
+}
+
+// pclmulqdq (xz's CRC64): the carry-less product of one qword of each operand.
+#include <wmmintrin.h>
+#define CLMUL __attribute__((target("pclmul,sse2")))
+// @diff clmul_lo: u64(u64, u64)
+CLMUL uint64_t clmul_lo(uint64_t a, uint64_t b) {
+    return _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(a), _mm_cvtsi64_si128(b), 0x00));
+}
+// @diff clmul_hi_11: u64(u64, u64, u64, u64)
+CLMUL uint64_t clmul_hi_11(uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1) {
+    __m128i r = _mm_clmulepi64_si128(_mm_set_epi64x(a1, a0), _mm_set_epi64x(b1, b0), 0x11);
+    return _mm_cvtsi128_si64(_mm_unpackhi_epi64(r, r)) ^ _mm_cvtsi128_si64(r) * 3;
+}

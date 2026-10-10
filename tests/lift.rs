@@ -188,6 +188,23 @@ fn shifts_divides_and_sign_extension() {
 }
 
 #[test]
+fn narrow_sign_extensions_and_prefetch() {
+    // gcc -O0 widens a signed char with cbw and a short dividend with cwd
+    let out = ir(|a| {
+        a.mov(eax, edi).unwrap();
+        a.prefetcht0(byte_ptr(rsi)).unwrap(); // a hint: nothing to lift
+        a.cbw().unwrap(); // ax = sext(al)
+        a.cwd().unwrap(); // dx = the sign of ax
+        a.idiv(cx).unwrap();
+        a.ret().unwrap();
+    });
+    assert!(out.contains("SExt"), "{out}");
+    assert!(out.contains("AShr") && out.contains("const 0xf"), "{out}");
+    assert!(out.contains("SDiv") && out.contains("SRem"), "{out}");
+    assert!(!out.contains("Load"), "prefetch reads nothing:\n{out}");
+}
+
+#[test]
 fn byte_register_write_reads_back_without_a_mask() {
     let out = ir(|a| {
         a.mov(al, 1).unwrap();
@@ -305,6 +322,69 @@ fn relative_jump_tables_at_o0() {
     verify(&f).unwrap();
     let out = dump(&f);
     assert!(out.contains("switch") && !out.contains("tailcall"), "{out}");
+}
+
+#[test]
+fn relative_jump_table_with_a_store_before_the_jump() {
+    // gcc -O2 may schedule a store between the add and the jump (zstd's
+    // ZSTD_decodeLiteralsBlock):
+    //   lea rsi, [rip+table] ; movsxd rcx, [rsi+rax*4] ; movzx edx, byte [rdx]
+    //   add rcx, rsi ; mov [rsp+8], rdx ; jmp rcx
+    use iced_x86::{BlockEncoderOptions, Code, Instruction, MemoryOperand, Register};
+    const TABLE: u64 = 0x3000;
+    let mut a = CodeAssembler::new(64).unwrap();
+    let mut cases = [a.create_label(), a.create_label(), a.create_label()];
+    let mut default = a.create_label();
+    let mut done = a.create_label();
+    a.cmp(edi, 2).unwrap();
+    a.ja(default).unwrap();
+    a.mov(eax, edi).unwrap();
+    a.add_instruction(Instruction::with2(Code::Lea_r64_m, Register::RSI, MemoryOperand::with_base_displ(Register::RIP, TABLE as i64)).unwrap()).unwrap();
+    a.movsxd(rcx, dword_ptr(rsi + rax * 4)).unwrap();
+    a.movzx(edx, byte_ptr(rdx)).unwrap();
+    a.add(rcx, rsi).unwrap();
+    a.mov(qword_ptr(rsp + 8), rdx).unwrap();
+    a.jmp(rcx).unwrap();
+    for (k, l) in cases.iter_mut().enumerate() {
+        a.set_label(l).unwrap();
+        a.lea(eax, dword_ptr(rdi + 10 * (k as i32 + 1))).unwrap();
+        a.jmp(done).unwrap();
+    }
+    a.set_label(&mut default).unwrap();
+    a.xor(eax, eax).unwrap();
+    a.set_label(&mut done).unwrap();
+    a.ret().unwrap();
+    let r = a.assemble_options(common::BASE, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS).unwrap();
+    let table: Vec<u8> = cases.iter().flat_map(|l| (r.label_ip(l).unwrap().wrapping_sub(TABLE) as i32).to_le_bytes()).collect();
+    let mut f = Function::with_capacity(64, 8);
+    Lifter::new().lift_with_data(&r.inner.code_buffer, common::BASE, &[(TABLE, &table)], &mut f).unwrap();
+    verify(&f).unwrap();
+    let out = dump(&f);
+    assert!(out.contains("switch") && !out.contains("tailcall"), "{out}");
+}
+
+#[test]
+fn a_jump_back_into_another_function_lifts_its_return() {
+    // pcre2's `pcre2_pattern_info_8.cold`: `mov esi, -34 ; jmp <return>`, where
+    // the return in the middle of pcre2_pattern_info_8 is `mov eax, esi ; ret`
+    const PARENT: u64 = 0x2000;
+    let parent: [u8; 8] = [0x90, 0x90, 0x90, 0x90, 0x89, 0xf0, 0xc3, 0xcc]; // nop x4 ; mov eax, esi ; ret
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.mov(esi, -34).unwrap();
+    a.jmp(PARENT + 4).unwrap();
+    let code = a.assemble(common::BASE).unwrap();
+    let mut l = Lifter::new();
+    l.entries = std::sync::Arc::new([common::BASE, PARENT].into_iter().collect());
+    let mut f = Function::with_capacity(64, 8);
+    l.lift_with_data(&code, common::BASE, &[(common::BASE, &code), (PARENT, &parent)], &mut f).unwrap();
+    verify(&f).unwrap();
+    let out = dump(&f);
+    assert!(out.contains("ret") && !out.contains("tailcall"), "{out}");
+
+    // a jump to a function's start stays a tail call
+    l.entries = std::sync::Arc::new([common::BASE, PARENT + 4].into_iter().collect());
+    l.lift_with_data(&code, common::BASE, &[(common::BASE, &code), (PARENT, &parent)], &mut f).unwrap();
+    assert!(dump(&f).contains("tailcall"), "{}", dump(&f));
 }
 
 #[test]

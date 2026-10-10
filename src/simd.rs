@@ -22,6 +22,9 @@ pub fn name(op: LaneOp, w: u8) -> String {
         let reg = ["eax", "ebx", "ecx", "edx"][w as usize & 3];
         return format!("simd::cpu::{}_{reg}", if op == Cpuid { "cpuid" } else { "xgetbv" });
     }
+    if op == ClMul {
+        return format!("simd::clmul::{}", if w == 0 { "lo" } else { "hi" });
+    }
     let float = matches!(
         op,
         FAdd | FSub | FMul | FDiv | FMin | FMax | FCmpEq | FCmpLt | FCmpLe | FCmpUnord | FCmpNeq | FCmpNlt | FCmpNle
@@ -63,7 +66,7 @@ pub fn name(op: LaneOp, w: u8) -> String {
         FCmpGt => "cmpgt",
         FCmpGe => "cmpge",
         FCmpLtGt => "cmplg",
-        Cpuid | Xgetbv | F80ToF64 | Fist | FRem => unreachable!("handled above"),
+        Cpuid | Xgetbv | ClMul | F80ToF64 | Fist | FRem => unreachable!("handled above"),
     };
     match float {
         true => format!("simd::f{}::{f}", 8 * w),
@@ -322,6 +325,14 @@ pub mod simd {
 
     /// `cpuid` and `xgetbv`, one output register each.
     #[allow(unused_unsafe)]
+    /// `pclmulqdq`: the carry-less (polynomial) product of two 64-bit values.
+    pub mod clmul {
+        fn wide(a: u64, b: u64) -> u128 {
+            (0..64).filter(|k| b >> k & 1 != 0).fold(0u128, |p, k| p ^ ((a as u128) << k))
+        }
+        pub fn lo(a: u64, b: u64) -> u64 { wide(a, b) as u64 }
+        pub fn hi(a: u64, b: u64) -> u64 { (wide(a, b) >> 64) as u64 }
+    }
     pub mod cpu {
         fn cpuid(a: u64, c: u64) -> core::arch::x86_64::CpuidResult {
             unsafe { core::arch::x86_64::__cpuid_count(a as u32, c as u32) }

@@ -29,6 +29,7 @@ pub(super) fn handled(m: Mnemonic) -> bool {
                 | Pextrw | Cmpsd | Cmpss | Cmppd | Cmpps | Ucomisd | Comisd | Ucomiss | Comiss | Cvtsi2sd | Cvtsi2ss
                 | Cvttsd2si | Cvtsd2si | Cvttss2si | Cvtss2si | Cvtss2sd | Cvtsd2ss | Sqrtsd | Sqrtss | Sqrtpd | Sqrtps
                 | Packsswb | Packuswb | Packssdw | Packusdw | Vpbroadcastb | Vpbroadcastw | Vpbroadcastd | Vpbroadcastq
+                | Pclmulqdq
         )
 }
 
@@ -277,6 +278,17 @@ impl Lifter {
                     _ => 8,
                 };
                 self.lanes(f, i, |l, f, a, b| l.lane(f, LaneOp::CmpEq, w, a, b))?;
+            }
+            // one qword of each operand (by the immediate's bits 0 and 4),
+            // multiplied carry-less into the whole register
+            Pclmulqdq => {
+                let (d, a, b) = self.srcs(f, i)?;
+                let k = i.immediate(2);
+                let x = if k & 1 != 0 { a.1 } else { a.0 };
+                let y = if k & 0x10 != 0 { b.1 } else { b.0 };
+                let lo = self.lane(f, LaneOp::ClMul, 0, x, y);
+                let hi = self.lane(f, LaneOp::ClMul, 1, x, y);
+                self.xmm_set(d, (lo, hi));
             }
             // the low dwords of each qword, multiplied into the whole qword
             Pmuludq => self.lanes(f, i, |l, f, a, b| {

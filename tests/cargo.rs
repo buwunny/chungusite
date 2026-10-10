@@ -107,3 +107,345 @@ fn cargo_project_runs_like_the_original() {
     assert!(std::fs::read_to_string(other.join("Cargo.toml")).unwrap().contains("mine"));
     let _ = std::fs::remove_dir_all(Path::new(&dir));
 }
+
+/// `-mcmodel=medium`: arrays over 64 KiB go in `.lbss`/`.ldata`, which the code
+/// reaches as the GOT's address plus a 64-bit offset; one is over 1 GB, so the
+/// project needs the medium code model too. `sum` takes 80 stack arguments.
+const LARGE: &str = r#"#include <stdio.h>
+#include <stdint.h>
+static uint32_t big[40000];
+uint32_t init[20000] = {1, 2, 3, 4, 5};
+static uint8_t huge[1200u << 20];
+uint64_t small = 7;
+#define A8(p) long p##0, long p##1, long p##2, long p##3, long p##4, long p##5, long p##6, long p##7
+#define S8(p) p##0 + p##1 + p##2 + p##3 + p##4 + p##5 + p##6 + p##7
+#define V8(n) n, n + 1, n + 2, n + 3, n + 4, n + 5, n + 6, n + 7
+__attribute__((noinline)) long sum(long a, long b, long c, long d, long e, long f,
+    A8(g), A8(h), A8(i), A8(j), A8(k), A8(l), A8(m), A8(n), A8(o), A8(p)) {
+    return a + b + c + d + e + f + S8(g) + S8(h) + S8(i) + S8(j) + S8(k) + S8(l) + S8(m) + S8(n) + S8(o) + S8(p) * 3;
+}
+__attribute__((noinline)) void fill(int n) { for (int i = 0; i < n; i++) big[i] = i * 3 + init[i % 5]; }
+int main(int argc, char **argv) {
+    fill(40000);
+    huge[sizeof huge - argc] = 9;
+    uint64_t s = small;
+    for (int i = 0; i < 40000; i++) s += big[i];
+    long t = sum(1, 2, 3, 4, 5, 6, V8(10), V8(20), V8(30), V8(40), V8(50), V8(60), V8(70), V8(80), V8(90), V8(100));
+    printf("%lu %u %d %ld\n", (unsigned long)s, init[4], huge[sizeof huge - 1], t);
+    return 0;
+}
+"#;
+
+#[test]
+fn medium_code_model_data() {
+    if !have("cc") || !have("cargo") {
+        eprintln!("cargo: no C compiler or cargo, skipping");
+        return;
+    }
+    let dir = scratch("medium");
+    std::fs::write(dir.join("large.c"), LARGE).unwrap();
+    let bin = env!("CARGO_BIN_EXE_chungusite");
+    for (opt, name) in [("-O0", "large0"), ("-O2", "large2")] {
+        let prog = dir.join(name);
+        let cc = Command::new("cc").args([opt, "-s", "-mcmodel=medium", "-o"]).arg(&prog).arg(dir.join("large.c")).status().unwrap();
+        assert!(cc.success());
+        let want = run(&mut Command::new(&prog));
+        assert_eq!(want, ("2400060007 5 9 4915\n".to_string(), 0), "{opt}: the original");
+
+        let project = dir.join(format!("p{name}"));
+        let out = Command::new(bin).arg(&prog).arg("--cargo").arg(&project).output().unwrap();
+        assert!(out.status.success(), "chungusite failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        assert!(std::fs::read_to_string(project.join(".cargo/config.toml")).unwrap().contains("code-model=medium"));
+        let target = dir.join("target");
+        let build = Command::new("cargo")
+            .args(["build", "--quiet", "--offline", "--manifest-path"])
+            .arg(project.join("Cargo.toml"))
+            .env("CARGO_TARGET_DIR", &target)
+            .output()
+            .unwrap();
+        assert!(build.status.success(), "{opt}: cargo build failed:\n{}", String::from_utf8_lossy(&build.stderr));
+        let got = run(&mut Command::new(target.join("debug").join(name)));
+        assert_eq!(got, want, "{opt}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A constructor picks the function a pointer calls (xz picks its CRCs so),
+/// and the call through it passes three stack arguments, two of the registers
+/// forwarded from the caller's own entry; the callee never reads r9.
+const CTOR: &str = r#"#include <stdio.h>
+typedef long (*fn9)(void *, long, long, long *, long, long *, long *, long, int);
+struct coder { void *c; fn9 code; };
+__attribute__((noinline)) long impl(void *c, long a, long b, long *p, long d, long *o, long *op, long os, int act) {
+    *op += os + act + a + b + d;
+    return *p + (long)c;
+}
+static struct coder co;
+__attribute__((constructor)) static void pick(void) { co.c = (void *)3; co.code = impl; }
+__attribute__((noinline)) long block(struct coder *k, long a, long b, long *p, long d, long *o, long *op, long os, int act) {
+    long r = k->code(k->c, a, b, p, d, o, op, os, act);
+    return r + *op;
+}
+int main(int argc, char **argv) {
+    long p = 5, o = 0, op = 1;
+    long r = block(&co, argc, 2, &p, 4, &o, &op, 100, argc + 6);
+    printf("%ld %ld\n", r, op);
+    return 0;
+}
+"#;
+
+#[test]
+fn constructors_and_stack_arguments_through_a_pointer() {
+    if !have("cc") || !have("cargo") {
+        eprintln!("cargo: no C compiler or cargo, skipping");
+        return;
+    }
+    let dir = scratch("ctor");
+    std::fs::write(dir.join("ctor.c"), CTOR).unwrap();
+    let bin = env!("CARGO_BIN_EXE_chungusite");
+    for (opt, name) in [("-O0", "ctor0"), ("-O2", "ctor2")] {
+        let prog = dir.join(name);
+        assert!(Command::new("cc").args([opt, "-s", "-o"]).arg(&prog).arg(dir.join("ctor.c")).status().unwrap().success());
+        let want = run(&mut Command::new(&prog));
+        assert_eq!(want, ("123 115\n".to_string(), 0), "{opt}: the original");
+        for mode in ["fast", "safe"] {
+            let project = dir.join(format!("p{name}{mode}"));
+            let out = Command::new(bin).arg(&prog).args(["--mode", mode, "--cargo"]).arg(&project).output().unwrap();
+            assert!(out.status.success(), "chungusite failed:\n{}", String::from_utf8_lossy(&out.stderr));
+            let target = dir.join("target");
+            let build = Command::new("cargo")
+                .args(["build", "--quiet", "--offline", "--manifest-path"])
+                .arg(project.join("Cargo.toml"))
+                .env("CARGO_TARGET_DIR", &target)
+                .output()
+                .unwrap();
+            assert!(build.status.success(), "{opt} {mode}: cargo build failed:\n{}", String::from_utf8_lossy(&build.stderr));
+            let got = run(&mut Command::new(target.join("debug").join(name)));
+            assert_eq!(got, want, "{opt} {mode}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Shapes from zstd at -O2: a 28-byte struct passed by value and forwarded
+/// with overlapping 16-byte copies, which read a stack argument word only in
+/// part; and a function pointer with stack arguments whose r9 was set before a
+/// call to a helper gcc knows leaves r9 alone.
+const FORWARD: &str = r#"#include <stdio.h>
+#include <stdlib.h>
+
+/* a 28-byte struct passed by value, forwarded with 16-byte copies */
+typedef struct { unsigned a, b, c, d, e, f, g; } P;
+
+__attribute__((noinline)) static int use(void *out, int x, const char *s, unsigned long long n, int lvl, P p) {
+    return (int)(p.a + p.b * 2 + p.c * 3 + p.d * 4 + p.e * 5 + p.f * 6 + p.g * 7) + x + lvl + (int)n + s[0] + (out != 0);
+}
+
+__attribute__((noinline)) int fwd(void *out, int x, const char *s, int lvl, P p) {
+    unsigned long long n = (unsigned long long)atoi(s);
+    return use(out, x, s, n, lvl, p);
+}
+
+/* a function pointer with stack arguments, its r9 set before a helper gcc
+   knows leaves r9 alone */
+typedef int (*get_fn)(int, int, int, int, int, const int *, int, int);
+__attribute__((noinline)) static int price(int a, int b) { return a * 3 + b; }
+__attribute__((noinline)) int pick7(int a, int b, int c, int d, int e, const int *r, int s, int t) {
+    return a + b + c + d + e + r[s] * 100 + t * 1000;
+}
+__attribute__((noinline)) int drive(get_fn f, int n, const int *rep) {
+    int total = 0;
+    for (int i = 0; i < n; i++) {
+        int pr = price(i, n);
+        total += f(i, 1, 2, 3, pr, rep, i == 0, n) + pr;
+    }
+    return total;
+}
+
+get_fn volatile pick = pick7;
+int main(int argc, char **argv) {
+    P p = {1, 2, 3, 4, 5, 6, (unsigned)argc + 8};
+    int rep[3] = {7, 11, 13};
+    get_fn f = pick;
+    printf("%d %d\n", fwd(argv, argc, "42", 9, p), drive(f, 3, rep));
+    return 0;
+}
+"#;
+
+#[test]
+fn struct_arguments_and_registers_kept_across_a_helper() {
+    if !have("cc") || !have("cargo") {
+        eprintln!("cargo: no C compiler or cargo, skipping");
+        return;
+    }
+    let dir = scratch("forward");
+    std::fs::write(dir.join("forward.c"), FORWARD).unwrap();
+    let bin = env!("CARGO_BIN_EXE_chungusite");
+    for (opt, name) in [("-O0", "forward0"), ("-O2", "forward2")] {
+        let prog = dir.join(name);
+        assert!(Command::new("cc").args([opt, "-s", "-o"]).arg(&prog).arg(dir.join("forward.c")).status().unwrap().success());
+        let want = run(&mut Command::new(&prog));
+        assert_eq!(want, ("259 11557\n".to_string(), 0), "{opt}: the original");
+        let project = dir.join(format!("p{name}"));
+        let out = Command::new(bin).arg(&prog).arg("--cargo").arg(&project).output().unwrap();
+        assert!(out.status.success(), "chungusite failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        let target = dir.join("target");
+        let build = Command::new("cargo")
+            .args(["build", "--quiet", "--offline", "--manifest-path"])
+            .arg(project.join("Cargo.toml"))
+            .env("CARGO_TARGET_DIR", &target)
+            .output()
+            .unwrap();
+        assert!(build.status.success(), "{opt}: cargo build failed:\n{}", String::from_utf8_lossy(&build.stderr));
+        let got = run(&mut Command::new(target.join("debug").join(name)));
+        assert_eq!(got, want, "{opt}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Shapes from xz and pcre2 at -O2: liblzma's `alone_decode` ends in a tail
+/// call through a pointer that passes its own stack arguments on, and one
+/// `fprintf` shared by paths that push different stack arguments.
+const TAIL: &str = r#"#include <stdio.h>
+#include <stdlib.h>
+
+/* a pointer tail call passing the caller's own stack arguments on */
+typedef long (*code_fn)(void *, long, long, long, long, long, long *, long, int);
+struct next { void *coder; code_fn code; };
+__attribute__((noinline)) long inner(void *c, long a, long b, long d, long e, long f, long *pos, long size, int action) {
+    *pos += size;
+    return a + b + d + e + f + size * 10 + action * 100 + (c != 0);
+}
+__attribute__((noinline)) long outer(struct next *n, long a, long b, long d, long e, long f, long *pos, long size, int action) {
+    if (n->coder == 0)
+        return -1;
+    return n->code(n->coder, a, b, d, e, f, pos, size, action);
+}
+
+/* two paths pushing different stack arguments to one shared fprintf */
+__attribute__((noinline)) void report(FILE *out, unsigned long line, const char *a, const char *b, size_t max, int which) {
+    if (which)
+        fprintf(out, "line %lu%s%s too long; max %zu (%d)\n", line, a, b, max, which);
+    else
+        fprintf(out, "line %lu%s%s too long; max %zu\n", line, b, a, max);
+}
+
+struct next volatile_next;
+int main(int argc, char **argv) {
+    long pos = 5;
+    volatile_next.coder = argv;
+    volatile_next.code = inner;
+    long r = outer(&volatile_next, 1, 2, 3, 4, argc, &pos, 7, 2);
+    printf("%ld %ld\n", r, pos);
+    report(stdout, 4, " of ", "x", 100 + argc, argc);
+    report(stdout, 9, "y", " in ", 200 + argc, 0);
+    return 0;
+}
+"#;
+
+#[test]
+fn stack_arguments_through_a_pointer_tail_call() {
+    if !have("cc") || !have("cargo") {
+        eprintln!("cargo: no C compiler or cargo, skipping");
+        return;
+    }
+    let dir = scratch("tail");
+    std::fs::write(dir.join("tail.c"), TAIL).unwrap();
+    let bin = env!("CARGO_BIN_EXE_chungusite");
+    for (opt, name) in [("-O0", "tail0"), ("-O2", "tail2")] {
+        let prog = dir.join(name);
+        assert!(Command::new("cc").args([opt, "-s", "-o"]).arg(&prog).arg(dir.join("tail.c")).status().unwrap().success());
+        let want = run(&mut Command::new(&prog));
+        assert_eq!(want.0.lines().next(), Some("282 12"), "{opt}: the original");
+        let project = dir.join(format!("p{name}"));
+        let out = Command::new(bin).arg(&prog).arg("--cargo").arg(&project).output().unwrap();
+        assert!(out.status.success(), "chungusite failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        let target = dir.join("target");
+        let build = Command::new("cargo")
+            .args(["build", "--quiet", "--offline", "--manifest-path"])
+            .arg(project.join("Cargo.toml"))
+            .env("CARGO_TARGET_DIR", &target)
+            .output()
+            .unwrap();
+        assert!(build.status.success(), "{opt}: cargo build failed:\n{}", String::from_utf8_lossy(&build.stderr));
+        let got = run(&mut Command::new(target.join("debug").join(name)));
+        assert_eq!(got, want, "{opt}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Shapes from QuickJS: a computed `goto` interpreter, whose jumps through
+/// one label table now share one dispatch, and a 16-byte result returned
+/// through a function pointer and a wrapper that checks its stack canary.
+const GOTO: &str = r#"#include <stdio.h>
+#include <stdlib.h>
+
+/* a computed goto interpreter: every opcode ends in its own jump through
+   the label table */
+__attribute__((noinline)) long run(const unsigned char *code, long acc) {
+    static void *labels[] = {&&op_inc, &&op_dbl, &&op_dec, &&op_neg, &&op_end, &&op_sq};
+#define NEXT goto *labels[*code++]
+    NEXT;
+op_inc: acc++; NEXT;
+op_dbl: acc *= 2; NEXT;
+op_dec: acc--; NEXT;
+op_neg: acc = -acc; NEXT;
+op_sq: acc *= acc; NEXT;
+op_end: return acc;
+}
+
+/* a 16-byte result through a function pointer and a wrapper */
+typedef struct { long v; long tag; } Val;
+__attribute__((noinline)) Val mk(long v, long t) { Val r = {v * 3, t}; return r; }
+typedef Val (*mk_fn)(long, long);
+mk_fn volatile mkp = mk;
+__attribute__((noinline)) Val via_ptr(long v) { return mkp(v, 7); }
+__attribute__((noinline)) Val wrap(const char *s) {
+    char buf[32];
+    snprintf(buf, sizeof buf, "%s", s);
+    Val r = via_ptr(atol(buf));
+    return r;
+}
+
+int main(int argc, char **argv) {
+    unsigned char prog[] = {0, 1, 1, 5, 2, 3, 0, 4};
+    Val v = wrap(argc > 5 ? argv[1] : "14");
+    printf("%ld %ld %ld\n", run(prog, argc + 2), v.v, v.tag);
+    return 0;
+}
+"#;
+
+#[test]
+fn computed_goto_and_pair_results() {
+    if !have("cc") || !have("cargo") {
+        eprintln!("cargo: no C compiler or cargo, skipping");
+        return;
+    }
+    let dir = scratch("goto");
+    std::fs::write(dir.join("goto.c"), GOTO).unwrap();
+    let bin = env!("CARGO_BIN_EXE_chungusite");
+    // (at -O0 the label table isn't found yet: the jump is taken for a tail call)
+    for (opt, name) in [("-O2", "goto2")] {
+        let prog = dir.join(name);
+        assert!(Command::new("cc").args([opt, "-s", "-o"]).arg(&prog).arg(dir.join("goto.c")).status().unwrap().success());
+        let want = run(&mut Command::new(&prog));
+        assert_eq!(want, ("-254 42 7\n".to_string(), 0), "{opt}: the original");
+        let ir = Command::new(bin).arg(&prog).args(["--emit", "ir"]).output().unwrap();
+        let ir = String::from_utf8_lossy(&ir.stdout);
+        assert_eq!(ir.matches("switch").count(), 1, "one dispatch for the label table:\n{ir}");
+        let project = dir.join(format!("p{name}"));
+        let out = Command::new(bin).arg(&prog).arg("--cargo").arg(&project).output().unwrap();
+        assert!(out.status.success(), "chungusite failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        let target = dir.join("target");
+        let build = Command::new("cargo")
+            .args(["build", "--quiet", "--offline", "--manifest-path"])
+            .arg(project.join("Cargo.toml"))
+            .env("CARGO_TARGET_DIR", &target)
+            .output()
+            .unwrap();
+        assert!(build.status.success(), "{opt}: cargo build failed:\n{}", String::from_utf8_lossy(&build.stderr));
+        let got = run(&mut Command::new(target.join("debug").join(name)));
+        assert_eq!(got, want, "{opt}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

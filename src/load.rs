@@ -311,6 +311,34 @@ impl<'a> Binary<'a> {
         self.func_at(addr).map(|f| f.name.as_str())
     }
 
+    /// The constructors the C runtime calls before `main`, in the order it calls
+    /// them: `.preinit_array`, then `.init_array`. Each slot holds its function's
+    /// address, in a PIE only once its `R_X86_64_RELATIVE` relocation is applied.
+    pub fn constructors(&self) -> Vec<u64> {
+        let relative: BTreeMap<u64, u64> = self
+            .file
+            .dynamic_relocations()
+            .into_iter()
+            .flatten()
+            .filter(|(_, r)| matches!(r.target(), RelocationTarget::Absolute) && (r.size() == 64 || r.size() == 0))
+            .map(|(at, r)| (at, r.addend() as u64))
+            .collect();
+        let mut out = Vec::new();
+        for name in [".preinit_array", ".init_array"] {
+            let Some(sec) = self.file.section_by_name(name) else { continue };
+            let Ok(bytes) = sec.data() else { continue };
+            for (k, w) in bytes.chunks_exact(8).enumerate() {
+                let at = sec.address() + 8 * k as u64;
+                let raw = u64::from_le_bytes(w.try_into().unwrap());
+                let addr = relative.get(&at).copied().unwrap_or(raw);
+                if addr != 0 && addr != u64::MAX {
+                    out.push(addr);
+                }
+            }
+        }
+        out
+    }
+
     /// The data section containing `addr`.
     pub fn data_section_at(&self, addr: u64) -> Option<usize> {
         let i = self.data.partition_point(|s| s.addr <= addr).checked_sub(1)?;

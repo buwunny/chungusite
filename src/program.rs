@@ -72,7 +72,7 @@ pub struct Func {
     /// Per site, for a callee without an inferred signature: the integer,
     /// float and stack arguments it sets up, and whether it reads a float
     /// result (xmm0, not rax) after the call.
-    guesses: Vec<(u8, u8, u8, bool)>,
+    guesses: Vec<(u8, u8, u8, bool, bool)>,
     /// Per site, the argument registers passed on unchanged from entry
     /// (`abi::passed_through`).
     passes: Vec<u8>,
@@ -285,6 +285,25 @@ impl Program {
         let syms = file.map(Symbols::parse).unwrap_or_default();
         let loaded = file.map(loaded_sections).unwrap_or_default();
         let sections: Vec<(u64, &[u8])> = loaded.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+        // GOT-relative data (`opt::fold_got_offsets`): the GOT's extent, and the
+        // allocated sections a GOT-relative address may land in.
+        let alloc: Vec<(u64, u64, String)> = file
+            .and_then(|d| object::File::parse(d).ok())
+            .filter(|o| o.kind() != ObjectKind::Relocatable)
+            .map(|o| {
+                o.sections()
+                    .filter(|s| s.address() != 0 && s.size() != 0)
+                    .filter(|s| matches!(s.kind(), SectionKind::Data | SectionKind::UninitializedData | SectionKind::ReadOnlyData | SectionKind::ReadOnlyString))
+                    .map(|s| (s.address(), s.address() + s.size(), s.name().unwrap_or("").to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let got = alloc
+            .iter()
+            .filter(|s| matches!(s.2.as_str(), ".got" | ".got.plt"))
+            .map(|s| (s.0, s.1))
+            .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)));
+        let lands = |a: u64| alloc.iter().any(|s| s.0 <= a && a < s.1 && !matches!(s.2.as_str(), ".got" | ".got.plt"));
         let thread_pointer = file.and_then(|d| crate::load::tls(&object::File::parse(d).ok()?)).map(|t| t.thread_pointer);
         let by_addr: HashMap<u64, usize> = inputs.iter().enumerate().map(|(i, x)| (x.addr, i)).rev().collect();
         let mut by_name: HashMap<String, usize> = HashMap::new();
@@ -313,6 +332,7 @@ impl Program {
             (true, Some(d)) => crate::dwarf::read(d, &mut tys, &|a| addrs.contains(&a)),
             _ => None,
         };
+        let entries = std::sync::Arc::new(addrs.clone());
         let lift = || -> Vec<(Result<Function, String>, Option<String>)> {
             inputs
                 .par_iter()
@@ -322,6 +342,7 @@ impl Program {
                         l.track_exits = true;
                         l.thread_pointer = thread_pointer;
                         l.asm = opts.asm;
+                        l.entries = entries.clone();
                         l
                     },
                     |lifter, x| {
@@ -344,6 +365,7 @@ impl Program {
                                 if lifter.followed_flow() {
                                     crate::opt::fold_branches(&mut f);
                                 }
+                                crate::dispatch::share_switches(&mut f);
                                 clean(&mut f);
                                 verify(&f).map_err(|e| format!("cleaned IR failed verification: {e:?}"))
                             });
@@ -389,6 +411,9 @@ impl Program {
                 _ => Target::Indirect,
             }
         };
+        // What each function keeps without help from its callees, for values
+        // gcc leaves in a register across a call to a helper it knows.
+        let alone: Vec<u16> = lifted.par_iter().map(|(ir, _)| ir.as_ref().map_or(0, abi::keeps_alone)).collect();
         let mut funcs: Vec<Func> = inputs
             .into_par_iter()
             .zip(lifted)
@@ -396,10 +421,14 @@ impl Program {
                 let (sites, targets, guesses, passes, xmm0_from) = match &ir {
                     Ok(f) => {
                         let sites = abi::sites(f);
-                        let targets = sites.iter().map(|&s| resolve(f, s)).collect();
-                        let args: Vec<u8> = sites.iter().map(|&s| abi::guess_args(f, s)).collect();
+                        let targets: Vec<Target> = sites.iter().map(|&s| resolve(f, s)).collect();
+                        let keeps = |call: ValueId, reg: u8| {
+                            matches!(resolve(f, Site::Call(call)), Target::Func(j) if alone[j] & (1 << reg) != 0)
+                        };
+                        let args: Vec<u8> = sites.iter().map(|&s| abi::guess_args(f, s, &keeps)).collect();
                         let stack = abi::guess_stack(f, &sites, &args);
-                        let guesses = sites.iter().zip(args).zip(stack).map(|((&s, a), st)| (a, abi::guess_fargs(f, s), st, false)).collect();
+                        // (stack arguments come after all six registers, set up or passed on)
+                        let guesses = sites.iter().zip(args).zip(stack).map(|((&s, a), st)| (if st > 0 { 6 } else { a }, abi::guess_fargs(f, s), st, false, matches!(s, Site::Tail(_)))).collect();
                         let passes = sites.iter().map(|&s| abi::passed_through(f, s)).collect();
                         let xmm0_from = sites.iter().map(|&s| abi::passes_xmm0(f, &sites, s)).collect();
                         (sites, targets, guesses, passes, xmm0_from)
@@ -452,7 +481,9 @@ impl Program {
             for k in 0..f.sites.len() {
                 let unknown = match &f.targets[k] {
                     Target::Indirect => true,
-                    Target::Import(n) => crate::libc::lookup(n).is_none(),
+                    // a variadic one takes what the call sets up, forwarded or not
+                    // (zstd's `fprintf(stderr, "%s already exists", name)`)
+                    Target::Import(n) => crate::libc::lookup(n).is_none_or(|s| s.variadic),
                     Target::Func(j) => failed[*j],
                 };
                 let pass = f.passes[k] & ((1u16 << set.min(6)) - 1) as u8;
@@ -477,6 +508,8 @@ impl Program {
                 let e = guessed.entry(key).or_insert(Sig { ret: true, ..Sig::default() });
                 e.args = e.args.max(g.0);
                 e.fargs = e.fargs.max(g.1);
+                // and the stack arguments (zlib's `deflateInit2_` takes eight)
+                e.stack_args = e.stack_args.max(g.2);
             }
         }
         let mut stack_args: Vec<u8> = funcs.par_iter().map(|f| f.ir.as_ref().map_or(0, abi::stack_args)).collect();
@@ -509,6 +542,17 @@ impl Program {
             }
             if !changed {
                 break;
+            }
+        }
+        // A tail call through a pointer passes on the caller's stack arguments
+        // too, where the caller found them (liblzma's `alone_decode` ends in
+        // `return coder->next.code(...)` with nine arguments).
+        for (i, f) in funcs.iter_mut().enumerate() {
+            for (k, s) in f.sites.iter().enumerate() {
+                if matches!(s, Site::Tail(_)) && f.targets[k] == Target::Indirect && stack_args[i] > 0 {
+                    let g = &mut f.guesses[k];
+                    (g.0, g.2) = (6, g.2.max(stack_args[i]));
+                }
             }
         }
 
@@ -580,7 +624,9 @@ impl Program {
                                     _ => site_sig(&f.targets[k], f.guesses[k], &sigs, &guessed),
                                 };
                                 let r = abi::infer(f.ir.as_ref().unwrap(), &f.sites, &callee, sigs[i], wanted_by[i], set_args[i]);
-                                (i, Sig { stack_args: stack_args[i], variadic: r.sig.variadic || va[i], ..r.sig }, r.reads)
+                                // stack arguments come after all six registers, read or not
+                                let args = if stack_args[i] > 0 { 6 } else { r.sig.args };
+                                (i, Sig { args, stack_args: stack_args[i], variadic: r.sig.variadic || va[i], ..r.sig }, r.reads)
                             })
                             .collect();
                         let kept: Vec<(u16, u32, bool)> = own
@@ -628,8 +674,11 @@ impl Program {
                 for (k, &r) in results[i].1.iter().enumerate() {
                     let (x, a) = (r & abi::READ_XMM0 != 0, r & abi::READ_RAX != 0);
                     match &f.targets[k] {
-                        Target::Indirect if f.guesses[k].3 != (x && !a) => {
+                        // and a 16-byte result (rax:rdx) if they read rdx; a tail
+                        // call passes on whatever the callee returns
+                        Target::Indirect if f.guesses[k].3 != (x && !a) || !f.guesses[k].4 && r & abi::READ_RDX != 0 => {
                             f.guesses[k].3 = x && !a;
+                            f.guesses[k].4 |= r & abi::READ_RDX != 0;
                             changed = true;
                             dirty[i] = true;
                         }
@@ -710,7 +759,9 @@ impl Program {
             let (made, copied) = split_returns(ir);
             // one entry per loop, so the loop's own edges skip the `match bb`
             let entries = crate::dispatch::single_entry(ir);
-            if made + entries > 0 {
+            // (after `apply`, which gives the GOT's address back to a register a call keeps)
+            let folded = got.map_or(0, |g| crate::opt::fold_got_offsets(ir, g, &lands));
+            if made + entries + folded > 0 {
                 clean(ir);
             }
             merge_straight(ir);
@@ -783,7 +834,7 @@ impl Program {
                         let s = guessed.get(&Target::Func(*j)).copied().unwrap_or(sigs[*j]);
                         (funcs[*j].name.clone(), s)
                     }
-                    Target::Import(n) => (n.clone(), site_sig(&funcs[fi].targets[k], (0, 0, 0, false), &sigs, &guessed)),
+                    Target::Import(n) => (n.clone(), site_sig(&funcs[fi].targets[k], (0, 0, 0, false, false), &sigs, &guessed)),
                     _ => continue,
                 };
                 if extern_of.contains_key(&name) {
@@ -815,7 +866,7 @@ impl Program {
             let e = &self.externs[*self.extern_of.get(name)?];
             // a variadic one's extra arguments: as many as this call sets up
             // (the floats among them go in xmm registers, as `f64`s)
-            let (args, fargs, stack, _) = f.guesses[k];
+            let (args, fargs, stack, _, _) = f.guesses[k];
             let sig = match e.sig.variadic {
                 true => Sig { args: e.sig.args.max(args), fargs: e.sig.fargs.max(fargs), stack_args: e.sig.stack_args.max(stack), ..e.sig },
                 false => e.sig,
@@ -851,9 +902,9 @@ impl Program {
             Target::Import(n) => ext(n),
             // through a pointer: integers and the float arguments the call sets up
             Target::Indirect => {
-                let (args, fargs, _, fret) = f.guesses[k];
+                let (args, fargs, _, fret, pair) = f.guesses[k];
                 let sig = Sig { args, fargs, ..Sig::default() };
-                Some(CallInfo { path: None, ret: true, foreign: true, arg_tys: arg_tys(sig, &[]), ret_ty: fret.then_some(TyId::F64), ..CallInfo::default() })
+                Some(CallInfo { path: None, ret: true, ret2: pair && !fret, foreign: true, arg_tys: arg_tys(sig, &[]), ret_ty: fret.then_some(TyId::F64), ..CallInfo::default() })
             }
         };
         let Some(s) = safe else { return plain };
@@ -1267,8 +1318,14 @@ impl Program {
         if !stubs.is_empty() {
             s.push_str("\n    // Functions of the binary that aren't in the output.\n");
         }
+        // a function that didn't lift panics with the reason, as its own stub does
+        let failed: HashMap<&str, &str> =
+            self.funcs.iter().filter_map(|f| Some((f.name.as_str(), f.ir.as_ref().err()?.as_str()))).collect();
         for e in stubs {
-            let why = format!("{} isn't decompiled", e.name);
+            let why = match failed.get(e.name.as_str()) {
+                Some(err) => format!("not lifted: {err}"),
+                None => format!("{} isn't decompiled", e.name),
+            };
             let _ = writeln!(s, "    pub unsafe {} {{\n        todo!({why:?})\n    }}", decl(e));
         }
         p
@@ -1518,11 +1575,13 @@ fn arg_tys(sig: Sig, int: &[Option<TyId>]) -> Vec<Option<TyId>> {
 /// What a call site passes: the callee's signature, with a variadic one's
 /// extra arguments as far as the site sets registers up, and the stack
 /// arguments it stores after all six registers.
-fn site_sig(t: &Target, (args, fargs, stack, fret): (u8, u8, u8, bool), sigs: &[Sig], guessed: &HashMap<Target, Sig>) -> Sig {
+fn site_sig(t: &Target, (args, fargs, stack, fret, pair): (u8, u8, u8, bool, bool), sigs: &[Sig], guessed: &HashMap<Target, Sig>) -> Sig {
     let s = match t {
         Target::Func(j) => guessed.get(t).copied().unwrap_or(sigs[*j]),
         Target::Import(n) => crate::libc::lookup(n).or_else(|| guessed.get(t).copied()).unwrap_or_default(),
-        Target::Indirect => Sig { args, fargs, ret: true, fret, ..Sig::default() },
+        // the stack arguments the call writes (`abi::guess_stack`): a function
+        // pointer with seven or more arguments, like liblzma's `coder->code`
+        Target::Indirect => Sig { args, fargs, stack_args: stack, ret: true, fret, ret2: pair && !fret, ..Sig::default() },
     };
     match (s.variadic, t) {
         // one of the program's own: it takes (and reads its register save area

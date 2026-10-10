@@ -709,3 +709,64 @@ fn eval(f: &Function, v: ValueId, depth: u32) -> Option<u64> {
     };
     Some(mask(w, r))
 }
+
+/// `-mcmodel=medium` reaches data that may be over 2 GB away (`.ldata`,
+/// `.lbss`) as the GOT's address plus a 64-bit offset: `lea rdx, [rip+GOT];
+/// movabs rax, off; add rax, rdx` (or `[rdx+rax]`). That sum is a constant
+/// address, but it is built from two values, so `Globals` would map the GOT
+/// slot it starts from and add the offset to that static. Each such sum,
+/// where `got` holds the start and `lands` the end, becomes
+/// `IntToPtr(Const(addr))` like any RIP-relative address. Returns how many.
+pub fn fold_got_offsets(f: &mut Function, got: (u64, u64), lands: &dyn Fn(u64) -> bool) -> usize {
+    let at_got = |f: &Function, v: ValueId| match f.insts[v].kind {
+        InstKind::IntToPtr(c) => match f.insts[c].kind {
+            InstKind::Const(k) => Some(f.consts[k.index()] as u64).filter(|&a| got.0 <= a && a < got.1),
+            _ => None,
+        },
+        _ => None,
+    };
+    let konst = |f: &Function, v: ValueId| match f.insts[v].kind {
+        InstKind::Const(k) => Some(f.consts[k.index()] as u64),
+        _ => None,
+    };
+    let mut folds = Vec::new();
+    for (b, blk) in f.blocks.iter() {
+        for &id in blk.insts.get(&f.value_pool) {
+            let addr = match f.insts[id].kind {
+                InstKind::Bin { op: BinOp::Add, lhs, rhs } if matches!(f.insts[id].ty, TyId::B8 | TyId::PTR) => {
+                    match (at_got(f, lhs), at_got(f, rhs), konst(f, lhs), konst(f, rhs)) {
+                        (Some(g), _, _, Some(c)) | (_, Some(g), Some(c), _) => g.wrapping_add(c),
+                        _ => continue,
+                    }
+                }
+                InstKind::PtrOffset { base, index: Some(index), scale, disp } => {
+                    let off = |c: u64, s: u8| c.wrapping_mul(s as u64).wrapping_add(disp as i64 as u64);
+                    match (at_got(f, base), konst(f, index), konst(f, base), at_got(f, index)) {
+                        (Some(g), Some(c), _, _) => g.wrapping_add(off(c, scale)),
+                        (_, _, Some(c), Some(g)) if scale == 1 => g.wrapping_add(off(c, 1)),
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+            if lands(addr) {
+                folds.push((b, id, addr));
+            }
+        }
+    }
+    for &(b, id, addr) in &folds {
+        // the constant goes right before the instruction that becomes its pointer
+        let c = ConstId::new(f.consts.len());
+        f.consts.push(addr as u128);
+        let k = f.insts.push(Inst { kind: InstKind::Const(c), ty: TyId::B8 });
+        f.origin.push(f.origin[id.index()]);
+        let mut list = f.blocks[b].insts.get(&f.value_pool).to_vec();
+        let at = list.iter().position(|&x| x == id).unwrap();
+        list.insert(at, k);
+        let start = f.value_pool.len() as u32;
+        f.value_pool.extend_from_slice(&list);
+        f.blocks[b].insts = ListRef { start, len: list.len() as u32 };
+        f.insts[id] = Inst { kind: InstKind::IntToPtr(k), ty: TyId::PTR };
+    }
+    folds.len()
+}

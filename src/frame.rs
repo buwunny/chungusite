@@ -272,6 +272,14 @@ struct Slot {
     size: i64,
 }
 
+impl Slot {
+    /// Does the slot touch the stack-argument word at `w` (a multiple of 8
+    /// above the return address)? A wide access can span several words.
+    fn covers_word(&self, w: i64) -> bool {
+        w >= 8 && self.off < w + 8 && w < self.off + self.size
+    }
+}
+
 /// Promote stack slots and give the function a frame; see the module docs.
 /// `stack_args` is how many stack arguments the signature takes: a stack
 /// argument whose address escapes copies in only those, as callers pass no more.
@@ -339,10 +347,9 @@ pub fn promote(f: &mut Function, stack_args: u8) {
         }
         // A stack-argument word with any access left in memory stays whole.
         for i in 0..slots.len() {
-            if slots[i].off >= 8 && !ok_slot[i] {
-                let word = (slots[i].off - 8) / 8;
+            if !ok_slot[i] {
                 for j in 0..slots.len() {
-                    if slots[j].off >= 8 && (slots[j].off - 8) / 8 == word {
+                    if (0..crate::abi::MAX_STACK_ARGS).map(|k| 8 + 8 * k).any(|w| slots[i].covers_word(w) && slots[j].covers_word(w)) {
                         ok_slot[j] = false;
                     }
                 }
@@ -412,7 +419,7 @@ pub fn promote(f: &mut Function, stack_args: u8) {
             let reg = STACK_ARG_BASE + word as u8;
             let exists = f.blocks[entry].params.get(&f.value_pool).iter().copied().find(|&p| matches!(f.insts[p].kind, InstKind::BlockParam(r) if r == reg));
             let in_memory = o.lost
-                || slots.iter().enumerate().any(|(i, s)| !ok_slot[i] && s.off >= 8 && (s.off - 8) / 8 == word)
+                || slots.iter().enumerate().any(|(i, s)| !ok_slot[i] && s.covers_word(8 + 8 * word))
                 || pos_taken.is_some_and(|t| 8 + 8 * word + 8 > t);
             if !in_memory || (exists.is_some() && !o.lost) {
                 continue;

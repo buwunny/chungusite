@@ -866,14 +866,17 @@ impl Lifter {
             }
             OpKind::Register => {
                 let r = j.op0_register();
-                let Some(add) = self.before(0).filter(|a| {
+                // the `add` of entry and table, last to write the register
+                // (gcc may schedule an unrelated store between it and the jump)
+                let Some(ka) = (0..RECENT).find(|&k| self.before(k).is_some_and(|w| writes(w, r))) else { return Ok(()) };
+                let Some(add) = self.before(ka).filter(|a| {
                     a.mnemonic() == Mnemonic::Add && a.op0_kind() == OpKind::Register && a.op0_register() == r
                         && a.op1_kind() == OpKind::Register
                 }) else { return Ok(()) };
                 let other = add.op1_register();
                 // The entry, sign-extended into one of the two: `movsxd`, or
                 // `mov eax, [..]; cdqe` (gcc -O0).
-                let Some((k, load, dst)) = (1..RECENT).find_map(|k| {
+                let Some((k, load, dst)) = (ka + 1..RECENT).find_map(|k| {
                     let m = self.before(k)?;
                     let dst = m.op0_register();
                     match m.mnemonic() {
@@ -887,7 +890,7 @@ impl Lifter {
                     }
                 }) else { return Ok(()) };
                 // the table, added to the entry
-                let Some(table) = self.rip_value(if dst == r { other } else { r }, 0) else { return Ok(()) };
+                let Some(table) = self.rip_value(if dst == r { other } else { r }, ka) else { return Ok(()) };
                 if load.memory_displacement64() != 0 {
                     return Ok(());
                 }

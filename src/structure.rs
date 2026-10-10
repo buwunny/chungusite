@@ -95,6 +95,23 @@ pub const DISPATCH_VAR: &str = "bb";
 /// keeps the state machine, which uses no recursion.
 const MAX_DEPTH: usize = 512;
 
+/// Deepest nesting of blocks, loops and `if`s the structurer emits.
+const MAX_NESTING: usize = 96;
+
+/// How deeply `nodes` nest.
+fn nesting(nodes: &[Node]) -> usize {
+    nodes
+        .iter()
+        .map(|n| match n {
+            Node::If { then, els, .. } => 1 + nesting(then).max(nesting(els)),
+            Node::Loop { body, .. } | Node::While { body, .. } | Node::Block { body, .. } => 1 + nesting(body),
+            Node::Dispatch { arms } => 2 + arms.iter().map(|a| nesting(&a.1)).max().unwrap_or(0),
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Is every cycle entered only through its header? Then every retreating edge
 /// (to a block no later in reverse postorder) goes to a block that dominates its
 /// source, and is a back edge of a natural loop.
@@ -223,7 +240,14 @@ pub fn structure(f: &Function, cfg: &Cfg, src: &mut dyn Source) -> Option<Struct
     let follows = vec![false; m];
     let mut s = Structurer { f, cfg: &view, src, node_of, vterm, forward_in, loop_head, children, follows, n };
     let body = s.tree(entry);
-    Some(Structured { nodes: tidy(body), regions: regions.len() })
+    let nodes = tidy(body);
+    // Code nested this deep (QuickJS's interpreter loop, hundreds of labeled
+    // blocks inside each other) is more than rustc can build in memory; the
+    // state machine is flat.
+    if nesting(&nodes) > MAX_NESTING {
+        return None;
+    }
+    Some(Structured { nodes, regions: regions.len() })
 }
 
 /// Where control really goes when it enters `b`: past any blocks that do nothing

@@ -72,7 +72,7 @@ pub struct Func {
     /// Per site, for a callee without an inferred signature: the integer,
     /// float and stack arguments it sets up, and whether it reads a float
     /// result (xmm0, not rax) after the call.
-    guesses: Vec<(u8, u8, u8, bool)>,
+    guesses: Vec<(u8, u8, u8, bool, bool)>,
     /// Per site, the argument registers passed on unchanged from entry
     /// (`abi::passed_through`).
     passes: Vec<u8>,
@@ -365,6 +365,7 @@ impl Program {
                                 if lifter.followed_flow() {
                                     crate::opt::fold_branches(&mut f);
                                 }
+                                crate::dispatch::share_switches(&mut f);
                                 clean(&mut f);
                                 verify(&f).map_err(|e| format!("cleaned IR failed verification: {e:?}"))
                             });
@@ -427,7 +428,7 @@ impl Program {
                         let args: Vec<u8> = sites.iter().map(|&s| abi::guess_args(f, s, &keeps)).collect();
                         let stack = abi::guess_stack(f, &sites, &args);
                         // (stack arguments come after all six registers, set up or passed on)
-                        let guesses = sites.iter().zip(args).zip(stack).map(|((&s, a), st)| (if st > 0 { 6 } else { a }, abi::guess_fargs(f, s), st, false)).collect();
+                        let guesses = sites.iter().zip(args).zip(stack).map(|((&s, a), st)| (if st > 0 { 6 } else { a }, abi::guess_fargs(f, s), st, false, matches!(s, Site::Tail(_)))).collect();
                         let passes = sites.iter().map(|&s| abi::passed_through(f, s)).collect();
                         let xmm0_from = sites.iter().map(|&s| abi::passes_xmm0(f, &sites, s)).collect();
                         (sites, targets, guesses, passes, xmm0_from)
@@ -673,8 +674,11 @@ impl Program {
                 for (k, &r) in results[i].1.iter().enumerate() {
                     let (x, a) = (r & abi::READ_XMM0 != 0, r & abi::READ_RAX != 0);
                     match &f.targets[k] {
-                        Target::Indirect if f.guesses[k].3 != (x && !a) => {
+                        // and a 16-byte result (rax:rdx) if they read rdx; a tail
+                        // call passes on whatever the callee returns
+                        Target::Indirect if f.guesses[k].3 != (x && !a) || !f.guesses[k].4 && r & abi::READ_RDX != 0 => {
                             f.guesses[k].3 = x && !a;
+                            f.guesses[k].4 |= r & abi::READ_RDX != 0;
                             changed = true;
                             dirty[i] = true;
                         }
@@ -830,7 +834,7 @@ impl Program {
                         let s = guessed.get(&Target::Func(*j)).copied().unwrap_or(sigs[*j]);
                         (funcs[*j].name.clone(), s)
                     }
-                    Target::Import(n) => (n.clone(), site_sig(&funcs[fi].targets[k], (0, 0, 0, false), &sigs, &guessed)),
+                    Target::Import(n) => (n.clone(), site_sig(&funcs[fi].targets[k], (0, 0, 0, false, false), &sigs, &guessed)),
                     _ => continue,
                 };
                 if extern_of.contains_key(&name) {
@@ -862,7 +866,7 @@ impl Program {
             let e = &self.externs[*self.extern_of.get(name)?];
             // a variadic one's extra arguments: as many as this call sets up
             // (the floats among them go in xmm registers, as `f64`s)
-            let (args, fargs, stack, _) = f.guesses[k];
+            let (args, fargs, stack, _, _) = f.guesses[k];
             let sig = match e.sig.variadic {
                 true => Sig { args: e.sig.args.max(args), fargs: e.sig.fargs.max(fargs), stack_args: e.sig.stack_args.max(stack), ..e.sig },
                 false => e.sig,
@@ -898,9 +902,9 @@ impl Program {
             Target::Import(n) => ext(n),
             // through a pointer: integers and the float arguments the call sets up
             Target::Indirect => {
-                let (args, fargs, _, fret) = f.guesses[k];
+                let (args, fargs, _, fret, pair) = f.guesses[k];
                 let sig = Sig { args, fargs, ..Sig::default() };
-                Some(CallInfo { path: None, ret: true, foreign: true, arg_tys: arg_tys(sig, &[]), ret_ty: fret.then_some(TyId::F64), ..CallInfo::default() })
+                Some(CallInfo { path: None, ret: true, ret2: pair && !fret, foreign: true, arg_tys: arg_tys(sig, &[]), ret_ty: fret.then_some(TyId::F64), ..CallInfo::default() })
             }
         };
         let Some(s) = safe else { return plain };
@@ -1571,13 +1575,13 @@ fn arg_tys(sig: Sig, int: &[Option<TyId>]) -> Vec<Option<TyId>> {
 /// What a call site passes: the callee's signature, with a variadic one's
 /// extra arguments as far as the site sets registers up, and the stack
 /// arguments it stores after all six registers.
-fn site_sig(t: &Target, (args, fargs, stack, fret): (u8, u8, u8, bool), sigs: &[Sig], guessed: &HashMap<Target, Sig>) -> Sig {
+fn site_sig(t: &Target, (args, fargs, stack, fret, pair): (u8, u8, u8, bool, bool), sigs: &[Sig], guessed: &HashMap<Target, Sig>) -> Sig {
     let s = match t {
         Target::Func(j) => guessed.get(t).copied().unwrap_or(sigs[*j]),
         Target::Import(n) => crate::libc::lookup(n).or_else(|| guessed.get(t).copied()).unwrap_or_default(),
         // the stack arguments the call writes (`abi::guess_stack`): a function
         // pointer with seven or more arguments, like liblzma's `coder->code`
-        Target::Indirect => Sig { args, fargs, stack_args: stack, ret: true, fret, ..Sig::default() },
+        Target::Indirect => Sig { args, fargs, stack_args: stack, ret: true, fret, ret2: pair && !fret, ..Sig::default() },
     };
     match (s.variadic, t) {
         // one of the program's own: it takes (and reads its register save area

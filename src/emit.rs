@@ -1854,6 +1854,18 @@ impl Emitter<'_> {
                 let want = |k: usize| info.as_ref().and_then(|c| c.arg_tys.get(k).copied().flatten());
                 let tys: Vec<&str> = (0..args.len()).map(|k| if want(k) == Some(TyId::F64) { "f64" } else { "u64" }).collect();
                 let callee = self.as_u64(callee);
+                // a 16-byte result comes back in rax:rdx
+                if info.as_ref().is_some_and(|c| c.ret2) {
+                    return (
+                        format!(
+                            "unsafe {{ #[repr(C)] struct Pair(u64, u64); let pair_ = core::mem::transmute::<u64, unsafe extern \"C\" fn({}) -> Pair>({callee})({a}); (pair_.0, pair_.1) }}",
+                            tys.join(", ")
+                        ),
+                        true,
+                        true,
+                        self.u64_ty,
+                    );
+                }
                 (
                     format!("unsafe {{ core::mem::transmute::<u64, unsafe extern \"C\" fn({}) -> u64>({callee})({a}) }}", tys.join(", ")),
                     true,

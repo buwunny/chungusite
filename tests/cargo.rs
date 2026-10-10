@@ -373,3 +373,79 @@ fn stack_arguments_through_a_pointer_tail_call() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Shapes from QuickJS: a computed `goto` interpreter, whose jumps through
+/// one label table now share one dispatch, and a 16-byte result returned
+/// through a function pointer and a wrapper that checks its stack canary.
+const GOTO: &str = r#"#include <stdio.h>
+#include <stdlib.h>
+
+/* a computed goto interpreter: every opcode ends in its own jump through
+   the label table */
+__attribute__((noinline)) long run(const unsigned char *code, long acc) {
+    static void *labels[] = {&&op_inc, &&op_dbl, &&op_dec, &&op_neg, &&op_end, &&op_sq};
+#define NEXT goto *labels[*code++]
+    NEXT;
+op_inc: acc++; NEXT;
+op_dbl: acc *= 2; NEXT;
+op_dec: acc--; NEXT;
+op_neg: acc = -acc; NEXT;
+op_sq: acc *= acc; NEXT;
+op_end: return acc;
+}
+
+/* a 16-byte result through a function pointer and a wrapper */
+typedef struct { long v; long tag; } Val;
+__attribute__((noinline)) Val mk(long v, long t) { Val r = {v * 3, t}; return r; }
+typedef Val (*mk_fn)(long, long);
+mk_fn volatile mkp = mk;
+__attribute__((noinline)) Val via_ptr(long v) { return mkp(v, 7); }
+__attribute__((noinline)) Val wrap(const char *s) {
+    char buf[32];
+    snprintf(buf, sizeof buf, "%s", s);
+    Val r = via_ptr(atol(buf));
+    return r;
+}
+
+int main(int argc, char **argv) {
+    unsigned char prog[] = {0, 1, 1, 5, 2, 3, 0, 4};
+    Val v = wrap(argc > 5 ? argv[1] : "14");
+    printf("%ld %ld %ld\n", run(prog, argc + 2), v.v, v.tag);
+    return 0;
+}
+"#;
+
+#[test]
+fn computed_goto_and_pair_results() {
+    if !have("cc") || !have("cargo") {
+        eprintln!("cargo: no C compiler or cargo, skipping");
+        return;
+    }
+    let dir = scratch("goto");
+    std::fs::write(dir.join("goto.c"), GOTO).unwrap();
+    let bin = env!("CARGO_BIN_EXE_chungusite");
+    // (at -O0 the label table isn't found yet: the jump is taken for a tail call)
+    for (opt, name) in [("-O2", "goto2")] {
+        let prog = dir.join(name);
+        assert!(Command::new("cc").args([opt, "-s", "-o"]).arg(&prog).arg(dir.join("goto.c")).status().unwrap().success());
+        let want = run(&mut Command::new(&prog));
+        assert_eq!(want, ("-254 42 7\n".to_string(), 0), "{opt}: the original");
+        let ir = Command::new(bin).arg(&prog).args(["--emit", "ir"]).output().unwrap();
+        let ir = String::from_utf8_lossy(&ir.stdout);
+        assert_eq!(ir.matches("switch").count(), 1, "one dispatch for the label table:\n{ir}");
+        let project = dir.join(format!("p{name}"));
+        let out = Command::new(bin).arg(&prog).arg("--cargo").arg(&project).output().unwrap();
+        assert!(out.status.success(), "chungusite failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        let target = dir.join("target");
+        let build = Command::new("cargo")
+            .args(["build", "--quiet", "--offline", "--manifest-path"])
+            .arg(project.join("Cargo.toml"))
+            .env("CARGO_TARGET_DIR", &target)
+            .output()
+            .unwrap();
+        assert!(build.status.success(), "{opt}: cargo build failed:\n{}", String::from_utf8_lossy(&build.stderr));
+        let got = run(&mut Command::new(target.join("debug").join(name)));
+        assert_eq!(got, want, "{opt}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

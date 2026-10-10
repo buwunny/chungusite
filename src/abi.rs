@@ -855,6 +855,20 @@ pub fn infer(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, prev: 
     // ---- arguments: which entry registers are live ----
     let mut reads = vec![0u8; sites.len()];
     let live = live_values(f, sites, callee, ret && !fret, prev.ret2, fret, &[], &mut reads);
+    // A call whose rdx the function returns as it is, when callers read rdx
+    // after calling the function, has its rdx read too: `JS_Eval` returns what
+    // `JS_EvalThis2` returns after its stack check, a 16-byte `JSValue`. So
+    // a 16-byte result reaches through wrappers, not only through tail calls.
+    if rax && wanted & READ_RDX != 0 {
+        for e in &ex {
+            let Some(v) = exit_value(f, sites, callee, e, RDX) else { continue };
+            if let InstKind::CallOut { call, reg: RDX } = f.insts[v].kind {
+                if let Some(k) = sites.iter().position(|&s| s == Site::Call(call)) {
+                    reads[k] |= READ_RDX;
+                }
+            }
+        }
+    }
     let entry_args = |live: &[bool]| {
         let (mut args, mut fargs) = (0, 0);
         for &p in f.blocks[f.entry].params.get(&f.value_pool) {

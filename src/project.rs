@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! DIR/Cargo.toml
+//! DIR/.cargo/config.toml       the medium code model, only for statics over 1 GB
 //! DIR/src/main.rs              calls `decompiled::main` with argc, argv, envp
 //! DIR/src/decompiled/mod.rs    lint allows, `simd`, and a `pub use` of every module
 //! DIR/src/decompiled/types.rs  recovered structs
@@ -56,7 +57,16 @@ pub struct Project<'a> {
     pub units: Vec<(u64, u64, String)>,
     /// Shared libraries to link besides the ones Rust's std links (`needed`).
     pub libs: Vec<String>,
+    /// Total size of the statics, which decides the code model (`LARGE_DATA`).
+    pub static_bytes: u64,
 }
+
+/// Statics past this many bytes don't fit the default (small) code model,
+/// whose 32-bit offsets reach 2 GB of code and data in all, Rust's own
+/// included. The project then builds with `-C code-model=medium`, as the
+/// original was built with `-mcmodel=medium`: LLVM puts the large statics in
+/// `.lbss`/`.ldata`, past everything else.
+const LARGE_DATA: u64 = 1 << 30;
 
 /// Functions per module when nothing better groups them.
 const CHUNK: usize = 64;
@@ -91,6 +101,13 @@ pub fn write(dir: &Path, p: &Project) -> io::Result<Vec<String>> {
 
     let _ = std::fs::remove_file(src.join(if p.main.is_some() { "lib.rs" } else { "main.rs" }));
     std::fs::write(&toml, cargo_toml(p))?;
+    let config = dir.join(".cargo").join("config.toml");
+    if p.static_bytes > LARGE_DATA {
+        std::fs::create_dir_all(dir.join(".cargo"))?;
+        std::fs::write(&config, format!("{MARKER}: the statics need the medium code model.\n[build]\nrustflags = [\"-C\", \"code-model=medium\"]\n"))?;
+    } else if std::fs::read_to_string(&config).is_ok_and(|c| c.starts_with(MARKER)) {
+        std::fs::remove_file(&config)?;
+    }
     if !dir.join(".gitignore").exists() {
         std::fs::write(dir.join(".gitignore"), "/target\n")?;
     }

@@ -517,6 +517,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             main,
             units: data.as_deref().map_or(Vec::new(), project::units),
             libs: data.as_deref().map_or(Vec::new(), project::needed),
+            static_bytes: statics.iter().map(|i| i.len).sum(),
         };
         let modules = project::write(dir, &project).map_err(|e| format!("{}: {e}", dir.display()))?;
         eprintln!(

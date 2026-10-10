@@ -107,3 +107,65 @@ fn cargo_project_runs_like_the_original() {
     assert!(std::fs::read_to_string(other.join("Cargo.toml")).unwrap().contains("mine"));
     let _ = std::fs::remove_dir_all(Path::new(&dir));
 }
+
+/// `-mcmodel=medium`: arrays over 64 KiB go in `.lbss`/`.ldata`, which the code
+/// reaches as the GOT's address plus a 64-bit offset; one is over 1 GB, so the
+/// project needs the medium code model too. `sum` takes 80 stack arguments.
+const LARGE: &str = r#"#include <stdio.h>
+#include <stdint.h>
+static uint32_t big[40000];
+uint32_t init[20000] = {1, 2, 3, 4, 5};
+static uint8_t huge[1200u << 20];
+uint64_t small = 7;
+#define A8(p) long p##0, long p##1, long p##2, long p##3, long p##4, long p##5, long p##6, long p##7
+#define S8(p) p##0 + p##1 + p##2 + p##3 + p##4 + p##5 + p##6 + p##7
+#define V8(n) n, n + 1, n + 2, n + 3, n + 4, n + 5, n + 6, n + 7
+__attribute__((noinline)) long sum(long a, long b, long c, long d, long e, long f,
+    A8(g), A8(h), A8(i), A8(j), A8(k), A8(l), A8(m), A8(n), A8(o), A8(p)) {
+    return a + b + c + d + e + f + S8(g) + S8(h) + S8(i) + S8(j) + S8(k) + S8(l) + S8(m) + S8(n) + S8(o) + S8(p) * 3;
+}
+__attribute__((noinline)) void fill(int n) { for (int i = 0; i < n; i++) big[i] = i * 3 + init[i % 5]; }
+int main(int argc, char **argv) {
+    fill(40000);
+    huge[sizeof huge - argc] = 9;
+    uint64_t s = small;
+    for (int i = 0; i < 40000; i++) s += big[i];
+    long t = sum(1, 2, 3, 4, 5, 6, V8(10), V8(20), V8(30), V8(40), V8(50), V8(60), V8(70), V8(80), V8(90), V8(100));
+    printf("%lu %u %d %ld\n", (unsigned long)s, init[4], huge[sizeof huge - 1], t);
+    return 0;
+}
+"#;
+
+#[test]
+fn medium_code_model_data() {
+    if !have("cc") || !have("cargo") {
+        eprintln!("cargo: no C compiler or cargo, skipping");
+        return;
+    }
+    let dir = scratch("medium");
+    std::fs::write(dir.join("large.c"), LARGE).unwrap();
+    let bin = env!("CARGO_BIN_EXE_chungusite");
+    for (opt, name) in [("-O0", "large0"), ("-O2", "large2")] {
+        let prog = dir.join(name);
+        let cc = Command::new("cc").args([opt, "-s", "-mcmodel=medium", "-o"]).arg(&prog).arg(dir.join("large.c")).status().unwrap();
+        assert!(cc.success());
+        let want = run(&mut Command::new(&prog));
+        assert_eq!(want, ("2400060007 5 9 4915\n".to_string(), 0), "{opt}: the original");
+
+        let project = dir.join(format!("p{name}"));
+        let out = Command::new(bin).arg(&prog).arg("--cargo").arg(&project).output().unwrap();
+        assert!(out.status.success(), "chungusite failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        assert!(std::fs::read_to_string(project.join(".cargo/config.toml")).unwrap().contains("code-model=medium"));
+        let target = dir.join("target");
+        let build = Command::new("cargo")
+            .args(["build", "--quiet", "--offline", "--manifest-path"])
+            .arg(project.join("Cargo.toml"))
+            .env("CARGO_TARGET_DIR", &target)
+            .output()
+            .unwrap();
+        assert!(build.status.success(), "{opt}: cargo build failed:\n{}", String::from_utf8_lossy(&build.stderr));
+        let got = run(&mut Command::new(target.join("debug").join(name)));
+        assert_eq!(got, want, "{opt}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

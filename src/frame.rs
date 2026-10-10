@@ -318,9 +318,9 @@ pub fn promote(f: &mut Function, stack_args: u8) {
             let at = accesses.iter().filter(|a| a.off == off);
             let size = at.clone().map(|a| a.size).max().unwrap();
             let stores_ok = at.clone().all(|a| !a.store || a.size == size);
-            // (stack arguments are the first 64 words above the return
-            // address, as `hi` below; a slot further up is something else)
-            let in_args = (8..8 + 8 * 64).contains(&off);
+            // (stack arguments are the first `MAX_STACK_ARGS` words above the
+            // return address, as `hi` below; a slot further up is something else)
+            let in_args = (8..8 + 8 * crate::abi::MAX_STACK_ARGS).contains(&off);
             let ok = stores_ok
                 && !tainted(off, off + size)
                 && (off + size <= 0 || (in_args && off % 8 == 0 && size <= 8));
@@ -395,7 +395,7 @@ pub fn promote(f: &mut Function, stack_args: u8) {
         if let Some(t) = pos_taken {
             hi = hi.max(t + 8).max(8 + 8 * stack_args as i64);
         }
-        (lo, hi.min(8 + 8 * 64))
+        (lo, hi.min(8 + 8 * crate::abi::MAX_STACK_ARGS))
     };
     let t = (-lo).max(8);
     let top = (t - 8 + 15) / 16 * 16 + 8;

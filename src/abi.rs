@@ -315,18 +315,18 @@ pub fn guess_stack(f: &Function, sites: &[Site], args: &[u8]) -> Vec<u8> {
         let rsp = a.origin[list[6].index()];
         let (Off::Known(base), true) = (rsp.off, rsp.roots != 0) else { continue };
         let Some(blk) = f.blocks.iter().map(|(_, b)| b.insts.get(&f.value_pool)).find(|i| i.contains(&id)) else { continue };
-        let mut written = 0u64;
+        let mut written = [false; MAX_STACK_ARGS as usize];
         for &i in blk.iter().take_while(|&&i| i != id) {
             if let InstKind::Store { ptr, .. } = f.insts[i].kind {
                 let o = a.origin[ptr.index()];
                 if let (Off::Known(off), true) = (o.off, o.roots == rsp.roots) {
-                    if (0..8 * 64).contains(&(off - base)) {
-                        written |= 1 << ((off - base) / 8);
+                    if (0..8 * MAX_STACK_ARGS).contains(&(off - base)) {
+                        written[((off - base) / 8) as usize] = true;
                     }
                 }
             }
         }
-        out[k] = written.trailing_ones() as u8;
+        out[k] = written.iter().take_while(|&&w| w).count() as u8;
     }
     out
 }
@@ -1105,6 +1105,10 @@ fn live_values(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, ret:
     live
 }
 
+/// The most stack arguments a function or call is taken to have (generated
+/// programs pass over 80 arrays); 6 register ones more still fit `Sig`'s `u8`s.
+pub const MAX_STACK_ARGS: i64 = 192;
+
 /// Stack arguments read: 8-byte words at entry-rsp offsets 8, 16, ... They don't
 /// depend on the callees, so `infer` leaves `Sig::stack_args` to this.
 pub fn stack_args(f: &Function) -> u8 {
@@ -1122,7 +1126,7 @@ pub fn stack_args(f: &Function) -> u8 {
             let o = a.origin[ptr.index()];
             if o.roots == 1u128 << k {
                 if let Off::Known(off) = o.off {
-                    if (8..8 + 8 * 64).contains(&off) {
+                    if (8..8 + 8 * MAX_STACK_ARGS).contains(&off) {
                         end = end.max(off + size as i64);
                     }
                 }

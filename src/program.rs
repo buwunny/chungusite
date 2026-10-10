@@ -285,6 +285,25 @@ impl Program {
         let syms = file.map(Symbols::parse).unwrap_or_default();
         let loaded = file.map(loaded_sections).unwrap_or_default();
         let sections: Vec<(u64, &[u8])> = loaded.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+        // GOT-relative data (`opt::fold_got_offsets`): the GOT's extent, and the
+        // allocated sections a GOT-relative address may land in.
+        let alloc: Vec<(u64, u64, String)> = file
+            .and_then(|d| object::File::parse(d).ok())
+            .filter(|o| o.kind() != ObjectKind::Relocatable)
+            .map(|o| {
+                o.sections()
+                    .filter(|s| s.address() != 0 && s.size() != 0)
+                    .filter(|s| matches!(s.kind(), SectionKind::Data | SectionKind::UninitializedData | SectionKind::ReadOnlyData | SectionKind::ReadOnlyString))
+                    .map(|s| (s.address(), s.address() + s.size(), s.name().unwrap_or("").to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let got = alloc
+            .iter()
+            .filter(|s| matches!(s.2.as_str(), ".got" | ".got.plt"))
+            .map(|s| (s.0, s.1))
+            .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)));
+        let lands = |a: u64| alloc.iter().any(|s| s.0 <= a && a < s.1 && !matches!(s.2.as_str(), ".got" | ".got.plt"));
         let thread_pointer = file.and_then(|d| crate::load::tls(&object::File::parse(d).ok()?)).map(|t| t.thread_pointer);
         let by_addr: HashMap<u64, usize> = inputs.iter().enumerate().map(|(i, x)| (x.addr, i)).rev().collect();
         let mut by_name: HashMap<String, usize> = HashMap::new();
@@ -710,7 +729,9 @@ impl Program {
             let (made, copied) = split_returns(ir);
             // one entry per loop, so the loop's own edges skip the `match bb`
             let entries = crate::dispatch::single_entry(ir);
-            if made + entries > 0 {
+            // (after `apply`, which gives the GOT's address back to a register a call keeps)
+            let folded = got.map_or(0, |g| crate::opt::fold_got_offsets(ir, g, &lands));
+            if made + entries + folded > 0 {
                 clean(ir);
             }
             merge_straight(ir);

@@ -188,6 +188,23 @@ fn shifts_divides_and_sign_extension() {
 }
 
 #[test]
+fn narrow_sign_extensions_and_prefetch() {
+    // gcc -O0 widens a signed char with cbw and a short dividend with cwd
+    let out = ir(|a| {
+        a.mov(eax, edi).unwrap();
+        a.prefetcht0(byte_ptr(rsi)).unwrap(); // a hint: nothing to lift
+        a.cbw().unwrap(); // ax = sext(al)
+        a.cwd().unwrap(); // dx = the sign of ax
+        a.idiv(cx).unwrap();
+        a.ret().unwrap();
+    });
+    assert!(out.contains("SExt"), "{out}");
+    assert!(out.contains("AShr") && out.contains("const 0xf"), "{out}");
+    assert!(out.contains("SDiv") && out.contains("SRem"), "{out}");
+    assert!(!out.contains("Load"), "prefetch reads nothing:\n{out}");
+}
+
+#[test]
 fn byte_register_write_reads_back_without_a_mask() {
     let out = ir(|a| {
         a.mov(al, 1).unwrap();

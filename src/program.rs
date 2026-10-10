@@ -1267,8 +1267,14 @@ impl Program {
         if !stubs.is_empty() {
             s.push_str("\n    // Functions of the binary that aren't in the output.\n");
         }
+        // a function that didn't lift panics with the reason, as its own stub does
+        let failed: HashMap<&str, &str> =
+            self.funcs.iter().filter_map(|f| Some((f.name.as_str(), f.ir.as_ref().err()?.as_str()))).collect();
         for e in stubs {
-            let why = format!("{} isn't decompiled", e.name);
+            let why = match failed.get(e.name.as_str()) {
+                Some(err) => format!("not lifted: {err}"),
+                None => format!("{} isn't decompiled", e.name),
+            };
             let _ = writeln!(s, "    pub unsafe {} {{\n        todo!({why:?})\n    }}", decl(e));
         }
         p

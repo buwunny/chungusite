@@ -2069,7 +2069,8 @@ impl Emitter<'_> {
                 let InstKind::Cast { kind: inner, v: w } = self.f.insts[v].kind else { break };
                 let redundant = match inner {
                     CastKind::ZExt => true,
-                    CastKind::Trunc => trunc,
+                    // `x as u8 as u32 as u16` keeps only 8 bits
+                    CastKind::Trunc => trunc && bytes(self.ty(v)) >= bytes(ty),
                     // only the source's own bits survive
                     CastKind::SExt => trunc && bytes(ty) <= bytes(self.ty(w)),
                     _ => false,

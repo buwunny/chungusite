@@ -472,3 +472,18 @@ fn sm_arity(src: &str, p: usize) -> usize {
     let params = &src[start..start + src[start..].find(')').unwrap()];
     if params.trim().is_empty() { 0 } else { params.split(", ").count() }
 }
+
+/// A byte truncation between widenings survives: `(u16)(u8)x` stored as a
+/// word (gcc -O0's `movzx ecx, cl; mov [rsi], cx`) is not `x as u16`.
+#[test]
+fn narrow_truncation_inside_wider_casts() {
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.movzx(eax, di).unwrap();
+    a.mov(ecx, eax).unwrap();
+    a.movzx(ecx, cl).unwrap();
+    a.mov(word_ptr(rsi), cx).unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(common::BASE).unwrap();
+    let fast = emit(&code, "f", Mode::Fast);
+    assert!(fast.contains("as u8"), "{fast}");
+}

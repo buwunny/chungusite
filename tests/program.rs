@@ -794,3 +794,34 @@ fn an_argument_stored_where_the_caller_cant_follow_takes_no_slice() {
     assert_eq!(src.class, chungusite::borrow::Class::Raw, "{:?}", src);
     assert_ne!(raw_frame(&p, 1), []);
 }
+
+#[test]
+fn stack_arguments_pushed_on_each_path_to_a_shared_call() {
+    // gcc shares one call between paths that each push their own seventh
+    // argument (pcre2grep's "line too long" fprintf):
+    //   test edx, edx ; je b ; push 111 ; jmp call ; b: push 222
+    //   call: mov rax, rdi ; (rdi..r9 set) ; call rax ; add rsp, 8 ; ret
+    let (p, _) = program(&[("shared", &|a| {
+        let mut b = a.create_label();
+        let mut call = a.create_label();
+        a.test(edx, edx).unwrap();
+        a.je(b).unwrap();
+        a.push(111).unwrap();
+        a.jmp(call).unwrap();
+        a.set_label(&mut b).unwrap();
+        a.push(222).unwrap();
+        a.set_label(&mut call).unwrap();
+        a.mov(rax, rdi).unwrap();
+        a.mov(rdi, rsi).unwrap();
+        a.mov(esi, 1).unwrap();
+        a.mov(edx, 2).unwrap();
+        a.mov(ecx, 3).unwrap();
+        a.mov(r8d, 4).unwrap();
+        a.mov(r9d, 5).unwrap();
+        a.call(rax).unwrap();
+        a.add(rsp, 8).unwrap();
+        a.ret().unwrap();
+    })]);
+    let out = emitted(&p, Mode::Fast).join("\n");
+    assert!(out.contains("fn(u64, u64, u64, u64, u64, u64, u64)"), "the seventh argument is passed:\n{out}");
+}

@@ -265,6 +265,14 @@ pub struct Lifter {
     /// Keep an instruction the lifter has no model of as inline assembly
     /// (`InstKind::Opaque`) instead of failing the function (`lift/asm.rs`).
     pub asm: bool,
+    /// Every function's start (`program.rs` sets this). A jump out of the
+    /// function to anywhere else lands in the middle of another function: a
+    /// `.cold` part jumping back to its function's return (`epilogues`).
+    pub entries: std::sync::Arc<std::collections::HashSet<u64>>,
+    /// Pass 1: the code at each jump target out of the function that isn't a
+    /// function's start, when it is a few plain instructions ending in `ret`
+    /// (`mov eax, esi ; ret`), lifted in place of a tail call.
+    epilogues: Vec<(u64, Vec<Instruction>)>,
     /// Instructions the lifter models, but not in the form found at these
     /// addresses: kept as inline assembly on the next try.
     forced: Vec<u64>,
@@ -316,6 +324,8 @@ impl Lifter {
             track_exits: false,
             thread_pointer: None,
             asm: false,
+            entries: Default::default(),
+            epilogues: Vec::new(),
             forced: Vec::new(),
             asm_args: Vec::new(),
             asm_vals: Vec::new(),
@@ -514,6 +524,7 @@ impl Lifter {
         self.case_stubs.clear();
         self.probes.clear();
         self.spill_skips.clear();
+        self.epilogues.clear();
         self.xmm = false;
         self.ymm = false;
         self.x87 = false;
@@ -574,6 +585,12 @@ impl Lifter {
                         self.leaders.push(t);
                     } else if self.insn.flow_control() == FlowControl::ConditionalBranch {
                         self.stubs.push(self.ip);
+                    }
+                    if !in_range(t) && !self.epilogues.iter().any(|e| e.0 == t) {
+                        if let Some(e) = self.epilogue(data, t) {
+                            self.xmm |= e.iter().any(|i| (0..i.op_count()).any(|k| i.op_kind(k) == OpKind::Register && i.op_register(k).is_vector_register()));
+                            self.epilogues.push((t, e));
+                        }
                     }
                     if in_range(next) && self.walked(next) { self.leaders.push(next); }
                 }
@@ -1008,13 +1025,50 @@ impl Lifter {
     /// The terminator for the jump `i` out of the function: a tail call, or,
     /// to code that never returns (a `.cold` part that calls `abort`), a call
     /// that doesn't return, so the path is evidence of no result.
-    fn jump_out(&mut self, f: &mut Function, i: &Instruction, noreturn: &dyn Fn(u64, Option<u64>) -> bool) -> Result<Terminator, LiftError> {
+    /// None when the block already ended: the target's few instructions, up to
+    /// its `ret`, were lifted here (`epilogues`).
+    fn jump_out(&mut self, f: &mut Function, i: &Instruction, noreturn: &dyn Fn(u64, Option<u64>) -> bool) -> Result<Option<Terminator>, LiftError> {
         let target = i.near_branch_target();
         if noreturn(self.ip, Some(target)) {
             self.call(f, i)?;
-            return Ok(Terminator::Unreachable);
+            return Ok(Some(Terminator::Unreachable));
         }
-        Ok(self.tail_call(f, target))
+        if let Some(k) = self.epilogues.iter().position(|e| e.0 == target) {
+            for n in 0..self.epilogues[k].1.len() {
+                self.insn = self.epilogues[k].1[n];
+                self.ip = self.insn.ip();
+                if self.lift_insn(f, noreturn)? {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(self.tail_call(f, target)))
+    }
+
+    /// The instructions at `t`, outside the function and not another
+    /// function's start, if they are at most a few that only move registers
+    /// or pop, then `ret`.
+    fn epilogue(&self, data: &[(u64, &[u8])], t: u64) -> Option<Vec<Instruction>> {
+        if self.entries.is_empty() || self.entries.contains(&t) {
+            return None;
+        }
+        let bytes = (1..=64).rev().find_map(|n| read(data, t, n))?;
+        let mut dec = Decoder::with_ip(64, bytes, t, DecoderOptions::NONE);
+        let mut out = Vec::new();
+        while dec.can_decode() && out.len() < 8 {
+            let i = dec.decode();
+            if i.is_invalid() || !handled(&i) {
+                return None;
+            }
+            out.push(i);
+            match i.flow_control() {
+                FlowControl::Return => return Some(out),
+                FlowControl::Next if matches!(i.mnemonic(), Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsxd | Mnemonic::Xor | Mnemonic::Pop | Mnemonic::Add | Mnemonic::Lea)
+                    && (0..i.op_count()).all(|k| i.op_kind(k) != OpKind::Memory) => {}
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// The address block `b` starts at; a stub's is its branch's.
@@ -1098,8 +1152,9 @@ impl Lifter {
                     self.nstub += 1;
                     self.end_block(f, Terminator::Branch { c, t: BlockId::new(stub), f: e, args: ListRef::EMPTY });
                     self.begin_block(stub, f);
-                    let term = self.jump_out(f, &i, noreturn)?;
-                    self.end_block(f, term);
+                    if let Some(term) = self.jump_out(f, &i, noreturn)? {
+                        self.end_block(f, term);
+                    }
                     return Ok(true);
                 };
                 self.end_block(f, Terminator::Branch { c, t, f: e, args: ListRef::EMPTY });
@@ -1109,7 +1164,10 @@ impl Lifter {
                 let term = match self.block_at(i.near_branch_target()) {
                     Some(to) => Terminator::Jump { to, args: ListRef::EMPTY },
                     // Jump out of this function: a tail call.
-                    None => self.jump_out(f, &i, noreturn)?,
+                    None => match self.jump_out(f, &i, noreturn)? {
+                        Some(term) => term,
+                        None => return Ok(true),
+                    },
                 };
                 self.end_block(f, term);
                 Ok(true)

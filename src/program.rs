@@ -332,6 +332,7 @@ impl Program {
             (true, Some(d)) => crate::dwarf::read(d, &mut tys, &|a| addrs.contains(&a)),
             _ => None,
         };
+        let entries = std::sync::Arc::new(addrs.clone());
         let lift = || -> Vec<(Result<Function, String>, Option<String>)> {
             inputs
                 .par_iter()
@@ -341,6 +342,7 @@ impl Program {
                         l.track_exits = true;
                         l.thread_pointer = thread_pointer;
                         l.asm = opts.asm;
+                        l.entries = entries.clone();
                         l
                     },
                     |lifter, x| {
@@ -539,6 +541,17 @@ impl Program {
             }
             if !changed {
                 break;
+            }
+        }
+        // A tail call through a pointer passes on the caller's stack arguments
+        // too, where the caller found them (liblzma's `alone_decode` ends in
+        // `return coder->next.code(...)` with nine arguments).
+        for (i, f) in funcs.iter_mut().enumerate() {
+            for (k, s) in f.sites.iter().enumerate() {
+                if matches!(s, Site::Tail(_)) && f.targets[k] == Target::Indirect && stack_args[i] > 0 {
+                    let g = &mut f.guesses[k];
+                    (g.0, g.2) = (6, g.2.max(stack_args[i]));
+                }
             }
         }
 

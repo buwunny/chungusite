@@ -302,3 +302,74 @@ fn struct_arguments_and_registers_kept_across_a_helper() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Shapes from xz and pcre2 at -O2: liblzma's `alone_decode` ends in a tail
+/// call through a pointer that passes its own stack arguments on, and one
+/// `fprintf` shared by paths that push different stack arguments.
+const TAIL: &str = r#"#include <stdio.h>
+#include <stdlib.h>
+
+/* a pointer tail call passing the caller's own stack arguments on */
+typedef long (*code_fn)(void *, long, long, long, long, long, long *, long, int);
+struct next { void *coder; code_fn code; };
+__attribute__((noinline)) long inner(void *c, long a, long b, long d, long e, long f, long *pos, long size, int action) {
+    *pos += size;
+    return a + b + d + e + f + size * 10 + action * 100 + (c != 0);
+}
+__attribute__((noinline)) long outer(struct next *n, long a, long b, long d, long e, long f, long *pos, long size, int action) {
+    if (n->coder == 0)
+        return -1;
+    return n->code(n->coder, a, b, d, e, f, pos, size, action);
+}
+
+/* two paths pushing different stack arguments to one shared fprintf */
+__attribute__((noinline)) void report(FILE *out, unsigned long line, const char *a, const char *b, size_t max, int which) {
+    if (which)
+        fprintf(out, "line %lu%s%s too long; max %zu (%d)\n", line, a, b, max, which);
+    else
+        fprintf(out, "line %lu%s%s too long; max %zu\n", line, b, a, max);
+}
+
+struct next volatile_next;
+int main(int argc, char **argv) {
+    long pos = 5;
+    volatile_next.coder = argv;
+    volatile_next.code = inner;
+    long r = outer(&volatile_next, 1, 2, 3, 4, argc, &pos, 7, 2);
+    printf("%ld %ld\n", r, pos);
+    report(stdout, 4, " of ", "x", 100 + argc, argc);
+    report(stdout, 9, "y", " in ", 200 + argc, 0);
+    return 0;
+}
+"#;
+
+#[test]
+fn stack_arguments_through_a_pointer_tail_call() {
+    if !have("cc") || !have("cargo") {
+        eprintln!("cargo: no C compiler or cargo, skipping");
+        return;
+    }
+    let dir = scratch("tail");
+    std::fs::write(dir.join("tail.c"), TAIL).unwrap();
+    let bin = env!("CARGO_BIN_EXE_chungusite");
+    for (opt, name) in [("-O0", "tail0"), ("-O2", "tail2")] {
+        let prog = dir.join(name);
+        assert!(Command::new("cc").args([opt, "-s", "-o"]).arg(&prog).arg(dir.join("tail.c")).status().unwrap().success());
+        let want = run(&mut Command::new(&prog));
+        assert_eq!(want.0.lines().next(), Some("282 12"), "{opt}: the original");
+        let project = dir.join(format!("p{name}"));
+        let out = Command::new(bin).arg(&prog).arg("--cargo").arg(&project).output().unwrap();
+        assert!(out.status.success(), "chungusite failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        let target = dir.join("target");
+        let build = Command::new("cargo")
+            .args(["build", "--quiet", "--offline", "--manifest-path"])
+            .arg(project.join("Cargo.toml"))
+            .env("CARGO_TARGET_DIR", &target)
+            .output()
+            .unwrap();
+        assert!(build.status.success(), "{opt}: cargo build failed:\n{}", String::from_utf8_lossy(&build.stderr));
+        let got = run(&mut Command::new(target.join("debug").join(name)));
+        assert_eq!(got, want, "{opt}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -335,21 +335,37 @@ pub fn guess_stack(f: &Function, sites: &[Site], args: &[u8]) -> Vec<u8> {
         }
         let rsp = a.origin[list[6].index()];
         let (Off::Known(base), true) = (rsp.off, rsp.roots != 0) else { continue };
-        let Some(blk) = f.blocks.iter().map(|(_, b)| b.insts.get(&f.value_pool)).find(|i| i.contains(&id)) else { continue };
-        let mut written = [false; MAX_STACK_ARGS as usize];
-        for &i in blk.iter().take_while(|&&i| i != id) {
-            if let InstKind::Store { ptr, val, .. } = f.insts[i].kind {
-                // not the prologue saving a callee-saved register (`push rbx`
-                // right before a call in the entry block; rbx, rbp, r12-r15)
-                if [3u8, 5, 12, 13, 14, 15].into_iter().any(|r| from_entry(f, val, r, &mut Vec::new())) {
-                    continue;
-                }
-                let o = a.origin[ptr.index()];
-                if let (Off::Known(off), true) = (o.off, o.roots == rsp.roots) {
-                    if (0..8 * MAX_STACK_ARGS).contains(&(off - base)) {
-                        written[((off - base) / 8) as usize] = true;
+        let Some((b, blk)) = f.blocks.iter().map(|(b, blk)| (b, blk.insts.get(&f.value_pool))).find(|(_, i)| i.contains(&id)) else { continue };
+        let words = |insts: &[ValueId], written: &mut [bool; MAX_STACK_ARGS as usize]| {
+            for &i in insts {
+                if let InstKind::Store { ptr, val, .. } = f.insts[i].kind {
+                    // not the prologue saving a callee-saved register (`push rbx`
+                    // right before a call in the entry block; rbx, rbp, r12-r15)
+                    if [3u8, 5, 12, 13, 14, 15].into_iter().any(|r| from_entry(f, val, r, &mut Vec::new())) {
+                        continue;
+                    }
+                    let o = a.origin[ptr.index()];
+                    if let (Off::Known(off), true) = (o.off, o.roots == rsp.roots) {
+                        if (0..8 * MAX_STACK_ARGS).contains(&(off - base)) {
+                            written[((off - base) / 8) as usize] = true;
+                        }
                     }
                 }
+            }
+        };
+        let mut written = [false; MAX_STACK_ARGS as usize];
+        words(&blk[..blk.iter().position(|&i| i == id).unwrap()], &mut written);
+        // and what every block jumping to it stored (gcc shares one `call
+        // fprintf` between paths that each push their own arguments)
+        let mut joined: Option<[bool; MAX_STACK_ARGS as usize]> = None;
+        for (_, p) in f.blocks.iter().filter(|(_, p)| p.term.successors(&f.value_pool).any(|s| s == b)) {
+            let mut w = [false; MAX_STACK_ARGS as usize];
+            words(p.insts.get(&f.value_pool), &mut w);
+            joined = Some(joined.map_or(w, |j| std::array::from_fn(|n| j[n] && w[n])));
+        }
+        if b != f.entry {
+            for (w, j) in written.iter_mut().zip(joined.unwrap_or([false; MAX_STACK_ARGS as usize])) {
+                *w |= j;
             }
         }
         out[k] = written.iter().take_while(|&&w| w).count() as u8;

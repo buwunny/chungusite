@@ -364,6 +364,30 @@ fn relative_jump_table_with_a_store_before_the_jump() {
 }
 
 #[test]
+fn a_jump_back_into_another_function_lifts_its_return() {
+    // pcre2's `pcre2_pattern_info_8.cold`: `mov esi, -34 ; jmp <return>`, where
+    // the return in the middle of pcre2_pattern_info_8 is `mov eax, esi ; ret`
+    const PARENT: u64 = 0x2000;
+    let parent: [u8; 8] = [0x90, 0x90, 0x90, 0x90, 0x89, 0xf0, 0xc3, 0xcc]; // nop x4 ; mov eax, esi ; ret
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.mov(esi, -34).unwrap();
+    a.jmp(PARENT + 4).unwrap();
+    let code = a.assemble(common::BASE).unwrap();
+    let mut l = Lifter::new();
+    l.entries = std::sync::Arc::new([common::BASE, PARENT].into_iter().collect());
+    let mut f = Function::with_capacity(64, 8);
+    l.lift_with_data(&code, common::BASE, &[(common::BASE, &code), (PARENT, &parent)], &mut f).unwrap();
+    verify(&f).unwrap();
+    let out = dump(&f);
+    assert!(out.contains("ret") && !out.contains("tailcall"), "{out}");
+
+    // a jump to a function's start stays a tail call
+    l.entries = std::sync::Arc::new([common::BASE, PARENT + 4].into_iter().collect());
+    l.lift_with_data(&code, common::BASE, &[(common::BASE, &code), (PARENT, &parent)], &mut f).unwrap();
+    assert!(dump(&f).contains("tailcall"), "{}", dump(&f));
+}
+
+#[test]
 fn indirect_jump_without_a_table_is_a_tail_call() {
     let out = ir(|a| {
         a.mov(rax, qword_ptr(rdi + 0x18)).unwrap();

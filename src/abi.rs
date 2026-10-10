@@ -299,17 +299,25 @@ fn set_before(f: &Function, a: ValueId, reg: Option<u8>, seen: &mut Vec<ValueId>
 
 /// How many 8-byte stack arguments each call that sets up all six argument
 /// registers stores just before it, at `[rsp]`, `[rsp+8]`, ... in its own
-/// block: the seventh and later arguments of a variadic call (`printf`).
+/// block: the seventh and later arguments of a variadic call (`printf`), or of
+/// a function pointer. Registers the function passes on from its own entry
+/// count as set up (`passed_through`): liblzma's `block_encode` forwards
+/// `out` and `out_pos` in r8 and r9 and pushes the rest.
 pub fn guess_stack(f: &Function, sites: &[Site], args: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; sites.len()];
-    if !args.contains(&6) {
+    let six = |k: usize, site: Site| {
+        let list = site.parts(f).1.get(&f.value_pool);
+        list.len() == CALL_ARGS
+            && (args[k] as usize..6).all(|r| from_entry(f, list[r], CALL_REGS[r].number() as u8, &mut Vec::new()))
+    };
+    if !sites.iter().enumerate().any(|(k, &s)| six(k, s)) {
         return out;
     }
     let a = analyze(f);
     for (k, &site) in sites.iter().enumerate() {
         let Site::Call(id) = site else { continue };
         let list = site.parts(f).1.get(&f.value_pool);
-        if args[k] < 6 || list.len() != CALL_ARGS {
+        if !six(k, site) {
             continue;
         }
         let rsp = a.origin[list[6].index()];
@@ -317,7 +325,12 @@ pub fn guess_stack(f: &Function, sites: &[Site], args: &[u8]) -> Vec<u8> {
         let Some(blk) = f.blocks.iter().map(|(_, b)| b.insts.get(&f.value_pool)).find(|i| i.contains(&id)) else { continue };
         let mut written = [false; MAX_STACK_ARGS as usize];
         for &i in blk.iter().take_while(|&&i| i != id) {
-            if let InstKind::Store { ptr, .. } = f.insts[i].kind {
+            if let InstKind::Store { ptr, val, .. } = f.insts[i].kind {
+                // not the prologue saving a callee-saved register (`push rbx`
+                // right before a call in the entry block; rbx, rbp, r12-r15)
+                if [3u8, 5, 12, 13, 14, 15].into_iter().any(|r| from_entry(f, val, r, &mut Vec::new())) {
+                    continue;
+                }
                 let o = a.origin[ptr.index()];
                 if let (Off::Known(off), true) = (o.off, o.roots == rsp.roots) {
                     if (0..8 * MAX_STACK_ARGS).contains(&(off - base)) {

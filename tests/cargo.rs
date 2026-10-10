@@ -169,3 +169,60 @@ fn medium_code_model_data() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A constructor picks the function a pointer calls (xz picks its CRCs so),
+/// and the call through it passes three stack arguments, two of the registers
+/// forwarded from the caller's own entry; the callee never reads r9.
+const CTOR: &str = r#"#include <stdio.h>
+typedef long (*fn9)(void *, long, long, long *, long, long *, long *, long, int);
+struct coder { void *c; fn9 code; };
+__attribute__((noinline)) long impl(void *c, long a, long b, long *p, long d, long *o, long *op, long os, int act) {
+    *op += os + act + a + b + d;
+    return *p + (long)c;
+}
+static struct coder co;
+__attribute__((constructor)) static void pick(void) { co.c = (void *)3; co.code = impl; }
+__attribute__((noinline)) long block(struct coder *k, long a, long b, long *p, long d, long *o, long *op, long os, int act) {
+    long r = k->code(k->c, a, b, p, d, o, op, os, act);
+    return r + *op;
+}
+int main(int argc, char **argv) {
+    long p = 5, o = 0, op = 1;
+    long r = block(&co, argc, 2, &p, 4, &o, &op, 100, argc + 6);
+    printf("%ld %ld\n", r, op);
+    return 0;
+}
+"#;
+
+#[test]
+fn constructors_and_stack_arguments_through_a_pointer() {
+    if !have("cc") || !have("cargo") {
+        eprintln!("cargo: no C compiler or cargo, skipping");
+        return;
+    }
+    let dir = scratch("ctor");
+    std::fs::write(dir.join("ctor.c"), CTOR).unwrap();
+    let bin = env!("CARGO_BIN_EXE_chungusite");
+    for (opt, name) in [("-O0", "ctor0"), ("-O2", "ctor2")] {
+        let prog = dir.join(name);
+        assert!(Command::new("cc").args([opt, "-s", "-o"]).arg(&prog).arg(dir.join("ctor.c")).status().unwrap().success());
+        let want = run(&mut Command::new(&prog));
+        assert_eq!(want, ("123 115\n".to_string(), 0), "{opt}: the original");
+        for mode in ["fast", "safe"] {
+            let project = dir.join(format!("p{name}{mode}"));
+            let out = Command::new(bin).arg(&prog).args(["--mode", mode, "--cargo"]).arg(&project).output().unwrap();
+            assert!(out.status.success(), "chungusite failed:\n{}", String::from_utf8_lossy(&out.stderr));
+            let target = dir.join("target");
+            let build = Command::new("cargo")
+                .args(["build", "--quiet", "--offline", "--manifest-path"])
+                .arg(project.join("Cargo.toml"))
+                .env("CARGO_TARGET_DIR", &target)
+                .output()
+                .unwrap();
+            assert!(build.status.success(), "{opt} {mode}: cargo build failed:\n{}", String::from_utf8_lossy(&build.stderr));
+            let got = run(&mut Command::new(target.join("debug").join(name)));
+            assert_eq!(got, want, "{opt} {mode}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -530,6 +530,9 @@ pub enum LaneOp {
     /// the left operand in eax and the right in ecx, and of `xgetbv` with the
     /// left operand in ecx. The CPU's answer, so nothing folds them.
     Cpuid, Xgetbv,
+    /// Not lanes: the carry-less product of the two operands (`pclmulqdq`),
+    /// its low 64 bits for `w` = 0 and its high 64 bits for 1.
+    ClMul,
     /// Not lanes either: x87. An 80-bit float (the left operand the significand,
     /// the right the sign and exponent) to an f64 bit pattern; and an f64 to a
     /// signed `w`-byte integer, rounded as the x87 control word in the right

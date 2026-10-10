@@ -418,7 +418,8 @@ impl Program {
                         let targets = sites.iter().map(|&s| resolve(f, s)).collect();
                         let args: Vec<u8> = sites.iter().map(|&s| abi::guess_args(f, s)).collect();
                         let stack = abi::guess_stack(f, &sites, &args);
-                        let guesses = sites.iter().zip(args).zip(stack).map(|((&s, a), st)| (a, abi::guess_fargs(f, s), st, false)).collect();
+                        // (stack arguments come after all six registers, set up or passed on)
+                        let guesses = sites.iter().zip(args).zip(stack).map(|((&s, a), st)| (if st > 0 { 6 } else { a }, abi::guess_fargs(f, s), st, false)).collect();
                         let passes = sites.iter().map(|&s| abi::passed_through(f, s)).collect();
                         let xmm0_from = sites.iter().map(|&s| abi::passes_xmm0(f, &sites, s)).collect();
                         (sites, targets, guesses, passes, xmm0_from)
@@ -599,7 +600,9 @@ impl Program {
                                     _ => site_sig(&f.targets[k], f.guesses[k], &sigs, &guessed),
                                 };
                                 let r = abi::infer(f.ir.as_ref().unwrap(), &f.sites, &callee, sigs[i], wanted_by[i], set_args[i]);
-                                (i, Sig { stack_args: stack_args[i], variadic: r.sig.variadic || va[i], ..r.sig }, r.reads)
+                                // stack arguments come after all six registers, read or not
+                                let args = if stack_args[i] > 0 { 6 } else { r.sig.args };
+                                (i, Sig { args, stack_args: stack_args[i], variadic: r.sig.variadic || va[i], ..r.sig }, r.reads)
                             })
                             .collect();
                         let kept: Vec<(u16, u32, bool)> = own
@@ -1549,7 +1552,9 @@ fn site_sig(t: &Target, (args, fargs, stack, fret): (u8, u8, u8, bool), sigs: &[
     let s = match t {
         Target::Func(j) => guessed.get(t).copied().unwrap_or(sigs[*j]),
         Target::Import(n) => crate::libc::lookup(n).or_else(|| guessed.get(t).copied()).unwrap_or_default(),
-        Target::Indirect => Sig { args, fargs, ret: true, fret, ..Sig::default() },
+        // the stack arguments the call writes (`abi::guess_stack`): a function
+        // pointer with seven or more arguments, like liblzma's `coder->code`
+        Target::Indirect => Sig { args, fargs, stack_args: stack, ret: true, fret, ..Sig::default() },
     };
     match (s.variadic, t) {
         // one of the program's own: it takes (and reads its register save area

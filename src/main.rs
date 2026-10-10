@@ -324,6 +324,20 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     if let Some(k) = main_at {
         address_taken.push(funcs[k].addr);
     }
+    // and its constructors (xz picks its CRC functions in one), which the
+    // generated `fn main` calls first; the C runtime's own are left out
+    let ctors_at: Vec<usize> = match (&cli.cargo, bin) {
+        (Some(_), Some(b)) => b
+            .constructors()
+            .into_iter()
+            .filter_map(|a| funcs.iter().position(|f| f.addr == a))
+            .filter(|&k| !project::is_crt(&funcs[k].name))
+            .collect(),
+        _ => Vec::new(),
+    };
+    for &k in &ctors_at {
+        address_taken.push(funcs[k].addr);
+    }
     let opts = Options { global_of: &global_of, global_end: &global_end, global_before: &global_before, global_slice: &global_slice, fast: &[], address_taken: &address_taken };
     let mut emitted = if rust { program.emit_all_with(mode, &opts) } else { Vec::new() };
     let analyses = if cli.emit == Emit::Borrows { program.analyses(&opts) } else { Vec::new() };
@@ -507,6 +521,18 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             }
         });
         let main = main.filter(|_| !(cli.skip_failed && main_at.is_some_and(|k| program.funcs[index[k]].ir.is_err())));
+        // a constructor that didn't lift isn't called: its stub takes no arguments
+        let pointer_idents = if mode == Mode::Safe { program.pointer_idents(&Options { fast: &fast, ..opts }) } else { Vec::new() };
+        let ctors = ctors_at
+            .iter()
+            .map(|&k| &program.funcs[index[k]])
+            .zip(ctors_at.iter().map(|&k| index[k]))
+            .filter(|(pf, _)| pf.ir.is_ok())
+            .map(|(pf, i)| {
+                let ident = if mode == Mode::Safe { pointer_idents[i].clone() } else { pf.ident.clone() };
+                Main { ident, args: (pf.sig.args + pf.sig.stack_args) as usize, fargs: pf.sig.fargs as usize }
+            })
+            .collect();
         let project = Project {
             source: &source,
             mode: mode_name,
@@ -518,6 +544,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             units: data.as_deref().map_or(Vec::new(), project::units),
             libs: data.as_deref().map_or(Vec::new(), project::needed),
             static_bytes: statics.iter().map(|i| i.len).sum(),
+            ctors,
         };
         let modules = project::write(dir, &project).map_err(|e| format!("{}: {e}", dir.display()))?;
         eprintln!(

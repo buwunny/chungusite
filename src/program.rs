@@ -408,6 +408,9 @@ impl Program {
                 _ => Target::Indirect,
             }
         };
+        // What each function keeps without help from its callees, for values
+        // gcc leaves in a register across a call to a helper it knows.
+        let alone: Vec<u16> = lifted.par_iter().map(|(ir, _)| ir.as_ref().map_or(0, abi::keeps_alone)).collect();
         let mut funcs: Vec<Func> = inputs
             .into_par_iter()
             .zip(lifted)
@@ -415,8 +418,11 @@ impl Program {
                 let (sites, targets, guesses, passes, xmm0_from) = match &ir {
                     Ok(f) => {
                         let sites = abi::sites(f);
-                        let targets = sites.iter().map(|&s| resolve(f, s)).collect();
-                        let args: Vec<u8> = sites.iter().map(|&s| abi::guess_args(f, s)).collect();
+                        let targets: Vec<Target> = sites.iter().map(|&s| resolve(f, s)).collect();
+                        let keeps = |call: ValueId, reg: u8| {
+                            matches!(resolve(f, Site::Call(call)), Target::Func(j) if alone[j] & (1 << reg) != 0)
+                        };
+                        let args: Vec<u8> = sites.iter().map(|&s| abi::guess_args(f, s, &keeps)).collect();
                         let stack = abi::guess_stack(f, &sites, &args);
                         // (stack arguments come after all six registers, set up or passed on)
                         let guesses = sites.iter().zip(args).zip(stack).map(|((&s, a), st)| (if st > 0 { 6 } else { a }, abi::guess_fargs(f, s), st, false)).collect();
@@ -472,7 +478,9 @@ impl Program {
             for k in 0..f.sites.len() {
                 let unknown = match &f.targets[k] {
                     Target::Indirect => true,
-                    Target::Import(n) => crate::libc::lookup(n).is_none(),
+                    // a variadic one takes what the call sets up, forwarded or not
+                    // (zstd's `fprintf(stderr, "%s already exists", name)`)
+                    Target::Import(n) => crate::libc::lookup(n).is_none_or(|s| s.variadic),
                     Target::Func(j) => failed[*j],
                 };
                 let pass = f.passes[k] & ((1u16 << set.min(6)) - 1) as u8;
@@ -497,6 +505,8 @@ impl Program {
                 let e = guessed.entry(key).or_insert(Sig { ret: true, ..Sig::default() });
                 e.args = e.args.max(g.0);
                 e.fargs = e.fargs.max(g.1);
+                // and the stack arguments (zlib's `deflateInit2_` takes eight)
+                e.stack_args = e.stack_args.max(g.2);
             }
         }
         let mut stack_args: Vec<u8> = funcs.par_iter().map(|f| f.ir.as_ref().map_or(0, abi::stack_args)).collect();

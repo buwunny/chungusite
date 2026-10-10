@@ -226,3 +226,79 @@ fn constructors_and_stack_arguments_through_a_pointer() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Shapes from zstd at -O2: a 28-byte struct passed by value and forwarded
+/// with overlapping 16-byte copies, which read a stack argument word only in
+/// part; and a function pointer with stack arguments whose r9 was set before a
+/// call to a helper gcc knows leaves r9 alone.
+const FORWARD: &str = r#"#include <stdio.h>
+#include <stdlib.h>
+
+/* a 28-byte struct passed by value, forwarded with 16-byte copies */
+typedef struct { unsigned a, b, c, d, e, f, g; } P;
+
+__attribute__((noinline)) static int use(void *out, int x, const char *s, unsigned long long n, int lvl, P p) {
+    return (int)(p.a + p.b * 2 + p.c * 3 + p.d * 4 + p.e * 5 + p.f * 6 + p.g * 7) + x + lvl + (int)n + s[0] + (out != 0);
+}
+
+__attribute__((noinline)) int fwd(void *out, int x, const char *s, int lvl, P p) {
+    unsigned long long n = (unsigned long long)atoi(s);
+    return use(out, x, s, n, lvl, p);
+}
+
+/* a function pointer with stack arguments, its r9 set before a helper gcc
+   knows leaves r9 alone */
+typedef int (*get_fn)(int, int, int, int, int, const int *, int, int);
+__attribute__((noinline)) static int price(int a, int b) { return a * 3 + b; }
+__attribute__((noinline)) int pick7(int a, int b, int c, int d, int e, const int *r, int s, int t) {
+    return a + b + c + d + e + r[s] * 100 + t * 1000;
+}
+__attribute__((noinline)) int drive(get_fn f, int n, const int *rep) {
+    int total = 0;
+    for (int i = 0; i < n; i++) {
+        int pr = price(i, n);
+        total += f(i, 1, 2, 3, pr, rep, i == 0, n) + pr;
+    }
+    return total;
+}
+
+get_fn volatile pick = pick7;
+int main(int argc, char **argv) {
+    P p = {1, 2, 3, 4, 5, 6, (unsigned)argc + 8};
+    int rep[3] = {7, 11, 13};
+    get_fn f = pick;
+    printf("%d %d\n", fwd(argv, argc, "42", 9, p), drive(f, 3, rep));
+    return 0;
+}
+"#;
+
+#[test]
+fn struct_arguments_and_registers_kept_across_a_helper() {
+    if !have("cc") || !have("cargo") {
+        eprintln!("cargo: no C compiler or cargo, skipping");
+        return;
+    }
+    let dir = scratch("forward");
+    std::fs::write(dir.join("forward.c"), FORWARD).unwrap();
+    let bin = env!("CARGO_BIN_EXE_chungusite");
+    for (opt, name) in [("-O0", "forward0"), ("-O2", "forward2")] {
+        let prog = dir.join(name);
+        assert!(Command::new("cc").args([opt, "-s", "-o"]).arg(&prog).arg(dir.join("forward.c")).status().unwrap().success());
+        let want = run(&mut Command::new(&prog));
+        assert_eq!(want, ("259 11557\n".to_string(), 0), "{opt}: the original");
+        let project = dir.join(format!("p{name}"));
+        let out = Command::new(bin).arg(&prog).arg("--cargo").arg(&project).output().unwrap();
+        assert!(out.status.success(), "chungusite failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        let target = dir.join("target");
+        let build = Command::new("cargo")
+            .args(["build", "--quiet", "--offline", "--manifest-path"])
+            .arg(project.join("Cargo.toml"))
+            .env("CARGO_TARGET_DIR", &target)
+            .output()
+            .unwrap();
+        assert!(build.status.success(), "{opt}: cargo build failed:\n{}", String::from_utf8_lossy(&build.stderr));
+        let got = run(&mut Command::new(target.join("debug").join(name)));
+        assert_eq!(got, want, "{opt}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

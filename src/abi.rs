@@ -173,7 +173,11 @@ pub fn sites(f: &Function) -> Vec<Site> {
 /// How many argument registers a call to unknown code passes: up to the last one
 /// the function set up (`set_for`; prefix-closed). Valid on lifter output, where a
 /// call's arguments are `CALL_ARGS` long.
-pub fn guess_args(f: &Function, site: Site) -> u8 {
+///
+/// `keeps(call, reg)`: does the direct `call` leave `reg` as it was? A leaf
+/// helper gcc's interprocedural register allocation knows keeps a register
+/// lets a value set up before it reach the next call (`keeps_alone`).
+pub fn guess_args(f: &Function, site: Site, keeps: &dyn Fn(ValueId, u8) -> bool) -> u8 {
     let (_, args) = site.parts(f);
     let args = args.get(&f.value_pool);
     if args.len() != CALL_ARGS {
@@ -186,7 +190,7 @@ pub fn guess_args(f: &Function, site: Site) -> u8 {
     let Some(block) = block else { return 0 };
     let mut n = 0;
     for (k, &a) in args[..6].iter().enumerate() {
-        if set_for(f, block, a, Some(CALL_REGS[k].number() as u8)) {
+        if set_for(f, block, a, Some(CALL_REGS[k].number() as u8), keeps) {
             n = k + 1;
         }
     }
@@ -251,13 +255,13 @@ fn from_entry(f: &Function, a: ValueId, reg: u8, seen: &mut Vec<ValueId>) -> boo
 /// the caller or a callee. `free(opaque, p)` through a pointer often loads
 /// `p` before a null check and `opaque` after it; `usage(name)` passes `name`
 /// on to `fprintf` in r8.
-fn set_for(f: &Function, block: BlockId, a: ValueId, reg: Option<u8>) -> bool {
+fn set_for(f: &Function, block: BlockId, a: ValueId, reg: Option<u8>, keeps: &dyn Fn(ValueId, u8) -> bool) -> bool {
     match f.insts[a].kind {
         // paths joining, each with what it set up (a float computed on one
         // path, reloaded from the stack after a call on the other)
-        InstKind::BlockParam(_) => set_before(f, a, reg, &mut Vec::new()),
+        InstKind::BlockParam(_) => set_before(f, a, reg, keeps, &mut Vec::new()),
         InstKind::Param(_) => f.blocks[block].insts.get(&f.value_pool).contains(&a),
-        _ => set_before(f, a, reg, &mut Vec::new()),
+        _ => set_before(f, a, reg, keeps, &mut Vec::new()),
     }
 }
 
@@ -265,8 +269,17 @@ fn set_for(f: &Function, block: BlockId, a: ValueId, reg: Option<u8>) -> bool {
 /// (paths joining, each with the arguments it set up, as in
 /// `fprintf(stderr, fmt, name, why)` after two error checks) counts if every
 /// path into it set its register up; a loop's way back adds nothing.
-fn set_before(f: &Function, a: ValueId, reg: Option<u8>, seen: &mut Vec<ValueId>) -> bool {
+fn set_before(f: &Function, a: ValueId, reg: Option<u8>, keeps: &dyn Fn(ValueId, u8) -> bool, seen: &mut Vec<ValueId>) -> bool {
     match f.insts[a].kind {
+        // another register's value across a call (`mov r8, r10` with r10
+        // kept by a callee gcc knows) is set up; the register's own isn't
+        InstKind::CallOut { reg: r, .. } if reg.is_some_and(|reg| reg != r) => true,
+        // the register's own value across a call that keeps it, set up before:
+        // gcc sets r9 for a function pointer, then calls a helper it knows
+        // leaves r9 alone
+        InstKind::CallOut { call, reg: r } if keeps(call, r) => {
+            Site::Call(call).before(f, r).is_some_and(|v| set_before(f, v, reg, keeps, seen))
+        }
         InstKind::Undef | InstKind::CallOut { .. } | InstKind::Param(_) => false,
         InstKind::BlockParam(r) if reg.is_some_and(|reg| reg != r) => true,
         InstKind::BlockParam(_) => {
@@ -285,7 +298,7 @@ fn set_before(f: &Function, a: ValueId, reg: Option<u8>, seen: &mut Vec<ValueId>
                 if blk.term.successors(&f.value_pool).any(|s| s == b) {
                     incoming(f, p, b, k, |v| {
                         paths += 1;
-                        all = all && set_before(f, v, reg, seen);
+                        all = all && set_before(f, v, reg, keeps, seen);
                     });
                 }
             }
@@ -363,7 +376,7 @@ pub fn guess_fargs(f: &Function, site: Site) -> u8 {
     }
     let mut n = 0;
     for (j, &a) in args[CALL_XMM..].iter().step_by(2).take(FLOAT_ARGS).enumerate() {
-        if set_for(f, block, a, None) {
+        if set_for(f, block, a, None, &|_, _| false) {
             n = j + 1;
         }
     }
@@ -677,6 +690,32 @@ fn exit_value(f: &Function, sites: &[Site], callee: &dyn Fn(usize) -> Sig, e: &E
             if callee(k).keeps(reg) { sites[k].before(f, reg) } else { None }
         }
     }
+}
+
+/// The caller-saved registers `f` (as for `infer`) keeps without help from
+/// any callee, as a mask of x86 numbers: what a helper that calls nothing
+/// leaves alone, for `guess_args` before signatures are known.
+pub fn keeps_alone(f: &Function) -> u16 {
+    let sites = sites(f);
+    let callee = |_: usize| Sig::default();
+    let cfg = Cfg::new(f);
+    let stale = stale_regs(f, &cfg, &sites, &callee);
+    let ex = exits(f, &cfg, &sites);
+    let src = sources(f, &cfg, &sites);
+    let mut keeps = 0u16;
+    for reg in 0..16u8 {
+        if CALLER_SAVED & (1 << reg) == 0 || stale[reg as usize] || ex.is_empty() {
+            continue;
+        }
+        let ok = ex.iter().all(|e| match e {
+            Exit::Tail(_) => false,
+            e => exit_value(f, &sites, &callee, e, reg).is_some_and(|v| traces_to_entry(f, &src, &sites, &callee, reg, v)),
+        });
+        if ok {
+            keeps |= 1 << reg;
+        }
+    }
+    keeps
 }
 
 /// The signature of `f` (lifted with `track_exits`, cleaned, not yet `apply`d),
